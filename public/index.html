@@ -63,6 +63,18 @@
   - "profile:avatar"      { avatarDataUrl }  [NOUVEAU] data URL image ou null
                              pour retirer l'avatar (250 Ko max, redimensionné
                              côté client avant envoi).
+  - "profile:style"       { nameFont, nameEffect }  [NOUVEAU] préférence de
+                             style du pseudo (police "Instagram" + effet
+                             visuel wave/néon/etc.). Le serveur doit stocker
+                             ces deux champs et les renvoyer avec l'utilisateur
+                             dans "friend:list", "friend:added", "friend:status",
+                             "friend:request_received" et dans "author"/
+                             "senderNullId" des messages, comme pour avatarDataUrl.
+                             Valeurs attendues : nameFont/nameEffect = chaînes
+                             courtes (clés), ex: "bold", "gothic", "none". Ne
+                             jamais faire confiance à du HTML envoyé par le
+                             client : ce ne sont que des clés d'un ensemble fixe
+                             connu du client, jamais du texte libre.
   - "dm:typing"           { targetNullId, isTyping }  [NOUVEAU]
   - "dm:read"             { targetNullId, messageId? }  [NOUVEAU]
 
@@ -120,6 +132,9 @@
   - "friend:removed"         { nullId }
   - "friend:status"          { nullId, online, socketId }
   - "friend:avatar_updated"  { nullId, avatarDataUrl }  [NOUVEAU]
+  - "friend:style_updated"   { nullId, nameFont, nameEffect }  [NOUVEAU] diffusé
+                               à ses amis en ligne quand quelqu'un change son
+                               style de pseudo (miroir de "profile:style").
   - "friend:error"           { message }
   - "dm:key_exchange"        { senderNullId, senderSocketId, publicKey, isNewUser }
   - "dm:message"             { messageId, senderNullId, author, ciphertext, iv, timestamp }
@@ -774,6 +789,86 @@ input:disabled{ opacity:.5; }
   .rail-btn{ width:46px; height:46px; }
   .avatar{ width:38px; height:38px; }
 }
+
+/* =========================================================
+   STYLES DE PSEUDO — polices "façon Instagram" + effets
+   ========================================================= */
+.styled-name{ display:inline-flex; flex-wrap:wrap; }
+.styled-name .ln{ display:inline-block; white-space:pre; }
+
+/* --- Néon --- */
+.fx-neon{
+  color:#fff;
+  text-shadow:
+    0 0 4px currentColor,
+    0 0 10px var(--accent, #7c5cff),
+    0 0 18px var(--accent, #7c5cff),
+    0 0 32px var(--accent, #7c5cff);
+  animation: fxNeonFlicker 2.6s infinite alternate;
+}
+@keyframes fxNeonFlicker{
+  0%, 3%, 6%, 100%{ opacity:1; }
+  4%, 5%{ opacity:0.55; }
+}
+
+/* --- Vague --- */
+.fx-wave .ln{
+  animation: fxWave 1.6s ease-in-out infinite;
+  animation-delay: calc(var(--i, 0) * 0.08s);
+}
+@keyframes fxWave{
+  0%, 100%{ transform: translateY(0); }
+  50%{ transform: translateY(-5px); }
+}
+
+/* --- Arc-en-ciel --- */
+.fx-rainbow{
+  background: linear-gradient(90deg,#ff5f6d,#ffc371,#f9f871,#7bed9f,#5ee7ff,#a29bfe,#ff5f6d);
+  background-size: 300% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: fxRainbowShift 4s linear infinite;
+}
+@keyframes fxRainbowShift{
+  0%{ background-position: 0% 50%; }
+  100%{ background-position: 300% 50%; }
+}
+
+/* --- Glitch --- */
+.fx-glitch{ position:relative; display:inline-block; }
+.fx-glitch .ln{ animation: fxGlitchJitter 3.2s infinite; animation-delay: calc(var(--i, 0) * 0.05s); }
+@keyframes fxGlitchJitter{
+  0%, 92%, 100%{ transform:translate(0,0); text-shadow:none; }
+  93%{ transform:translate(-1px,1px); text-shadow: 1px 0 var(--accent-2,#ff5c93), -1px 0 var(--accent,#5cc8ff); }
+  95%{ transform:translate(1px,-1px); text-shadow: -1px 0 var(--accent-2,#ff5c93), 1px 0 var(--accent,#5cc8ff); }
+  97%{ transform:translate(0,0); text-shadow:none; }
+}
+
+/* --- Brillance / Shine --- */
+.fx-shine{
+  background: linear-gradient(100deg, currentColor 30%, #fff 50%, currentColor 70%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: fxShineSweep 2.8s linear infinite;
+}
+@keyframes fxShineSweep{
+  0%{ background-position: 200% 0; }
+  100%{ background-position: -50% 0; }
+}
+
+/* --- Aperçu dans les Paramètres --- */
+.name-style-preview{
+  display:flex; align-items:center; justify-content:center;
+  min-height:44px; padding:10px; margin:8px 0 14px 0;
+  background: var(--bg-raised); border:1px solid var(--border-soft); border-radius: var(--radius-sm);
+  font-size:17px; font-weight:700;
+}
+.name-style-grid{ display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; margin-bottom:16px; }
+.name-style-swatch{
+  padding:9px 6px; border-radius: var(--radius-sm); background: var(--bg-raised);
+  border:1px solid var(--border-soft); color: var(--text-primary); font-size:12.5px; font-weight:600;
+  cursor:pointer; text-align:center; font-family: var(--font-body);
+}
+.name-style-swatch.active{ border-color: var(--accent, #7c5cff); background: var(--bg-panel-2); }
 </style>
 </head>
 <body>
@@ -976,6 +1071,16 @@ input:disabled{ opacity:.5; }
       </div>
     </div>
 
+    <div class="label-small">Style du pseudo</div>
+    <div class="name-style-preview" id="nameStylePreview"></div>
+    <div class="label-small" style="margin-top:0;">Police</div>
+    <div class="name-style-grid" id="nameFontGrid"></div>
+    <div class="label-small" style="margin-top:0;">Effet</div>
+    <div class="name-style-grid" id="nameEffectGrid"></div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:-8px 0 16px 0;">
+      Visible par tes amis dans les messages, la liste d'amis et les appels. Ton pseudo réel (utilisé pour te connecter) ne change pas.
+    </div>
+
     <div class="label-small">Micro (entrée audio)</div>
     <select id="audioInputSelect" class="settings-select" style="width:100%; margin:8px 0 16px 0; padding:10px; border-radius:var(--radius-sm); background:var(--bg-raised); color:var(--text-primary); border:1px solid var(--border-soft);"></select>
 
@@ -1037,6 +1142,8 @@ let isLoginMode = true;
 let currentUser = null;
 let myNullId = null;
 let myAvatarDataUrl = null;
+let myNameFont = 'none';
+let myNameEffect = 'none';
 let authToken = null;
 let socket = null;
 let myKeyPair = null;
@@ -1048,6 +1155,7 @@ const SESSION_STORAGE_KEY = 'nullchat_session_v1';
 const SESSION_DURATION_MS = 60 * 24 * 60 * 60 * 1000; // ~2 mois
 const NEW_ACCOUNT_FLAG_KEY = 'nullchat_new_account';
 const TUTORIAL_SEEN_KEY = 'nullchat_tutorial_seen';
+const NAME_STYLE_KEY = 'nullchat_name_style_v1';
 let tutorialStepIndex = 0;
 let pendingTutorialAfterLogin = false;
 
@@ -1097,6 +1205,15 @@ function colorForName(name){
 }
 function initialFor(name){ return (name || '?').trim().charAt(0).toUpperCase(); }
 
+// Retrouve la préférence de style (police/effet) à appliquer à l'auteur d'un message.
+function nameStyleForAuthor(author, isOwn){
+  if (isOwn) return { font: myNameFont, effect: myNameEffect };
+  for (const f of friends.values()){
+    if (f.username === author) return { font: f.nameFont || 'none', effect: f.nameEffect || 'none' };
+  }
+  return { font: 'none', effect: 'none' };
+}
+
 // Affiche une photo de profil si disponible, sinon retombe sur l'initiale colorée.
 function renderAvatarInto(el, { username, avatarDataUrl }){
   if (!el) return;
@@ -1142,6 +1259,122 @@ function escapeHtml(str){
   div.textContent = str;
   return div.innerHTML;
 }
+
+/* =========================================================
+   POLICES "FAÇON INSTAGRAM" (Unicode) + EFFETS DE PSEUDO
+   Ceci ne change jamais le pseudo réel (login, recherche, NULLID) :
+   on ne fait que remplacer, à l'AFFICHAGE, chaque lettre par son
+   équivalent Unicode stylisé. Aucune donnée envoyée au serveur
+   n'est du HTML libre : uniquement des clés fixes (voir NAME_FONTS).
+   ========================================================= */
+const NAME_FONTS = {
+  none:  { label: 'Normale',        sample: 'Abc' },
+  bold:  { label: 'Gras',           sample: '𝗔𝗯𝗰', base: 0x1D400, baseLower: 0x1D41A, baseDigit: 0x1D7CE },
+  italic:{ label: 'Italique',       sample: '𝘈𝘣𝘤', base: 0x1D434, baseLower: 0x1D44E },
+  script:{ label: 'Cursive',        sample: '𝒜𝒷𝒸', base: 0x1D49C, baseLower: 0x1D4B6, exceptions: { 'B':'\u212C','E':'\u2130','F':'\u2131','H':'\u210B','I':'\u2110','L':'\u2112','M':'\u2133','R':'\u211B','e':'\u212F','g':'\u210A','o':'\u2134' } },
+  gothic:{ label: 'Gothique',       sample: '𝔄𝔟𝔠', base: 0x1D504, baseLower: 0x1D51E, exceptions: { 'C':'\u212D','H':'\u210C','I':'\u2111','R':'\u211C','Z':'\u2128' } },
+  double:{ label: 'Double',         sample: '𝔸𝕓𝕔', base: 0x1D538, baseLower: 0x1D552, baseDigit: 0x1D7D8, exceptions: { 'C':'\u2102','H':'\u210D','N':'\u2115','P':'\u2119','Q':'\u211A','R':'\u211D','Z':'\u2124' } },
+  mono:  { label: 'Monospace',      sample: '𝙰𝚋𝚌', base: 0x1D670, baseLower: 0x1D68A, baseDigit: 0x1D7F6 },
+  bubble:{ label: 'Bulle',          sample: 'Ⓐⓑⓒ', base: 0x24B6, baseLower: 0x24D0 },
+  smallcaps:{ label: 'Petites maj.', sample: 'ᴬʙᶜ', map: { a:'ᴀ',b:'ʙ',c:'ᴄ',d:'ᴅ',e:'ᴇ',f:'ꜰ',g:'ɢ',h:'ʜ',i:'ɪ',j:'ᴊ',k:'ᴋ',l:'ʟ',m:'ᴍ',n:'ɴ',o:'ᴏ',p:'ᴘ',q:'Q',r:'ʀ',s:'s',t:'ᴛ',u:'ᴜ',v:'ᴠ',w:'ᴡ',x:'x',y:'ʏ',z:'ᴢ' } }
+};
+const NAME_EFFECTS = {
+  none:   { label: 'Aucun' },
+  wave:   { label: 'Vague',       cls: 'fx-wave',   perLetter: true },
+  neon:   { label: 'Néon',        cls: 'fx-neon' },
+  rainbow:{ label: 'Arc-en-ciel', cls: 'fx-rainbow' },
+  glitch: { label: 'Glitch',      cls: 'fx-glitch', perLetter: true },
+  shine:  { label: 'Brillance',   cls: 'fx-shine' }
+};
+
+// Convertit une chaîne normale vers son équivalent Unicode stylisé.
+function toFancyFont(text, fontKey){
+  const def = NAME_FONTS[fontKey];
+  if (!def || fontKey === 'none') return text || '';
+  let out = '';
+  for (const ch of String(text || '')){
+    if (def.map){
+      out += def.map[ch] || def.map[ch.toLowerCase()] || ch;
+      continue;
+    }
+    if (def.exceptions && def.exceptions[ch]){ out += def.exceptions[ch]; continue; }
+    const code = ch.codePointAt(0);
+    if (ch >= 'A' && ch <= 'Z' && typeof def.base === 'number'){
+      out += String.fromCodePoint(def.base + (code - 65));
+    } else if (ch >= 'a' && ch <= 'z' && typeof def.baseLower === 'number'){
+      out += String.fromCodePoint(def.baseLower + (code - 97));
+    } else if (ch >= '0' && ch <= '9' && typeof def.baseDigit === 'number'){
+      out += String.fromCodePoint(def.baseDigit + (code - 48));
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+// Construit le HTML (échappé) d'un pseudo stylisé, prêt à insérer via innerHTML.
+// rawName = pseudo réel (jamais modifié en base) ; font/effect = clés fixes ci-dessus.
+function styledNameHTML(rawName, font, effect){
+  const fancy = toFancyFont(rawName || '', font || 'none');
+  const fx = NAME_EFFECTS[effect] || NAME_EFFECTS.none;
+  if (!fx.cls) return escapeHtml(fancy);
+  if (fx.perLetter){
+    let i = 0;
+    const letters = [...fancy].map(ch => {
+      const span = `<span class="ln" style="--i:${i}">${escapeHtml(ch === ' ' ? '\u00A0' : ch)}</span>`;
+      i++;
+      return span;
+    }).join('');
+    return `<span class="styled-name ${fx.cls}">${letters}</span>`;
+  }
+  return `<span class="styled-name ${fx.cls}">${escapeHtml(fancy)}</span>`;
+}
+
+// --- Gestion de la préférence de style du pseudo (locale + envoyée aux amis) ---
+function loadNameStylePref(){
+  try{
+    const raw = localStorage.getItem(NAME_STYLE_KEY);
+    if (raw){
+      const s = JSON.parse(raw);
+      if (s && NAME_FONTS[s.font]) myNameFont = s.font;
+      if (s && NAME_EFFECTS[s.effect]) myNameEffect = s.effect;
+    }
+  }catch(e){}
+}
+function saveNameStylePref(){
+  try{ localStorage.setItem(NAME_STYLE_KEY, JSON.stringify({ font: myNameFont, effect: myNameEffect })); }catch(e){}
+}
+function applyNameStyle(font, effect){
+  myNameFont = NAME_FONTS[font] ? font : 'none';
+  myNameEffect = NAME_EFFECTS[effect] ? effect : 'none';
+  saveNameStylePref();
+  renderNameStylePicker();
+  const pn = document.getElementById('profileName');
+  if (pn) pn.innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect);
+  if (socket && socket.connected){
+    socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect });
+  }
+}
+function renderNameStylePicker(){
+  const fontGrid = document.getElementById('nameFontGrid');
+  const fxGrid = document.getElementById('nameEffectGrid');
+  const preview = document.getElementById('nameStylePreview');
+  if (!fontGrid || !fxGrid) return;
+  fontGrid.innerHTML = Object.entries(NAME_FONTS).map(([key, def]) => `
+    <div class="name-style-swatch${key === myNameFont ? ' active' : ''}" data-font="${key}" title="${escapeHtml(def.label)}">${escapeHtml(def.sample)}</div>
+  `).join('');
+  fontGrid.querySelectorAll('[data-font]').forEach(el => {
+    el.onclick = () => applyNameStyle(el.getAttribute('data-font'), myNameEffect);
+  });
+  fxGrid.innerHTML = Object.entries(NAME_EFFECTS).map(([key, def]) => `
+    <div class="name-style-swatch${key === myNameEffect ? ' active' : ''}" data-fx="${key}">${escapeHtml(def.label)}</div>
+  `).join('');
+  fxGrid.querySelectorAll('[data-fx]').forEach(el => {
+    el.onclick = () => applyNameStyle(myNameFont, el.getAttribute('data-fx'));
+  });
+  if (preview) preview.innerHTML = styledNameHTML(currentUser || 'Pseudo', myNameFont, myNameEffect);
+}
+loadNameStylePref();
 
 /* =========================================================
    ANIMATION SIGNATURE : "déchiffrement" visuel du texte
@@ -1373,7 +1606,7 @@ function toggleProfilePop(evt){
   const rect = evt.currentTarget.getBoundingClientRect();
   pop.style.left = (rect.right + 12) + 'px';
   pop.style.top = (rect.bottom - 200) + 'px';
-  document.getElementById('profileName').textContent = currentUser || '';
+  document.getElementById('profileName').innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect);
   document.getElementById('profileNullId').textContent = myNullId || 'inconnu';
   document.getElementById('notifToggle').classList.toggle('on', notifsEnabled);
   pop.classList.add('open');
@@ -1537,7 +1770,7 @@ function renderFriendList(){
       row.innerHTML = `
         <div class="avatar" style="${avatarStyleAttr(req)}">${req.avatarDataUrl ? '' : escapeHtml(initialFor(req.username))}</div>
         <div class="friend-meta">
-          <div class="friend-name">${escapeHtml(req.username)}</div>
+          <div class="friend-name">${styledNameHTML(req.username, req.nameFont || 'none', req.nameEffect || 'none')}</div>
           <div class="friend-sub">${escapeHtml(req.nullId)}</div>
         </div>
         <div class="friend-actions">
@@ -1573,7 +1806,7 @@ function renderFriendList(){
         <div class="avatar-dot" style="background:${f.online ? 'var(--online)' : 'var(--text-faint)'}; width:11px; height:11px; border-color: var(--bg-panel-2);"></div>
       </div>
       <div class="friend-meta">
-        <div class="friend-name">${escapeHtml(f.username)} ${unread > 0 ? `<span class="unread-pill">${unread}</span>` : ''}</div>
+        <div class="friend-name">${styledNameHTML(f.username, f.nameFont || 'none', f.nameEffect || 'none')} ${unread > 0 ? `<span class="unread-pill">${unread}</span>` : ''}</div>
         <div class="friend-sub">${escapeHtml(f.nullId)} · ${f.online ? 'en ligne' : 'hors ligne'}</div>
       </div>
       <div class="friend-actions">
@@ -1616,7 +1849,7 @@ function openDm(friend){
   currentDmPeer = friend;
   unreadDm.delete(friend.nullId);
   renderAvatarInto(document.getElementById('dmAvatar'), friend);
-  document.getElementById('dmPeerName').textContent = friend.username;
+  document.getElementById('dmPeerName').innerHTML = styledNameHTML(friend.username, friend.nameFont || 'none', friend.nameEffect || 'none');
   const callBtn = document.getElementById('dmCallBtn');
   callBtn.disabled = !friend.online;
   callBtn.onclick = () => startCall(friend);
@@ -1729,7 +1962,7 @@ function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, f
   const authorSpan = document.createElement('span');
   authorSpan.className = 'author';
   authorSpan.style.color = isOwn ? 'var(--accent-2)' : colorForName(author);
-  authorSpan.textContent = author;
+  { const st = nameStyleForAuthor(author, isOwn); authorSpan.innerHTML = styledNameHTML(author, st.font, st.effect); }
   const timeSpan = document.createElement('span');
   timeSpan.className = 'timestamp';
   timeSpan.textContent = new Date(timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit' });
@@ -1857,6 +2090,7 @@ function openSettings(){
   document.getElementById('settingsNullId').textContent = myNullId || 'inconnu';
   renderAvatarInto(document.getElementById('settingsAvatarPreview'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
   document.getElementById('avatarRemoveRow').style.display = myAvatarDataUrl ? 'block' : 'none';
+  renderNameStylePicker();
   document.getElementById('settingsOverlay').style.display = 'flex';
   populateAudioDeviceSelects();
   loadActiveSessions();
@@ -2173,7 +2407,7 @@ async function fetchIceServers(){
 
 function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions }){
   document.getElementById('callOverlay').classList.add('open');
-  document.getElementById('callName').textContent = name;
+  { const st = nameStyleForAuthor(name, false); document.getElementById('callName').innerHTML = styledNameHTML(name, st.font, st.effect); }
   document.getElementById('callStatusText').textContent = statusText;
   const avatar = document.getElementById('callAvatar');
   renderAvatarInto(avatar, { username: name, avatarDataUrl });
@@ -2357,7 +2591,7 @@ function addChatMessage({ author, text, isOwn, timestamp, kind, dataUrl, filenam
   const authorSpan = document.createElement('span');
   authorSpan.className = 'author';
   authorSpan.style.color = isOwn ? 'var(--accent-2)' : colorForName(author);
-  authorSpan.textContent = author;
+  { const st = nameStyleForAuthor(author, isOwn); authorSpan.innerHTML = styledNameHTML(author, st.font, st.effect); }
 
   const timeSpan = document.createElement('span');
   timeSpan.className = 'timestamp';
@@ -2441,6 +2675,9 @@ async function startApp(){
     );
     const rawPublicKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
     socket.emit('share_public_key', Array.from(new Uint8Array(rawPublicKey)));
+    // Resynchronise la préférence de style de pseudo (police/effet) auprès du serveur,
+    // au cas où elle aurait changé sur un autre appareil ou avant que ce socket existe.
+    socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect });
     if (pendingTutorialAfterLogin){
       pendingTutorialAfterLogin = false;
       setTimeout(() => openTutorial(), 500);
@@ -2542,6 +2779,21 @@ async function startApp(){
     if ((data.requests || []).length){
       showToast({ title: 'Demandes d\u2019ami en attente', body: `${data.requests.length} demande(s) reçue(s) pendant ton absence.` });
     }
+  });
+
+  // Style de pseudo d'un ami mis à jour en temps réel (police/effet)
+  socket.on('friend:style_updated', (data) => {
+    const f = friends.get(data.nullId);
+    if (f){
+      f.nameFont = data.nameFont || 'none';
+      f.nameEffect = data.nameEffect || 'none';
+    }
+    if (currentDmPeer && currentDmPeer.nullId === data.nullId){
+      currentDmPeer.nameFont = data.nameFont || 'none';
+      currentDmPeer.nameEffect = data.nameEffect || 'none';
+      document.getElementById('dmPeerName').innerHTML = styledNameHTML(currentDmPeer.username, currentDmPeer.nameFont, currentDmPeer.nameEffect);
+    }
+    if (currentView === 'friends') renderFriendList();
   });
 
   // Avatar d'un ami mis à jour en temps réel
