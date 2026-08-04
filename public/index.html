@@ -1,0 +1,2841 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0">
+<script>
+// Évite le flash de l'écran de connexion si une session valide (< 2 mois) est déjà stockée.
+(function(){
+  try{
+    var raw = localStorage.getItem('nullchat_session_v1');
+    if (raw){
+      var s = JSON.parse(raw);
+      if (s && s.token && s.expiresAt && s.expiresAt > Date.now()){
+        document.documentElement.classList.add('returning-user');
+      }
+    }
+  }catch(e){}
+})();
+</script>
+<title>NullChat</title>
+<script src="/socket.io/socket.io.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/*
+  =====================================================================
+  CONTRAT SERVEUR REQUIS (Socket.IO) — à implémenter côté backend
+  =====================================================================
+  Ce fichier est uniquement le client. Pour que le système d'amis, les
+  messages privés et les appels fonctionnent, le serveur doit gérer les
+  événements suivants.
+
+  --- Identité ---
+  - /api/login et /api/register doivent renvoyer un champ `nullId`
+    (identifiant unique et stable de l'utilisateur, ex: "A3F9-72CD").
+
+  --- Émis par le client, à écouter côté serveur ---
+  - "friend:request"      { targetNullId }
+  - "friend:accept"       { requestId }
+  - "friend:decline"      { requestId }
+  - "friend:remove"       { nullId }
+  - "friend:block"        { nullId }   [NOUVEAU] le serveur doit empêcher ce
+                                        nullId d'envoyer messages/appels/
+                                        demandes d'ami tant qu'il est bloqué.
+  - "friend:unblock"      { nullId }   [NOUVEAU]
+  - "dm:key_exchange"     { targetSocketId, publicKey, isNewUser }
+  - "dm:message"          { targetNullId, targetSocketId, ciphertext, iv,
+                             kind, mime, filename, timestamp }
+                             [NOUVEAU] kind/mime/filename sont optionnels et
+                             juste relayés tels quels (kind: 'text'|'image'|
+                             'video'|'audio'). Le contenu reste chiffré E2E,
+                             donc mime/filename sont les seules métadonnées
+                             en clair — à garder minimales par design.
+                             Le serveur doit aussi imposer une limite de
+                             taille de payload (ex: 20 Mo) pour éviter l'abus.
+  - "call:offer"          { targetNullId, targetSocketId, sdp }
+  - "call:answer"         { targetNullId, targetSocketId, sdp }
+  - "call:ice"            { targetNullId, targetSocketId, candidate }
+  - "call:end"            { targetNullId, targetSocketId, reason? }
+                             reason: 'declined' pour un refus explicite,
+                             sinon un simple raccrochage ("call:ended").
+  - "profile:avatar"      { avatarDataUrl }  [NOUVEAU] data URL image ou null
+                             pour retirer l'avatar (250 Ko max, redimensionné
+                             côté client avant envoi).
+  - "dm:typing"           { targetNullId, isTyping }  [NOUVEAU]
+  - "dm:read"             { targetNullId, messageId? }  [NOUVEAU]
+
+  --- Serveurs (groupes chiffrés créés par les utilisateurs) ---
+  Le salon "#général" global a été retiré : toute discussion de groupe se
+  fait désormais dans un serveur créé par un utilisateur, avec un code
+  d'invitation, sur le même modèle de chiffrement pair-à-pair que les DM
+  (ECDH + AES-GCM), mais étendu à chaque membre en ligne du serveur.
+  - "server:create"        { name }
+  - "server:join"          { inviteCode }
+  - "server:leave"         { serverId }
+  - "server:key_exchange"  { serverId, targetSocketId, publicKey, isNewMember }
+                              targetSocketId absent/null = diffusion à tous
+                              les membres actuellement en ligne du serveur.
+  - "server:message"       { serverId, targets: [{ targetId, ciphertext, iv }],
+                              kind, mime, filename, timestamp }
+                              même principe que l'ancien "encrypted_message" :
+                              un ciphertext différent par membre en ligne,
+                              chiffré avec la clé partagée dérivée pour ce
+                              membre. Le serveur ne voit jamais le texte en
+                              clair. Limite de taille de payload à imposer
+                              comme pour "dm:message".
+
+  --- Envoyés par le serveur, écoutés ici ---
+  - "friend:list"            { friends: [{ nullId, username, online, socketId, avatarDataUrl }] }
+  - "friend:request_received"{ requestId, from: { nullId, username, avatarDataUrl } }
+  - "friend:pending_list"    { requests: [...] }  [NOUVEAU] rattrapage des demandes
+                               reçues pendant une déconnexion.
+  - "friend:added"           { nullId, username, socketId, online, avatarDataUrl }
+  - "friend:removed"         { nullId }
+  - "friend:status"          { nullId, online, socketId }
+  - "friend:avatar_updated"  { nullId, avatarDataUrl }  [NOUVEAU]
+  - "friend:error"           { message }
+  - "dm:key_exchange"        { senderNullId, senderSocketId, publicKey, isNewUser }
+  - "dm:message"             { messageId, senderNullId, author, ciphertext, iv, timestamp }
+  - "dm:queued_messages"     { messages: [...] }  [NOUVEAU] DM reçus hors ligne,
+                               livrés à la reconnexion (file bornée à 200
+                               messages / 14 jours par destinataire).
+  - "dm:pending"             { messageId, targetNullId }  [NOUVEAU] accusé que le
+                               message vient d'être mis en attente (destinataire
+                               hors ligne) plutôt que livré immédiatement.
+  - "dm:typing"              { nullId, isTyping }  [NOUVEAU]
+  - "dm:read"                { nullId, messageId }  [NOUVEAU]
+  - "call:incoming"          { from: { nullId, username, socketId, avatarDataUrl }, sdp }
+  - "call:answer"            { from: { nullId }, sdp }
+  - "call:ice"               { from: { nullId }, candidate }
+  - "call:ended"             { nullId }
+  - "call:declined"          { nullId }
+
+  --- HTTP additionnel ---
+  - GET    /api/sessions      (Authorization: Bearer <token>) [NOUVEAU]
+           -> { sessions: [{ id, current, createdAt, userAgent }] }
+  - DELETE /api/sessions/:id  (Authorization: Bearer <token>) [NOUVEAU]
+           révoque une session (déconnecte cet appareil).
+
+  Note DM : le serveur relaie simplement "dm:key_exchange" et "dm:message"
+  entre les deux sockets concernés (il n'a jamais accès au contenu en
+  clair, tout est chiffré en E2E côté client via ECDH + AES-GCM, comme
+  pour le salon général).
+
+  Si votre serveur actuel ne gère pas encore ça, l'UI reste utilisable
+  (affichage, recherche par NULLID, etc.) mais les actions réseau
+  échoueront silencieusement / afficheront une erreur générique.
+  =====================================================================
+*/
+
+:root {
+  /* ---- Palette : Rouge Foncé & Noir — identité "chiffrée" ---- */
+  --bg-deepest:   #08080a;
+  --bg-panel:     #131316;
+  --bg-panel-2:   #1b1b20;
+  --bg-raised:    #24242b;
+  --border-soft:  #3d1418;
+  --text-primary: #f5e6e6;
+  --text-muted:   #a3888a;
+  --text-faint:   #5c474a;
+
+  --accent-1: #8b0000;
+  --accent-2: #ff2d47;
+  --accent-3: #ffb020;
+  --accent-grad: linear-gradient(135deg, #8b0000, #ff2d47);
+  --accent-solid: #990000;
+  --accent-ring: rgba(255, 45, 71, 0.22);
+  --accent-glow: rgba(255, 45, 71, 0.35);
+
+  --online: #2fd66b;
+  --idle:   #f0b232;
+  --danger: #ef5a6f;
+
+  --radius-lg: 16px;
+  --radius-md: 10px;
+  --radius-sm: 6px;
+
+  --font-display: 'Sora', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --ease-out: cubic-bezier(.16,1,.3,1);
+}
+
+@media (prefers-reduced-motion: reduce){
+  *{ animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+}
+
+*{ box-sizing:border-box; }
+html,body{ height:100%; }
+body{
+  margin:0;
+  background-color: var(--bg-deepest);
+  background-image:
+    radial-gradient(circle at 20% 20%, rgba(139, 0, 0, 0.22) 0%, transparent 45%),
+    radial-gradient(circle at 80% 80%, rgba(80, 0, 0, 0.28) 0%, transparent 50%),
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 3px);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  overflow:hidden;
+}
+::-webkit-scrollbar{ width:8px; }
+::-webkit-scrollbar-thumb{ background:var(--border-soft); border-radius:8px; }
+::-webkit-scrollbar-track{ background:transparent; }
+
+button{ font-family: var(--font-display); }
+input{ font-family: var(--font-body); }
+
+:focus-visible{ outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 4px; }
+
+/* =========================================================
+   EFFETS BOUTONS (ripple + retour tactile + brillance)
+   ========================================================= */
+button{ -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.fx-btn{
+  position:relative; overflow:hidden;
+  transition: transform .16s var(--ease-out), box-shadow .2s var(--ease-out), filter .2s var(--ease-out), background .2s var(--ease-out);
+}
+.fx-btn:active{ transform: scale(0.94); }
+.fx-ripple{
+  position:absolute; border-radius:50%; pointer-events:none;
+  background: rgba(255,255,255,0.45); transform: scale(0); opacity:0.6;
+  animation: fx-ripple-anim .55s var(--ease-out) forwards;
+}
+@keyframes fx-ripple-anim{ to{ transform: scale(2.6); opacity:0; } }
+@media (prefers-reduced-motion: reduce){ .fx-btn, .fx-btn:active{ transition:none; transform:none; } .fx-ripple{ display:none; } }
+
+/* Boutons "vedette" : lueur douce au survol + shimmer occasionnel */
+.btn-auth.fx-btn:hover:not(:disabled),
+.btn-send.fx-btn:hover:not(:disabled){
+  transform: translateY(-1px);
+  box-shadow: 0 6px 22px var(--accent-glow);
+  filter: brightness(1.06);
+}
+.btn-auth.fx-btn::before,
+.btn-send.fx-btn:not(:disabled)::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background: linear-gradient(115deg, transparent 20%, rgba(255,255,255,0.28) 35%, transparent 50%);
+  background-size: 220% 100%; background-position: 130% 0;
+  transition: background-position .9s var(--ease-out);
+}
+.btn-auth.fx-btn:hover::before,
+.btn-send.fx-btn:not(:disabled):hover::before{ background-position: -30% 0; }
+
+.rail-btn.fx-btn:hover{ transform: translateY(-1px) scale(1.04); }
+.rail-btn.fx-btn.active{ box-shadow: 0 0 0 1px rgba(255,45,71,0.3), 0 4px 14px var(--accent-ring); }
+.icon-btn.fx-btn:hover:not(:disabled){ transform: translateY(-1px); }
+.call-btn.fx-btn:hover{ filter: brightness(1.12); box-shadow: 0 6px 18px rgba(0,0,0,0.35); }
+.btn-mini.fx-btn:hover{ transform: translateY(-1px); box-shadow: 0 4px 14px var(--accent-glow); }
+
+/* =========================================================
+   ÉCRAN D'AUTHENTIFICATION
+   ========================================================= */
+html.returning-user .auth-wrap{ display:none !important; }
+.auth-wrap{
+  display:flex;
+  min-height:100vh;
+  width:100%;
+  align-items:center;
+  justify-content:center;
+  position:relative;
+  overflow:hidden;
+}
+.cipher-rain{
+  position:absolute; inset:0; z-index:0; overflow:hidden; pointer-events:none;
+  -webkit-mask-image: radial-gradient(circle at 50% 45%, transparent 0, transparent 220px, black 520px);
+  mask-image: radial-gradient(circle at 50% 45%, transparent 0, transparent 220px, black 520px);
+}
+.cipher-col{
+  position:absolute; top:-40%; font-family: var(--font-mono); font-size:13px; line-height:1.5;
+  color: var(--accent-2); opacity:0.14; white-space:pre; animation: cipher-fall linear infinite;
+}
+@keyframes cipher-fall{ from{ transform: translateY(0); } to{ transform: translateY(140%); } }
+@media (prefers-reduced-motion: reduce){ .cipher-col{ animation: none; display:none; } }
+.auth-card{
+  position:relative; z-index:1;
+  background: var(--bg-panel);
+  padding: 40px 36px;
+  border-radius: var(--radius-lg);
+  width: 400px;
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.45), 0 0 80px -20px var(--accent-glow);
+  animation: card-in .5s var(--ease-out);
+}
+@keyframes card-in{ from{ opacity:0; transform: translateY(10px) scale(.985); } to{ opacity:1; transform:none; } }
+.auth-card::before{
+  content:"";
+  position:absolute; inset:-1px;
+  border-radius: var(--radius-lg);
+  padding:1px;
+  background: var(--accent-grad);
+  opacity:0.35;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events:none;
+}
+.brand{
+  display:flex; align-items:center; gap:10px; justify-content:center;
+  margin-bottom: 22px;
+}
+.brand-mark{
+  width:34px; height:34px; border-radius:10px;
+  background: var(--accent-grad);
+  display:flex; align-items:center; justify-content:center;
+  font-family: var(--font-display); font-weight:800; font-size:16px; color:#0d0e13;
+}
+.brand-name{ font-family: var(--font-display); font-weight:700; font-size:19px; letter-spacing:0.2px; }
+
+.auth-card h2{
+  margin: 0 0 4px 0; color: var(--text-primary); text-align:center;
+  font-family: var(--font-display); font-size: 22px; font-weight:700;
+}
+.auth-card p.subtitle{
+  color: var(--text-muted); text-align:center; margin: 0 0 26px 0; font-size: 13.5px;
+}
+.input-group{ margin-bottom: 16px; }
+.input-group label{
+  display:block; color: var(--text-muted); font-size: 11px; font-weight:600;
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 7px;
+}
+input{
+  width:100%; padding: 11px 12px; background: var(--bg-deepest);
+  border: 1px solid var(--border-soft); color: var(--text-primary);
+  border-radius: var(--radius-sm); font-size: 14.5px; outline:none;
+  transition: border-color .15s, box-shadow .15s;
+}
+input:focus{ border-color: var(--accent-2); box-shadow: 0 0 0 3px var(--accent-ring); }
+input:disabled{ opacity:.5; }
+
+.error-text{ color: var(--danger); font-size: 12.5px; margin: -8px 0 12px 0; min-height: 16px; }
+
+.btn-auth{
+  width:100%; padding: 12px; background: var(--accent-grad); color: #10111a;
+  border:none; border-radius: var(--radius-sm); font-weight:700; font-size: 14.5px;
+  cursor:pointer; margin-top:6px; transition: filter .15s, transform .1s;
+}
+.btn-auth:hover:not(:disabled){ filter: brightness(1.08); }
+.btn-auth:active:not(:disabled){ transform: translateY(1px); }
+.btn-auth:disabled{ background: var(--bg-raised); color: var(--text-faint); cursor:not-allowed; }
+
+.switch-link{
+  color: var(--accent-2); font-size: 12.5px; text-align:center; cursor:pointer;
+  margin-top: 18px; display:block; user-select:none;
+}
+.switch-link:hover{ text-decoration: underline; }
+
+/* =========================================================
+   APPLICATION
+   ========================================================= */
+#chatApp{
+  width: 96vw; max-width: 1200px; height: 88vh;
+  background: var(--bg-panel);
+  border-radius: var(--radius-lg);
+  display:none;
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+  overflow:hidden;
+}
+.app-shell{ display:flex; height:100%; width:100%; }
+
+/* --- Rail d'icônes --- */
+.rail{
+  width: 72px; background: var(--bg-deepest);
+  display:flex; flex-direction:column; align-items:center;
+  padding: 16px 0; gap: 10px; flex-shrink:0;
+  border-right: 1px solid var(--border-soft);
+}
+.rail-logo{
+  width:42px; height:42px; border-radius:14px; background: var(--accent-grad);
+  display:flex; align-items:center; justify-content:center;
+  font-family: var(--font-display); font-weight:800; color:#0d0e13; font-size:15px;
+  margin-bottom: 6px;
+}
+.rail-btn{
+  width:46px; height:46px; border-radius: 14px; background: var(--bg-panel-2);
+  display:flex; align-items:center; justify-content:center; cursor:pointer;
+  color: var(--text-muted); transition: all .15s; position:relative;
+  border: 1px solid transparent;
+}
+.rail-btn:hover{ background: var(--bg-raised); color: var(--text-primary); }
+.rail-btn.active{ background: var(--accent-ring); color: var(--accent-2); border-color: rgba(255, 45, 71, 0.4); }
+.rail-btn svg{ width:20px; height:20px; }
+.rail-badge{
+  position:absolute; top:-4px; right:-4px; background: var(--danger);
+  color:white; font-size:10px; font-weight:700; min-width:16px; height:16px;
+  border-radius:8px; display:flex; align-items:center; justify-content:center;
+  padding: 0 3px; font-family: var(--font-body);
+}
+.rail-spacer{ flex:1; }
+.rail-profile{ position:relative; cursor:pointer; }
+.avatar{
+  width:42px; height:42px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  font-family: var(--font-display); font-weight:700; font-size:15px; color:#0d0e13;
+  flex-shrink:0;
+}
+.avatar-dot{
+  position:absolute; bottom:-1px; right:-1px; width:13px; height:13px;
+  border-radius:50%; background: var(--online); border: 3px solid var(--bg-deepest);
+}
+
+/* --- Panneau latéral (contenu contextuel) --- */
+.side-panel{
+  width: 300px; background: var(--bg-panel-2); flex-shrink:0;
+  display:flex; flex-direction:column; border-right: 1px solid var(--border-soft);
+}
+.side-header{
+  padding: 18px 18px 12px 18px; border-bottom: 1px solid var(--border-soft);
+}
+.side-header h3{
+  margin:0 0 12px 0; font-family: var(--font-display); font-size:15px; font-weight:700;
+}
+.add-friend-row{ display:flex; gap:8px; }
+.add-friend-row input{ flex:1; font-family: var(--font-mono); font-size:13px; }
+.btn-mini{
+  background: var(--accent-grad); border:none; color:#10111a; border-radius: var(--radius-sm);
+  padding: 0 14px; font-weight:700; font-size:13px; cursor:pointer; white-space:nowrap;
+}
+.btn-mini:hover{ filter:brightness(1.08); }
+.hint-text{ font-size:11px; color: var(--text-faint); margin-top:7px; }
+.side-error{ color: var(--danger); font-size:12px; margin-top:7px; min-height:14px; }
+
+.tabs{ display:flex; gap:4px; padding: 10px 12px 0 12px; }
+.tab{
+  flex:1; text-align:center; padding: 8px 4px; font-size:12px; font-weight:600;
+  color: var(--text-muted); cursor:pointer; border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  border-bottom: 2px solid transparent;
+}
+.tab.active{ color: var(--text-primary); border-bottom-color: var(--accent-2); }
+.tab .count{ color: var(--text-faint); font-weight:500; }
+
+.list-scroll{ flex:1; overflow-y:auto; padding: 8px 10px; }
+.list-empty{
+  color: var(--text-faint); font-size: 12.5px; text-align:center;
+  padding: 30px 14px; line-height:1.5;
+}
+
+.friend-row{
+  display:flex; align-items:center; gap:10px; padding: 8px 8px;
+  border-radius: var(--radius-md); cursor:pointer; transition: background .12s;
+  position:relative;
+}
+.friend-row:hover{ background: var(--bg-raised); }
+.friend-row .avatar{ width:36px; height:36px; font-size:13px; }
+.friend-meta{ flex:1; min-width:0; }
+.friend-name{ font-size: 13.5px; font-weight:600; color: var(--text-primary); display:flex; align-items:center; gap:6px; }
+.friend-sub{ font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+.friend-actions{ display:flex; gap:6px; }
+.icon-btn{
+  width:30px; height:30px; border-radius: 8px; border:none; background: var(--bg-raised);
+  color: var(--text-muted); display:flex; align-items:center; justify-content:center; cursor:pointer;
+  transition: all .12s;
+}
+.icon-btn:hover{ background: var(--accent-1); color:white; }
+.icon-btn.recording{ background: var(--danger); color:white; animation: pulseRec 1s infinite; }
+@keyframes pulseRec{ 0%,100%{ opacity:1; } 50%{ opacity:.5; } }
+.icon-btn.danger:hover{ background: var(--danger); }
+.icon-btn svg{ width:15px; height:15px; }
+
+.unread-pill{
+  background: var(--accent-grad); color:#10111a; font-size:10px; font-weight:800;
+  min-width:16px; height:16px; border-radius:8px; display:flex; align-items:center;
+  justify-content:center; padding:0 4px; flex-shrink:0;
+}
+
+.request-row{
+  display:flex; align-items:center; gap:10px; padding:10px 8px; border-radius: var(--radius-md);
+}
+.request-row:hover{ background: var(--bg-raised); }
+
+/* --- Zone principale --- */
+.main-area{ flex:1; display:flex; flex-direction:column; min-width:0; }
+.chat-header{
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 14px 20px; border-bottom: 1px solid var(--border-soft);
+  gap:10px;
+}
+.chat-header .title{
+  font-size: 15px; font-weight:700; color: var(--text-primary); font-family: var(--font-display);
+  display:flex; align-items:center; gap:8px; min-width:0;
+}
+.chat-header .title .hash{ color: var(--text-faint); }
+.status{ font-size:11.5px; display:flex; align-items:center; gap:6px; color: var(--text-muted); flex-shrink:0; }
+.status-dot{ width:8px; height:8px; border-radius:50%; background: var(--idle); transition: background .2s; animation: dot-pulse 1.3s ease-in-out infinite; }
+.status-dot.connected{ background: var(--online); animation:none; }
+.status-dot.disconnected{ background: var(--danger); animation:none; }
+@keyframes dot-pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.35; } }
+
+.back-btn{
+  width:32px; height:32px; border-radius:9px; border:none; background: var(--bg-panel-2);
+  color: var(--text-muted); display:flex; align-items:center; justify-content:center;
+  cursor:pointer; flex-shrink:0;
+}
+.back-btn:hover{ background: var(--bg-raised); color: var(--text-primary); }
+.back-btn svg{ width:16px; height:16px; }
+
+.dm-call-btn{
+  width:32px; height:32px; border-radius:9px; border:none; background: var(--bg-panel-2);
+  color: var(--text-muted); display:flex; align-items:center; justify-content:center;
+  cursor:pointer; flex-shrink:0;
+}
+.dm-call-btn:hover:not(:disabled){ background: var(--accent-1); color:white; }
+.dm-call-btn:disabled{ opacity:.3; cursor:not-allowed; }
+.dm-call-btn svg{ width:16px; height:16px; }
+
+#chat, #dmChat{ flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding: 18px 20px; }
+
+.msg{
+  background: var(--bg-panel-2); padding: 9px 14px; border-radius: var(--radius-md);
+  width:fit-content; max-width:70%; word-break: break-word;
+  animation: msg-in .25s var(--ease-out);
+  border: 1px solid transparent;
+}
+@keyframes msg-in{ from{ opacity:0; transform: translateY(4px); } to{ opacity:1; transform:none; } }
+.msg.own{ align-self:flex-end; background: var(--accent-ring); border-color: rgba(255,45,71,0.18); }
+.msg.system{
+  align-self:center; background:transparent; color: var(--text-faint);
+  font-size:12px; font-style:italic;
+  animation: none;
+}
+.msg-top{ display:flex; align-items:baseline; gap:8px; }
+.author{ font-weight:700; font-size:13.5px; font-family: var(--font-display); }
+.timestamp{ color: var(--text-faint); font-size:10.5px; font-family: var(--font-mono); }
+.text{ color: var(--text-primary); font-size:14.5px; white-space:pre-wrap; margin-top:2px; }
+
+.chat-input-box{ display:flex; gap:10px; padding: 14px 20px 18px 20px; }
+.chat-input-box input{ flex:1; }
+.btn-send{
+  background: var(--accent-grad); color:#10111a; border:none; padding: 0 22px;
+  border-radius: var(--radius-sm); cursor:pointer; font-weight:700; font-size:14px;
+}
+.btn-send:disabled{ background: var(--bg-raised); color: var(--text-faint); cursor:not-allowed; }
+.char-count{ font-size:10.5px; color: var(--text-faint); text-align:right; padding: 0 20px; font-family: var(--font-mono); }
+
+/* --- Vue "Friends" centrale (placeholder quand aucun DM ouvert) --- */
+.friends-hero{
+  flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  color: var(--text-muted); gap:14px; padding: 20px;
+}
+.friends-hero svg{ width:64px; height:64px; opacity:.35; }
+.friends-hero .lead{ font-family: var(--font-display); font-weight:700; font-size:16px; color: var(--text-primary); }
+.friends-hero .sub{ font-size:13px; max-width:320px; text-align:center; line-height:1.5; }
+
+/* --- Profil / NULLID popover --- */
+.profile-pop{
+  position:fixed; z-index:40; display:none; width:250px;
+  background: var(--bg-raised); border:1px solid var(--border-soft); border-radius: var(--radius-md);
+  padding: 16px; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+}
+.profile-pop.open{ display:block; }
+.profile-pop .pname{ font-family: var(--font-display); font-weight:700; font-size:15px; margin-bottom:10px; }
+.nullid-badge{
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  background: var(--bg-deepest); border:1px solid var(--border-soft); border-radius: var(--radius-sm);
+  padding: 9px 11px;
+}
+.nullid-badge .code{
+  font-family: var(--font-mono); font-size:13px; letter-spacing: 0.03em;
+  background: var(--accent-grad); -webkit-background-clip:text; background-clip:text; color:transparent;
+}
+.copy-btn{
+  background:none; border:none; color: var(--text-muted); cursor:pointer; padding:4px; border-radius:6px;
+}
+.copy-btn:hover{ color: var(--text-primary); background: var(--bg-panel-2); }
+.copy-btn svg{ width:15px; height:15px; }
+.profile-pop .label-small{
+  font-size: 10.5px; text-transform:uppercase; letter-spacing:.06em; color: var(--text-faint); margin: 12px 0 6px;
+}
+.logout-btn{
+  width:100%; text-align:left; background:none; border:none; color: var(--danger);
+  font-size:13px; padding: 8px 4px; cursor:pointer; font-family: var(--font-body); font-weight:600;
+}
+.logout-btn:hover{ text-decoration: underline; }
+
+.notif-row{
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  padding: 6px 4px; font-size:12.5px; color: var(--text-muted);
+}
+.notif-toggle{
+  width:36px; height:20px; border-radius:10px; background: var(--bg-panel-2);
+  border:1px solid var(--border-soft); cursor:pointer; position:relative; flex-shrink:0;
+  transition: background .15s;
+}
+.notif-toggle::after{
+  content:""; position:absolute; top:1px; left:1px; width:16px; height:16px; border-radius:50%;
+  background: var(--text-faint); transition: transform .15s, background .15s;
+}
+.notif-toggle.on{ background: var(--accent-ring); border-color: var(--accent-1); }
+.notif-toggle.on::after{ transform: translateX(16px); background: var(--accent-2); }
+
+.credit-line{
+  text-align:center; font-size:10.5px; color: var(--text-faint);
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-soft);
+  letter-spacing: .03em;
+}
+.credit-line span{
+  background: var(--accent-grad); -webkit-background-clip:text; background-clip:text; color:transparent;
+  font-weight:700;
+}
+
+/* --- Toast (demande d'ami reçue, erreurs, etc.) --- */
+.toast-stack{ position:fixed; top:18px; right:18px; z-index:60; display:flex; flex-direction:column; gap:10px; }
+.toast{
+  background: var(--bg-raised); border:1px solid var(--border-soft); border-left:3px solid var(--accent-2);
+  border-radius: var(--radius-md);
+  padding: 14px 16px; width: 300px; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+  animation: toast-in .25s var(--ease-out);
+}
+@keyframes toast-in{ from{ opacity:0; transform: translateY(-8px);} to{opacity:1; transform:translateY(0);} }
+.toast .t-title{ font-family: var(--font-display); font-weight:700; font-size:13.5px; margin-bottom:4px; display:flex; align-items:center; gap:8px; }
+.toast .t-body{ font-size:12.5px; color: var(--text-muted); margin-bottom:10px; }
+.toast .t-actions{ display:flex; gap:8px; }
+.toast .t-actions button{
+  flex:1; padding:7px; border-radius:8px; border:none; font-size:12px; font-weight:700; cursor:pointer;
+}
+.toast .t-accept{ background: var(--accent-grad); color:#10111a; }
+.toast .t-decline{ background: var(--bg-panel-2); color: var(--text-muted); }
+.toast .t-decline:hover{ color: var(--text-primary); }
+
+/* --- Overlay d'appel --- */
+.call-overlay{
+  position:fixed; inset:0; background: rgba(10,10,14,0.75); backdrop-filter: blur(6px);
+  z-index:70; display:none; align-items:center; justify-content:center;
+}
+.call-overlay.open{ display:flex; }
+.call-card{
+  background: var(--bg-panel); border:1px solid var(--border-soft); border-radius: var(--radius-lg);
+  padding: 36px 32px; width:320px; text-align:center; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.call-avatar{
+  width:84px; height:84px; border-radius:50%; margin: 0 auto 16px auto;
+  display:flex; align-items:center; justify-content:center; font-family: var(--font-display);
+  font-weight:800; font-size:28px; color:#0d0e13; position:relative;
+}
+.call-avatar.ringing::after{
+  content:""; position:absolute; inset:-8px; border-radius:50%;
+  border:2px solid var(--accent-2); animation: ring-pulse 1.4s ease-out infinite;
+}
+@keyframes ring-pulse{ 0%{ transform:scale(0.9); opacity:1;} 100%{ transform:scale(1.35); opacity:0;} }
+.call-name{ font-family: var(--font-display); font-weight:700; font-size:17px; margin-bottom:4px; }
+.call-status{ font-size:12.5px; color: var(--text-muted); margin-bottom: 24px; font-family: var(--font-mono); }
+.call-actions{ display:flex; gap:16px; justify-content:center; }
+.call-btn{
+  width:52px; height:52px; border-radius:50%; border:none; cursor:pointer;
+  display:flex; align-items:center; justify-content:center; transition: transform .1s, filter .15s;
+}
+.call-btn:active{ transform: scale(0.92); }
+.call-btn svg{ width:22px; height:22px; }
+.call-btn.accept{ background: var(--online); color:#0d0e13; }
+.call-btn.decline{ background: var(--danger); color:white; }
+.call-btn.hangup{ background: var(--danger); color:white; }
+.call-btn.mute{ background: var(--bg-raised); color: var(--text-primary); }
+.call-btn.mute.active-mute{ background: var(--accent-1); color:white; }
+
+/* --- Fondu doux entre les vues --- */
+.view-fade{ animation: view-fade-in .22s var(--ease-out); }
+@keyframes view-fade-in{ from{ opacity:0; transform: translateY(6px); } to{ opacity:1; transform:none; } }
+@media (prefers-reduced-motion: reduce){ .view-fade{ animation:none; } }
+
+/* =========================================================
+   TUTORIEL D'ONBOARDING
+   ========================================================= */
+.tuto-overlay{
+  position:fixed; inset:0; background: rgba(6,6,9,0.78); backdrop-filter: blur(6px);
+  z-index:300; display:none; align-items:center; justify-content:center; padding:16px;
+}
+.tuto-overlay.open{ display:flex; }
+.tuto-card{
+  background: var(--bg-panel); border:1px solid var(--border-soft); border-radius: var(--radius-lg);
+  width:min(460px, 100%); max-height:88vh; overflow-y:auto; padding:28px 26px 22px 26px;
+  box-shadow: 0 24px 70px rgba(0,0,0,0.55); position:relative;
+}
+.tuto-skip{
+  position:absolute; top:14px; right:14px; background:none; border:none; color: var(--text-faint);
+  font-size:12.5px; cursor:pointer; padding:6px 8px; border-radius:8px;
+}
+.tuto-skip:hover{ color: var(--text-primary); background: var(--bg-panel-2); }
+.tuto-icon{
+  width:56px; height:56px; border-radius:16px; background: var(--accent-grad);
+  display:flex; align-items:center; justify-content:center; margin-bottom:16px;
+  box-shadow: 0 8px 24px var(--accent-glow);
+}
+.tuto-icon svg{ width:28px; height:28px; color:#0d0e13; }
+.tuto-title{ font-family: var(--font-display); font-weight:800; font-size:19px; margin-bottom:8px; }
+.tuto-text{ font-size:14px; line-height:1.6; color: var(--text-muted); margin-bottom:4px; }
+.tuto-text b{ color: var(--text-primary); }
+.tuto-text code{
+  font-family: var(--font-mono); background: var(--bg-panel-2); padding:1px 6px; border-radius:5px;
+  color: var(--accent-3); font-size:12.5px;
+}
+.tuto-dots{ display:flex; gap:6px; justify-content:center; margin: 20px 0 16px 0; }
+.tuto-dot{ width:7px; height:7px; border-radius:50%; background: var(--bg-raised); transition: all .2s var(--ease-out); }
+.tuto-dot.active{ background: var(--accent-2); width:20px; border-radius:4px; }
+.tuto-actions{ display:flex; gap:10px; }
+.tuto-btn{
+  flex:1; border:none; border-radius: var(--radius-sm); padding:11px; font-weight:700; font-size:13.5px;
+  cursor:pointer; font-family: var(--font-display);
+}
+.tuto-btn.primary{ background: var(--accent-grad); color:#10111a; }
+.tuto-btn.ghost{ background: var(--bg-panel-2); color: var(--text-muted); }
+.tuto-btn.ghost:hover{ color: var(--text-primary); }
+.tuto-help-btn{ position:relative; }
+.tuto-help-btn .rail-badge.pulse{ animation: pulseRec 1.6s infinite; }
+
+/* =========================================================
+   RESPONSIVE MOBILE
+   ========================================================= */
+@media (max-width: 860px){
+  #chatApp{ width:100vw; max-width:none; height:100dvh; border-radius:0; border:none; }
+  .side-panel{
+    position:fixed; inset:0; z-index:20; width:100%;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+  .toast-stack{ left:12px; right:12px; top: max(12px, env(safe-area-inset-top)); }
+  .toast{ width:auto; }
+}
+
+@media (max-width: 720px){
+  body{ overflow:auto; }
+  .auth-wrap{ padding: 16px; }
+  .auth-card{ width:100%; padding: 28px 20px; }
+  #chatApp{ width:100vw; height:100dvh; height:100svh; border-radius:0; }
+  .app-shell{ flex-direction:column-reverse; }
+
+  /* La barre d'icônes devient une barre du bas, façon app mobile */
+  .rail{
+    width:100%; flex-direction:row; align-items:center; justify-content:space-around;
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)) 10px;
+    border-right:none; border-top: 1px solid var(--border-soft); gap:4px; flex-shrink:0;
+  }
+  .rail-logo{ display:none; }
+  .rail-spacer{ display:none; }
+  .rail-btn{ width:50px; height:50px; }
+
+  .main-area{ min-height:0; }
+  .chat-header{ padding: 12px 14px; }
+  .chat-header .title{ font-size:14px; }
+  #chat, #dmChat{ padding: 12px 14px; }
+  .msg{ max-width:85%; }
+  .chat-input-box{ padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)) 12px; gap:8px; }
+  .char-count{ padding: 0 14px; }
+
+  .side-panel{ width:100%; }
+  .side-header{ padding: 16px 14px 10px 14px; }
+
+  .friends-hero{ padding: 20px 16px; }
+  .friends-hero .sub{ max-width: 280px; }
+
+  .toast-stack{ left:10px; right:10px; top: max(10px, env(safe-area-inset-top)); }
+  .toast{ width:auto; }
+
+  .call-card{ width:min(320px, 88vw); padding: 28px 22px; }
+
+  /* Le popover profil devient une feuille ancrée en bas de l'écran */
+  .profile-pop{
+    left:12px !important; right:12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); top:auto !important;
+    width:auto; max-height:70vh; overflow-y:auto;
+  }
+
+  .tuto-card{ padding: 22px 18px 18px 18px; }
+}
+
+@media (max-width: 420px){
+  .rail-btn{ width:46px; height:46px; }
+  .avatar{ width:38px; height:38px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     ÉCRAN DE CONNEXION / INSCRIPTION
+     ============================================================ -->
+<div class="auth-wrap" id="authWrap">
+  <div class="cipher-rain" id="cipherRain"></div>
+  <div class="auth-card" id="authBox">
+<div class="brand">
+  <img src="logo.png" alt="NullChat Logo" style="width: 80px; height: 80px; border-radius: 50%; object-fit: cover; background: var(--accent-grad);"
+       onerror="this.style.display='none'; document.getElementById('brandFallback').style.display='flex';">
+  <div class="brand-mark" id="brandFallback" style="display:none; width:80px; height:80px; font-size:30px;">N∅</div>
+  <div class="brand-name" style="font-size:24px;">NullChat</div>
+</div>
+    <h2 id="authTitle">Bienvenue !</h2>
+    <p class="subtitle" id="authSubtitle">Nous sommes ravis de vous revoir !</p>
+
+    <div class="input-group">
+      <label for="authUsername">Nom d'utilisateur</label>
+      <input type="text" id="authUsername" placeholder="Entre ton pseudo" maxlength="32" autocomplete="username">
+    </div>
+    <div class="input-group">
+      <label for="authPassword">Mot de passe</label>
+      <input type="password" id="authPassword" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <div class="input-group" id="authNullIdGroup" style="display:none;">
+      <label for="authNullId">NULLID personnalisé (optionnel)</label>
+      <input type="text" id="authNullId" placeholder="ex: ZIUX ou AB12-9F3D" maxlength="16" style="text-transform:uppercase;">
+    </div>
+
+    <div class="error-text" id="authError"></div>
+
+    <button class="btn-auth fx-btn" onclick="handleAuth()" id="authBtn">Se connecter</button>
+    <span class="switch-link" onclick="toggleAuthMode()" id="toggleLink">Besoin d'un compte ? S'inscrire</span>
+  </div>
+</div>
+
+<!-- ============================================================
+     APPLICATION
+     ============================================================ -->
+<div id="chatApp">
+  <div class="app-shell">
+
+    <!-- Rail d'icônes -->
+    <div class="rail">
+<img src="logo.png" alt="Logo" style="width: 48px; height: 48px; object-fit: cover; margin-bottom: 6px; border-radius: 50%; background: var(--accent-grad);"
+     onerror="this.style.display='none'; document.getElementById('railBrandFallback').style.display='flex';">
+<div class="rail-logo" id="railBrandFallback" style="display:none;">N∅</div>
+
+      <div class="rail-btn fx-btn active" id="navGeneral" onclick="switchView('general')" title="Salon général">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+      </div>
+
+      <div class="rail-btn fx-btn" id="navFriends" onclick="switchView('friends')" title="Amis">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span class="rail-badge" id="requestBadge" style="display:none;">0</span>
+      </div>
+
+      <div class="rail-btn fx-btn tuto-help-btn" id="navHelp" onclick="openTutorial()" title="Comment ça marche ?">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>
+      </div>
+
+      <div class="rail-spacer"></div>
+
+      <div class="rail-profile" id="railProfile" onclick="toggleProfilePop(event)">
+        <div class="avatar" id="myAvatar"></div>
+        <div class="avatar-dot"></div>
+      </div>
+    </div>
+
+    <!-- Panneau latéral : Amis -->
+    <div class="side-panel" id="friendsPanel" style="display:none;">
+      <div class="side-header">
+        <h3>Ajouter un ami</h3>
+        <div class="add-friend-row">
+          <input type="text" id="addFriendInput" placeholder="NULLID (ex: ZIUX ou A3F9-72CD)" maxlength="16">
+          <button class="btn-mini fx-btn" onclick="sendFriendRequest()">Ajouter</button>
+        </div>
+        <div class="hint-text">Ton NULLID se trouve dans ton profil (icône en bas à gauche).</div>
+        <div class="side-error" id="friendError"></div>
+      </div>
+
+      <div class="tabs">
+        <div class="tab active" data-tab="online" onclick="setFriendTab('online')">En ligne <span class="count" id="countOnline"></span></div>
+        <div class="tab" data-tab="all" onclick="setFriendTab('all')">Tous <span class="count" id="countAll"></span></div>
+        <div class="tab" data-tab="pending" onclick="setFriendTab('pending')">Demandes <span class="count" id="countPending"></span></div>
+      </div>
+
+      <div class="list-scroll" id="friendListScroll"></div>
+    </div>
+
+    <!-- Zone principale -->
+    <div class="main-area">
+      <!-- Vue Salon général -->
+      <div class="main-area" id="viewGeneral" style="display:flex;">
+        <div class="chat-header">
+          <span class="title"><span class="hash">#</span> général</span>
+          <span class="status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connexion...</span></span>
+        </div>
+        <div id="chat"></div>
+        <div class="chat-input-box">
+          <button class="icon-btn fx-btn" id="genAttachBtn" title="Envoyer une photo ou vidéo" onclick="document.getElementById('genFileInput').click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="file" id="genFileInput" accept="image/*,video/*" style="display:none" onchange="handleGeneralFileSelected(event)">
+          <button class="icon-btn fx-btn" id="genMicBtn" title="Message vocal" onclick="toggleGeneralVoiceRecording()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
+          </button>
+          <input type="text" id="msgInput" placeholder="Envoyer un message chiffré..." disabled maxlength="2000">
+          <button class="btn-send fx-btn" onclick="sendSecretMessage()" id="sendBtn" disabled>Envoyer</button>
+        </div>
+        <div class="char-count" id="charCount"></div>
+      </div>
+
+      <!-- Vue Amis (placeholder central) -->
+      <div class="friends-hero" id="viewFriendsHero" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <div class="lead">Tes amis</div>
+        <div class="sub">Ajoute quelqu'un avec son NULLID pour discuter en privé et l'appeler. Clique sur un ami dans la liste pour ouvrir la conversation.</div>
+      </div>
+
+      <!-- Vue Conversation privée (DM) -->
+      <div class="main-area" id="viewDM" style="display:none;">
+        <div class="chat-header">
+          <button class="back-btn fx-btn" onclick="closeDm()" title="Retour">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          </button>
+          <span class="title" style="flex-direction:column; align-items:flex-start; line-height:1.2;">
+            <span style="display:flex; align-items:center; gap:8px;">
+              <span class="avatar" id="dmAvatar" style="width:26px;height:26px;font-size:11px;"></span>
+              <span id="dmPeerName">—</span>
+            </span>
+            <span id="dmPeerStatus" style="font-size:11px; color:var(--text-faint); font-weight:400;"></span>
+          </span>
+          <button class="dm-call-btn fx-btn" id="dmCallBtn" title="Appeler">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+          </button>
+          <button class="dm-call-btn fx-btn" id="dmDeleteBtn" title="Supprimer la conversation" onclick="currentDmPeer && deleteConversation(currentDmPeer.nullId)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>
+          </button>
+        </div>
+        <div id="dmChat"></div>
+        <div class="chat-input-box">
+          <button class="icon-btn fx-btn" id="dmAttachBtn" title="Envoyer une photo ou vidéo" onclick="document.getElementById('dmFileInput').click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="file" id="dmFileInput" accept="image/*,video/*" style="display:none" onchange="handleDmFileSelected(event)">
+          <button class="icon-btn fx-btn" id="dmMicBtn" title="Message vocal" onclick="toggleVoiceRecording()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
+          </button>
+          <input type="text" id="dmInput" placeholder="Message privé chiffré..." maxlength="2000">
+          <button class="btn-send fx-btn" onclick="sendDM()" id="dmSendBtn">Envoyer</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Popover profil / NULLID -->
+<div class="profile-pop" id="profilePop">
+  <div class="pname" id="profileName"></div>
+  <div class="nullid-badge">
+    <span class="code" id="profileNullId">----</span>
+    <button class="copy-btn fx-btn" onclick="copyNullId()" title="Copier">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+    </button>
+  </div>
+  <div class="label-small">Notifications</div>
+  <div class="notif-row">
+    <span>Son + notification bureau</span>
+    <button class="notif-toggle fx-btn" id="notifToggle" onclick="toggleNotifs()" title="Activer/désactiver"></button>
+  </div>
+  <div class="label-small">Compte</div>
+  <button class="logout-btn fx-btn" style="background:var(--bg-raised);color:var(--text-primary);margin-bottom:8px;" onclick="openSettings()">Paramètres</button>
+  <button class="logout-btn fx-btn" onclick="handleLogout()">Se déconnecter</button>
+  <div class="credit-line">Fait par <span>2FT4</span></div>
+</div>
+
+<!-- Modale Paramètres -->
+<div class="settings-overlay" id="settingsOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
+  <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(420px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+      <div style="font-family:var(--font-display); font-weight:700; font-size:18px;">Paramètres</div>
+      <button class="icon-btn fx-btn" onclick="closeSettings()" title="Fermer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="label-small">Photo de profil</div>
+    <div style="display:flex; align-items:center; gap:14px; margin:8px 0 18px 0;">
+      <div class="avatar" id="settingsAvatarPreview" style="width:56px;height:56px;font-size:20px;"></div>
+      <div>
+        <button class="notif-toggle fx-btn" style="width:auto; padding:8px 14px; border-radius:var(--radius-sm);" onclick="document.getElementById('avatarFileInput').click()">Changer la photo</button>
+        <input type="file" id="avatarFileInput" accept="image/*" style="display:none" onchange="handleAvatarSelected(event)">
+        <div id="avatarRemoveRow" style="margin-top:6px; display:none;">
+          <span class="switch-link" onclick="removeAvatar()">Retirer la photo</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="label-small">Micro (entrée audio)</div>
+    <select id="audioInputSelect" class="settings-select" style="width:100%; margin:8px 0 16px 0; padding:10px; border-radius:var(--radius-sm); background:var(--bg-raised); color:var(--text-primary); border:1px solid var(--border-soft);"></select>
+
+    <div class="label-small">Haut-parleur (sortie audio)</div>
+    <select id="audioOutputSelect" class="settings-select" style="width:100%; margin:8px 0 8px 0; padding:10px; border-radius:var(--radius-sm); background:var(--bg-raised); color:var(--text-primary); border:1px solid var(--border-soft);"></select>
+    <div class="sub" id="audioOutputNote" style="font-size:12px; color:var(--text-muted); margin-bottom:16px;"></div>
+
+    <div class="label-small">NULLID</div>
+    <div class="nullid-badge" style="margin:8px 0;">
+      <span class="code" id="settingsNullId">----</span>
+      <button class="copy-btn fx-btn" onclick="copyNullId()" title="Copier">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+    </div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted);">
+      Le NULLID se choisit uniquement à l'inscription (pour ne pas casser tes amitiés et conversations existantes, qui y sont liées). Tu ne peux pas le changer ici, mais tu pouvais en proposer un personnalisé (3 à 16 caractères, lettres/chiffres, ex: "ZIUX") au moment de créer ton compte.
+    </div>
+
+    <div class="label-small" style="margin-top:18px;">Sessions actives</div>
+    <div id="sessionsList" style="margin:8px 0 4px 0; font-size:13px; color:var(--text-muted);">Chargement…</div>
+  </div>
+</div>
+
+<!-- Toasts (demandes d'amis, erreurs) -->
+<div class="toast-stack" id="toastStack"></div>
+
+<!-- Overlay d'appel -->
+<div class="call-overlay" id="callOverlay">
+  <div class="call-card">
+    <div class="call-avatar" id="callAvatar">?</div>
+    <div class="call-name" id="callName">—</div>
+    <div class="call-status" id="callStatusText">...</div>
+    <div class="call-actions" id="callActions"></div>
+  </div>
+</div>
+
+<audio id="remoteAudio" autoplay></audio>
+
+<!-- Tutoriel de bienvenue -->
+<div class="tuto-overlay" id="tutoOverlay">
+  <div class="tuto-card">
+    <button class="tuto-skip" onclick="closeTutorial()">Passer ✕</button>
+    <div class="tuto-icon" id="tutoIcon"></div>
+    <div class="tuto-title" id="tutoTitle"></div>
+    <div class="tuto-text" id="tutoText"></div>
+    <div class="tuto-dots" id="tutoDots"></div>
+    <div class="tuto-actions">
+      <button class="tuto-btn ghost" id="tutoPrevBtn" onclick="tutorialPrev()">Précédent</button>
+      <button class="tuto-btn primary fx-btn" id="tutoNextBtn" onclick="tutorialNext()">Suivant</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =========================================================
+   ÉTAT GLOBAL
+   ========================================================= */
+let isLoginMode = true;
+let currentUser = null;
+let myNullId = null;
+let myAvatarDataUrl = null;
+let authToken = null;
+let socket = null;
+let myKeyPair = null;
+let currentView = 'general';
+let currentFriendTab = 'online';
+
+// --- Persistance de session : on ne redemande le mot de passe qu'après 2 mois d'inactivité ---
+const SESSION_STORAGE_KEY = 'nullchat_session_v1';
+const SESSION_DURATION_MS = 60 * 24 * 60 * 60 * 1000; // ~2 mois
+const NEW_ACCOUNT_FLAG_KEY = 'nullchat_new_account';
+const TUTORIAL_SEEN_KEY = 'nullchat_tutorial_seen';
+let tutorialStepIndex = 0;
+let pendingTutorialAfterLogin = false;
+
+// Chat général : peer -> { sharedKey }, indexé par socket id (comportement existant)
+const peers = new Map();
+
+// Amis : nullId -> { nullId, username, online, socketId }
+const friends = new Map();
+// Demandes reçues en attente : requestId -> { nullId, username }
+const pendingRequests = new Map();
+// Clés partagées pour les messages privés, indexées par nullId
+const dmKeys = new Map();
+// Historique des conversations privées, indexé par nullId
+const dmHistory = new Map();
+// Messages non lus par ami, indexé par nullId
+const unreadDm = new Map();
+// Ami actuellement ouvert en DM
+let currentDmPeer = null;
+// NULLIDs bloqués (persistés localement, propagés au serveur via friend:block)
+const blockedIds = new Set();
+
+// ---- Perf : évite le gel de l'UI après beaucoup de messages ----
+const MAX_RENDERED_MESSAGES = 200; // messages gardés dans le DOM par salon/conv
+let activeReveals = 0;
+const MAX_CONCURRENT_REVEALS = 6; // au-delà, on affiche le texte direct (pas d'anim)
+
+// ---- Pièces jointes ----
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024; // 15 Mo, avant chiffrement
+let mediaRecorder = null;
+let recordedChunks = [];
+
+// Notifications
+let notifsEnabled = false;
+let audioCtx = null;
+
+// Appel en cours
+let rtcConn = null;
+let localStream = null;
+let activeCallPeer = null; // { nullId, username, socketId }
+let callMuted = false;
+
+function colorForName(name){
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue}, 65%, 58%)`;
+}
+function initialFor(name){ return (name || '?').trim().charAt(0).toUpperCase(); }
+
+// Affiche une photo de profil si disponible, sinon retombe sur l'initiale colorée.
+function renderAvatarInto(el, { username, avatarDataUrl }){
+  if (!el) return;
+  if (avatarDataUrl){
+    el.style.backgroundImage = `url(${avatarDataUrl})`;
+    el.style.backgroundSize = 'cover';
+    el.style.backgroundPosition = 'center';
+    el.style.background = el.style.background; // no-op, garde le fallback si l'image casse
+    el.textContent = '';
+  } else {
+    el.style.backgroundImage = 'none';
+    el.style.background = colorForName(username || '');
+    el.textContent = initialFor(username);
+  }
+}
+// Revalidation côté client (défense en profondeur) : on ne fait jamais confiance
+// à une chaîne provenant du réseau avant de l'interpoler dans un attribut HTML,
+// même si le serveur est censé l'avoir déjà validée.
+const SAFE_AVATAR_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+function avatarStyleAttr({ username, avatarDataUrl }){
+  if (avatarDataUrl && SAFE_AVATAR_DATA_URL_RE.test(avatarDataUrl)){
+    return `background-image:url("${avatarDataUrl}");background-size:cover;background-position:center;`;
+  }
+  return `background:${colorForName(username || '')};`;
+}
+
+const SAFE_ATTACHMENT_DATA_URL_RE = {
+  image: /^data:image\/[a-z0-9.+-]+;base64,/i,
+  video: /^data:video\/[a-z0-9.+-]+;base64,/i,
+  audio: /^data:audio\/[a-z0-9.+-]+;base64,/i
+};
+// Le contenu déchiffré (dataUrl) provient d'un contact et n'est jamais un pur hasard
+// bienveillant à faire confiance : on vérifie que c'est bien un data: URI local du bon
+// type avant de l'utiliser comme src, sinon un contact malveillant pourrait glisser une
+// URL externe qui, chargée automatiquement, servirait de balise de tracking (fuite d'IP,
+// confirmation de lecture silencieuse).
+function isSafeAttachmentDataUrl(dataUrl, kind){
+  return typeof dataUrl === 'string' && !!SAFE_ATTACHMENT_DATA_URL_RE[kind]?.test(dataUrl);
+}
+
+function escapeHtml(str){
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+/* =========================================================
+   ANIMATION SIGNATURE : "déchiffrement" visuel du texte
+   Les messages reçus se révèlent depuis un flux de caractères
+   cryptiques vers le texte en clair, pour rendre visible ce que
+   fait réellement l'app à chaque message.
+   ========================================================= */
+const CIPHER_CHARS = '!<>-_\\/[]{}—=+*^?#$%&01';
+function prefersReducedMotion(){
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+function revealText(el, finalText, duration){
+  duration = duration || Math.min(700, 220 + finalText.length * 6);
+  // Si trop de messages arrivent d'un coup (spam), on saute l'animation :
+  // c'est ce qui provoquait le "gel" de la fenêtre / l'impression de ne
+  // plus pouvoir écrire après avoir reçu beaucoup de messages.
+  if (prefersReducedMotion() || !finalText || activeReveals >= MAX_CONCURRENT_REVEALS){
+    el.textContent = finalText;
+    return;
+  }
+  activeReveals++;
+  let done = false;
+  function finish(){
+    if (done) return;
+    done = true;
+    activeReveals = Math.max(0, activeReveals - 1);
+  }
+  const len = finalText.length;
+  const start = performance.now();
+  function frame(now){
+    // Si l'élément a été retiré du DOM (historique tronqué), on arrête proprement.
+    if (!el.isConnected){ finish(); return; }
+    const t = Math.min(1, (now - start) / duration);
+    let out = '';
+    for (let i = 0; i < len; i++){
+      const ch = finalText[i];
+      const charT = len <= 1 ? 1 : i / (len - 1);
+      if (t > charT * 0.7 || ch === ' ' || ch === '\n'){
+        out += ch;
+      } else {
+        out += CIPHER_CHARS[(Math.random() * CIPHER_CHARS.length) | 0];
+      }
+    }
+    el.textContent = out;
+    if (t < 1) requestAnimationFrame(frame);
+    else { el.textContent = finalText; finish(); }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* =========================================================
+   AUTHENTIFICATION
+   ========================================================= */
+function setAuthError(msg){ document.getElementById('authError').textContent = msg || ''; }
+
+function toggleAuthMode(){
+  isLoginMode = !isLoginMode;
+  setAuthError('');
+  document.getElementById('authTitle').innerText = isLoginMode ? 'Bienvenue !' : 'Créer un compte';
+  document.getElementById('authSubtitle').innerText = isLoginMode ? 'Nous sommes ravis de vous revoir !' : 'Rejoins NullChat dès maintenant.';
+  document.getElementById('authBtn').innerText = isLoginMode ? 'Se connecter' : "S'inscrire";
+  document.getElementById('toggleLink').innerText = isLoginMode ? "Besoin d'un compte ? S'inscrire" : 'Déjà un compte ? Se connecter';
+  document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
+}
+
+function setAuthLoading(loading){
+  const btn = document.getElementById('authBtn');
+  btn.disabled = loading;
+  btn.innerText = loading ? '...' : (isLoginMode ? 'Se connecter' : "S'inscrire");
+}
+
+async function handleAuth(){
+  const username = document.getElementById('authUsername').value.trim();
+  const password = document.getElementById('authPassword').value;
+  setAuthError('');
+
+  if (!username || !password) return setAuthError('Remplis tous les champs.');
+  if (username.length > 32) return setAuthError('Pseudo trop long (32 caractères max).');
+
+  setAuthLoading(true);
+  try{
+    if (isLoginMode){
+      const res = await fetch('/api/login', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return setAuthError(data.error || 'Connexion impossible.');
+
+      currentUser = username;
+      myNullId = data.nullId || null;
+      myAvatarDataUrl = data.avatarDataUrl || null;
+      if (myNullId) saveOwnAvatarLocally(myAvatarDataUrl);
+      loadBlockedIds();
+      authToken = data.token || null;
+      saveSession();
+      checkFirstLoginTutorial(username);
+      startApp();
+    } else {
+      const keyPair = await window.crypto.subtle.generateKey(
+        { name:'ECDH', namedCurve:'P-256' }, true, ['deriveKey']
+      );
+      const rawPublicKey = await window.crypto.subtle.exportKey('raw', keyPair.publicKey);
+      const customNullId = document.getElementById('authNullId').value.trim().toUpperCase();
+      if (customNullId && !/^[A-Z0-9][A-Z0-9-]{1,14}[A-Z0-9]$/.test(customNullId)){
+        setAuthLoading(false);
+        return setAuthError('NULLID invalide (3 à 16 caractères, lettres/chiffres, tiret(s) au milieu autorisé(s)).');
+      }
+
+      const res = await fetch('/api/register', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          username, password,
+          publicKey: Array.from(new Uint8Array(rawPublicKey)),
+          customNullId: customNullId || undefined
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return setAuthError(data.error || 'Inscription impossible.');
+
+      setAuthError('');
+      try{ localStorage.setItem(NEW_ACCOUNT_FLAG_KEY, username.toLowerCase()); }catch(e){}
+      document.getElementById('authUsername').value = username;
+      toggleAuthMode();
+      showToast({ title: 'Compte créé !', body: 'Connecte-toi maintenant, un petit guide t\'attend pour découvrir NullChat.' });
+    }
+  } catch(err){
+    console.error(err);
+    setAuthError('Erreur réseau, réessaie.');
+  } finally {
+    setAuthLoading(false);
+  }
+}
+
+document.getElementById('authPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleAuth(); });
+
+/* =========================================================
+   SESSION PERSISTANTE (connexion valable ~2 mois)
+   ========================================================= */
+function saveSession(){
+  if (!authToken) return;
+  try{
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+      token: authToken,
+      username: currentUser,
+      nullId: myNullId,
+      avatarDataUrl: myAvatarDataUrl,
+      expiresAt: Date.now() + SESSION_DURATION_MS
+    }));
+  }catch(e){ /* quota localStorage, tant pis, la session ne survivra pas */ }
+}
+function loadSession(){
+  try{
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    if (!s || !s.token || !s.expiresAt || s.expiresAt < Date.now()) return null;
+    return s;
+  }catch(e){ return null; }
+}
+function clearSession(){
+  try{ localStorage.removeItem(SESSION_STORAGE_KEY); }catch(e){}
+}
+// Tant que la personne revient dans les 2 mois, on prolonge la session en silence.
+function renewSession(){ if (authToken) saveSession(); }
+
+function attemptAutoLogin(){
+  const s = loadSession();
+  if (!s) return false;
+  currentUser = s.username;
+  myNullId = s.nullId;
+  myAvatarDataUrl = s.avatarDataUrl;
+  authToken = s.token;
+  loadBlockedIds();
+  startApp();
+  return true;
+}
+
+function checkFirstLoginTutorial(username){
+  try{
+    const flagged = localStorage.getItem(NEW_ACCOUNT_FLAG_KEY);
+    if (flagged && flagged === (username || '').toLowerCase()){
+      localStorage.removeItem(NEW_ACCOUNT_FLAG_KEY);
+      pendingTutorialAfterLogin = true;
+    }
+  }catch(e){}
+}
+
+/* =========================================================
+   NAVIGATION / VUES
+   ========================================================= */
+function switchView(view){
+  currentView = view;
+  document.getElementById('navGeneral').classList.toggle('active', view === 'general');
+  document.getElementById('navFriends').classList.toggle('active', view === 'friends' || view === 'dm');
+  document.getElementById('friendsPanel').style.display = view === 'friends' ? 'flex' : 'none';
+  document.getElementById('viewGeneral').style.display = view === 'general' ? 'flex' : 'none';
+  document.getElementById('viewFriendsHero').style.display = view === 'friends' ? 'flex' : 'none';
+  document.getElementById('viewDM').style.display = view === 'dm' ? 'flex' : 'none';
+  if (view === 'friends') renderFriendList();
+  playViewTransition(view);
+}
+
+// Petite animation de fondu/glissement pour que la navigation entre vues soit fluide.
+function playViewTransition(view){
+  const map = { general: 'viewGeneral', friends: 'friendsPanel', dm: 'viewDM' };
+  const id = map[view];
+  if (!id) return;
+  const el = document.getElementById(id);
+  if (!el || el.style.display === 'none') return;
+  el.classList.remove('view-fade');
+  void el.offsetWidth; // force reflow pour redémarrer l'animation
+  el.classList.add('view-fade');
+}
+
+function setFriendTab(tab){
+  currentFriendTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  renderFriendList();
+}
+
+/* =========================================================
+   PROFIL / NULLID
+   ========================================================= */
+function toggleProfilePop(evt){
+  const pop = document.getElementById('profilePop');
+  const isOpen = pop.classList.contains('open');
+  if (isOpen){ pop.classList.remove('open'); return; }
+  const rect = evt.currentTarget.getBoundingClientRect();
+  pop.style.left = (rect.right + 12) + 'px';
+  pop.style.top = (rect.bottom - 200) + 'px';
+  document.getElementById('profileName').textContent = currentUser || '';
+  document.getElementById('profileNullId').textContent = myNullId || 'inconnu';
+  document.getElementById('notifToggle').classList.toggle('on', notifsEnabled);
+  pop.classList.add('open');
+}
+document.addEventListener('click', (e) => {
+  const pop = document.getElementById('profilePop');
+  if (!pop.contains(e.target) && !document.getElementById('railProfile').contains(e.target)){
+    pop.classList.remove('open');
+  }
+});
+function handleLogout(){
+  clearSession();
+  if (authToken){
+    fetch('/api/logout', {
+      method: 'POST', headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({ token: authToken })
+    }).catch(() => {}).finally(() => location.reload());
+  } else {
+    location.reload();
+  }
+}
+
+function copyNullId(){
+  if (!myNullId) return;
+  navigator.clipboard.writeText(myNullId).catch(() => {});
+  const btn = document.querySelector('.copy-btn');
+  const original = btn.innerHTML;
+  btn.innerHTML = '✓';
+  setTimeout(() => { btn.innerHTML = original; }, 1200);
+}
+
+/* =========================================================
+   NOTIFICATIONS (son + notification navigateur)
+   ========================================================= */
+async function toggleNotifs(){
+  notifsEnabled = !notifsEnabled;
+  if (notifsEnabled && 'Notification' in window && Notification.permission === 'default'){
+    try{ await Notification.requestPermission(); } catch(e){ /* ignore */ }
+  }
+  document.getElementById('notifToggle').classList.toggle('on', notifsEnabled);
+}
+
+function playNotifSound(){
+  if (!notifsEnabled) return;
+  try{
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 720;
+    gain.gain.setValueAtTime(0.001, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.12, audioCtx.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.28);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.3);
+  } catch(e){ /* audio indisponible, on ignore */ }
+}
+
+function notifyIncoming(title, body){
+  if (!notifsEnabled) return;
+  playNotifSound();
+  if (document.hidden && 'Notification' in window && Notification.permission === 'granted'){
+    try{ new Notification(title, { body, silent:true }); } catch(e){ /* ignore */ }
+  }
+}
+
+/* =========================================================
+   TOASTS
+   ========================================================= */
+function showToast({ title, body, actions }){
+  const stack = document.getElementById('toastStack');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `
+    <div class="t-title">${escapeHtml(title)}</div>
+    <div class="t-body">${escapeHtml(body || '')}</div>
+    <div class="t-actions"></div>
+  `;
+  const actionsEl = el.querySelector('.t-actions');
+  (actions || []).forEach(a => {
+    const btn = document.createElement('button');
+    btn.className = a.type === 'accept' ? 't-accept' : 't-decline';
+    btn.textContent = a.label;
+    btn.onclick = () => { a.onClick(); el.remove(); };
+    actionsEl.appendChild(btn);
+  });
+  if (!actions || actions.length === 0){
+    setTimeout(() => el.remove(), 4000);
+  }
+  stack.appendChild(el);
+}
+
+/* =========================================================
+   SYSTÈME D'AMIS
+   ========================================================= */
+function normalizeNullId(raw){
+  return (raw || '').trim().toUpperCase();
+}
+
+function sendFriendRequest(){
+  const input = document.getElementById('addFriendInput');
+  const targetNullId = normalizeNullId(input.value);
+  const errEl = document.getElementById('friendError');
+  errEl.textContent = '';
+
+  if (!targetNullId) return errEl.textContent = 'Entre un NULLID valide.';
+  if (targetNullId === myNullId) return errEl.textContent = "C'est ton propre NULLID !";
+  if (friends.has(targetNullId)) return errEl.textContent = 'Déjà dans ta liste d\u2019amis.';
+
+  socket.emit('friend:request', { targetNullId });
+  input.value = '';
+  showToast({ title: 'Demande envoyée', body: `NULLID ${targetNullId}` });
+}
+
+function acceptFriendRequest(requestId){
+  socket.emit('friend:accept', { requestId });
+  pendingRequests.delete(requestId);
+  updateRequestBadge();
+  renderFriendList();
+}
+function declineFriendRequest(requestId){
+  socket.emit('friend:decline', { requestId });
+  pendingRequests.delete(requestId);
+  updateRequestBadge();
+  renderFriendList();
+}
+function removeFriend(nullId){
+  if (!confirm('Retirer cet ami ?')) return;
+  socket.emit('friend:remove', { nullId });
+  friends.delete(nullId);
+  dmKeys.delete(nullId);
+  if (currentDmPeer && currentDmPeer.nullId === nullId) closeDm();
+  renderFriendList();
+}
+
+function updateRequestBadge(){
+  const badge = document.getElementById('requestBadge');
+  const n = pendingRequests.size;
+  badge.style.display = n > 0 ? 'flex' : 'none';
+  badge.textContent = n;
+}
+
+function renderFriendList(){
+  document.getElementById('countOnline').textContent =
+    '(' + [...friends.values()].filter(f => f.online).length + ')';
+  document.getElementById('countAll').textContent = '(' + friends.size + ')';
+  document.getElementById('countPending').textContent = '(' + pendingRequests.size + ')';
+
+  const scroll = document.getElementById('friendListScroll');
+  scroll.innerHTML = '';
+
+  if (currentFriendTab === 'pending'){
+    if (pendingRequests.size === 0){
+      scroll.innerHTML = '<div class="list-empty">Aucune demande en attente.</div>';
+      return;
+    }
+    for (const [requestId, req] of pendingRequests.entries()){
+      const row = document.createElement('div');
+      row.className = 'request-row';
+      row.innerHTML = `
+        <div class="avatar" style="${avatarStyleAttr(req)}">${req.avatarDataUrl ? '' : escapeHtml(initialFor(req.username))}</div>
+        <div class="friend-meta">
+          <div class="friend-name">${escapeHtml(req.username)}</div>
+          <div class="friend-sub">${escapeHtml(req.nullId)}</div>
+        </div>
+        <div class="friend-actions">
+          <button class="icon-btn fx-btn" title="Accepter" data-action="accept">✓</button>
+          <button class="icon-btn fx-btn danger" title="Refuser" data-action="decline">✕</button>
+        </div>
+      `;
+      row.querySelector('[data-action="accept"]').onclick = () => acceptFriendRequest(requestId);
+      row.querySelector('[data-action="decline"]').onclick = () => declineFriendRequest(requestId);
+      scroll.appendChild(row);
+    }
+    return;
+  }
+
+  let list = [...friends.values()];
+  if (currentFriendTab === 'online') list = list.filter(f => f.online);
+
+  if (list.length === 0){
+    scroll.innerHTML = `<div class="list-empty">${
+      currentFriendTab === 'online' ? 'Personne en ligne pour le moment.' : 'Ta liste d\u2019amis est vide.<br>Ajoute quelqu\u2019un avec son NULLID.'
+    }</div>`;
+    return;
+  }
+
+  list.sort((a,b) => a.username.localeCompare(b.username));
+  for (const f of list){
+    const unread = unreadDm.get(f.nullId) || 0;
+    const row = document.createElement('div');
+    row.className = 'friend-row';
+    row.innerHTML = `
+      <div style="position:relative;">
+        <div class="avatar" style="${avatarStyleAttr(f)}">${f.avatarDataUrl ? '' : escapeHtml(initialFor(f.username))}</div>
+        <div class="avatar-dot" style="background:${f.online ? 'var(--online)' : 'var(--text-faint)'}; width:11px; height:11px; border-color: var(--bg-panel-2);"></div>
+      </div>
+      <div class="friend-meta">
+        <div class="friend-name">${escapeHtml(f.username)} ${unread > 0 ? `<span class="unread-pill">${unread}</span>` : ''}</div>
+        <div class="friend-sub">${escapeHtml(f.nullId)} · ${f.online ? 'en ligne' : 'hors ligne'}</div>
+      </div>
+      <div class="friend-actions">
+        <button class="icon-btn fx-btn" title="Appeler" data-action="call" ${f.online ? '' : 'disabled style="opacity:.35;cursor:not-allowed;"'}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+        </button>
+        <button class="icon-btn fx-btn danger" title="Bloquer" data-action="block">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M4.9 4.9l14.2 14.2"/></svg>
+        </button>
+        <button class="icon-btn fx-btn danger" title="Retirer" data-action="remove">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    `;
+    row.addEventListener('click', () => openDm(f));
+    const callBtn = row.querySelector('[data-action="call"]');
+    if (f.online) callBtn.onclick = (e) => { e.stopPropagation(); startCall(f); };
+    row.querySelector('[data-action="remove"]').onclick = (e) => { e.stopPropagation(); removeFriend(f.nullId); };
+    row.querySelector('[data-action="block"]').onclick = (e) => { e.stopPropagation(); blockFriend(f.nullId); };
+    scroll.appendChild(row);
+  }
+}
+
+/* =========================================================
+   MESSAGES PRIVÉS (DM) — chiffrés de bout en bout par ami
+   ========================================================= */
+async function ensureDmKey(friend){
+  if (dmKeys.has(friend.nullId)) return dmKeys.get(friend.nullId);
+  if (!friend.socketId) return null; // ami hors ligne : pas de session possible pour l'instant
+  const rawPublicKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
+  socket.emit('dm:key_exchange', {
+    targetSocketId: friend.socketId,
+    publicKey: Array.from(new Uint8Array(rawPublicKey)),
+    isNewUser: true
+  });
+  return null; // la clé sera dérivée à la réception de la réponse "dm:key_exchange"
+}
+
+function openDm(friend){
+  currentDmPeer = friend;
+  unreadDm.delete(friend.nullId);
+  renderAvatarInto(document.getElementById('dmAvatar'), friend);
+  document.getElementById('dmPeerName').textContent = friend.username;
+  const callBtn = document.getElementById('dmCallBtn');
+  callBtn.disabled = !friend.online;
+  callBtn.onclick = () => startCall(friend);
+
+  const input = document.getElementById('dmInput');
+  input.disabled = !friend.online;
+  input.placeholder = friend.online ? 'Message privé chiffré...' : 'Cet ami est hors ligne';
+
+  loadDmHistory(friend.nullId);
+  renderDmHistory(friend.nullId);
+  switchView('dm');
+  renderFriendList();
+  if (friend.online) ensureDmKey(friend);
+  socket.emit('dm:read', { targetNullId: friend.nullId });
+}
+
+// Traite un DM chiffré reçu, qu'il arrive en direct ou via la file d'attente hors-ligne.
+async function handleIncomingDm(data, opts){
+  opts = opts || {};
+  if (blockedIds.has(data.senderNullId)) return; // bloqué localement : on ignore silencieusement
+  const key = dmKeys.get(data.senderNullId);
+  if (!key){ console.warn("Message privé reçu sans clé établie, ignoré."); return; }
+  try{
+    const ciphertext = new Uint8Array(data.ciphertext);
+    const iv = new Uint8Array(data.iv);
+    const decryptedBuffer = await window.crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, ciphertext);
+    const clearContent = new TextDecoder().decode(decryptedBuffer);
+    const kind = data.kind || 'text';
+    const entry = {
+      author: data.author, isOwn:false, timestamp: data.timestamp, kind,
+      text: kind === 'text' ? clearContent : undefined,
+      dataUrl: kind !== 'text' ? clearContent : undefined,
+      mime: data.mime, filename: data.filename
+    };
+    pushDmToHistory(data.senderNullId, entry);
+
+    const preview = kind === 'text' ? clearContent.slice(0, 60)
+      : kind === 'image' ? '📷 Photo' : kind === 'video' ? '🎥 Vidéo' : '🎤 Message vocal';
+
+    const isViewingThisConvo = currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.senderNullId;
+    if (isViewingThisConvo){
+      appendDmBubble(entry);
+      socket.emit('dm:read', { targetNullId: data.senderNullId, messageId: data.messageId || null });
+    } else {
+      unreadDm.set(data.senderNullId, (unreadDm.get(data.senderNullId) || 0) + 1);
+      if (currentView === 'friends' && !opts.silent) renderFriendList();
+      if (!opts.silent) notifyIncoming('Message privé', `${data.author} : ${preview}`);
+    }
+  } catch(err){ console.error('Échec du déchiffrement DM:', err); }
+}
+
+let dmTypingTimeout = null;
+function showDmTypingIndicator(isTyping){
+  const el = document.getElementById('dmPeerStatus');
+  if (!el) return;
+  clearTimeout(dmTypingTimeout);
+  if (isTyping){
+    el.textContent = 'en train d\u2019écrire…';
+    // Filet de sécurité si l'événement "stop typing" se perd (déconnexion, etc.)
+    dmTypingTimeout = setTimeout(() => { el.textContent = ''; }, 6000);
+  } else {
+    el.textContent = '';
+  }
+}
+
+function markDmBubblesRead(){
+  const box = document.getElementById('dmChat');
+  if (!box) return;
+  const ownBubbles = box.querySelectorAll('.msg.own');
+  if (!ownBubbles.length) return;
+  const last = ownBubbles[ownBubbles.length - 1];
+  if (last.querySelector('.read-marker')) return;
+  const marker = document.createElement('div');
+  marker.className = 'read-marker';
+  marker.style.cssText = 'font-size:11px;color:var(--text-faint);text-align:right;margin-top:2px;';
+  marker.textContent = 'Lu';
+  last.appendChild(marker);
+}
+
+let dmTypingEmitTimeout = null;
+function notifyTyping(){
+  if (!currentDmPeer || !currentDmPeer.online) return;
+  socket.emit('dm:typing', { targetNullId: currentDmPeer.nullId, isTyping: true });
+  clearTimeout(dmTypingEmitTimeout);
+  dmTypingEmitTimeout = setTimeout(() => {
+    socket.emit('dm:typing', { targetNullId: currentDmPeer.nullId, isTyping: false });
+  }, 2500);
+}
+
+function closeDm(){
+  currentDmPeer = null;
+  switchView('friends');
+}
+
+function renderDmHistory(nullId){
+  const box = document.getElementById('dmChat');
+  box.innerHTML = '';
+  const hist = dmHistory.get(nullId) || [];
+  hist.slice(-MAX_RENDERED_MESSAGES).forEach(m => appendDmBubble(m, false));
+  box.scrollTop = box.scrollHeight;
+}
+
+function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, filename }, animate){
+  if (animate === undefined) animate = true;
+  const box = document.getElementById('dmChat');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'msg' + (isOwn ? ' own' : '');
+  const top = document.createElement('div');
+  top.className = 'msg-top';
+  const authorSpan = document.createElement('span');
+  authorSpan.className = 'author';
+  authorSpan.style.color = isOwn ? 'var(--accent-2)' : colorForName(author);
+  authorSpan.textContent = author;
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'timestamp';
+  timeSpan.textContent = new Date(timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit' });
+  top.appendChild(authorSpan);
+  top.appendChild(timeSpan);
+  wrapper.appendChild(top);
+
+  if (kind === 'image' && isSafeAttachmentDataUrl(dataUrl, 'image')){
+    const img = document.createElement('img');
+    img.src = dataUrl;
+    img.alt = filename || 'image';
+    img.style.cssText = 'max-width:280px;max-height:280px;border-radius:10px;display:block;margin-top:4px;cursor:pointer;';
+    img.onclick = () => window.open(dataUrl, '_blank');
+    wrapper.appendChild(img);
+  } else if (kind === 'video' && isSafeAttachmentDataUrl(dataUrl, 'video')){
+    const vid = document.createElement('video');
+    vid.src = dataUrl;
+    vid.controls = true;
+    vid.style.cssText = 'max-width:280px;max-height:280px;border-radius:10px;display:block;margin-top:4px;';
+    wrapper.appendChild(vid);
+  } else if (kind === 'audio' && isSafeAttachmentDataUrl(dataUrl, 'audio')){
+    const aud = document.createElement('audio');
+    aud.src = dataUrl;
+    aud.controls = true;
+    aud.style.cssText = 'display:block;margin-top:4px;';
+    wrapper.appendChild(aud);
+  } else if (kind === 'image' || kind === 'video' || kind === 'audio'){
+    const bad = document.createElement('div');
+    bad.className = 'text';
+    bad.textContent = '⚠️ Pièce jointe invalide, impossible de l\u2019afficher.';
+    wrapper.appendChild(bad);
+  } else {
+    const textDiv = document.createElement('div');
+    textDiv.className = 'text';
+    if (isOwn || !animate) textDiv.textContent = text; else revealText(textDiv, text);
+    wrapper.appendChild(textDiv);
+  }
+
+  box.appendChild(wrapper);
+  while (box.children.length > MAX_RENDERED_MESSAGES) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+/* ---------------------------------------------------------
+   Persistance locale des conversations privées.
+   Important : la conversation est stockée par (mon nullId, nullId
+   du contact) et n'est JAMAIS effacée quand on retire/bloque un
+   ami — seulement via "Supprimer la conversation" (bouton dédié).
+   --------------------------------------------------------- */
+function dmStorageKey(peerNullId){
+  return `nullchat_dm_${myNullId}_${peerNullId}`;
+}
+function saveDmHistory(nullId){
+  try{
+    const hist = dmHistory.get(nullId) || [];
+    // on ne garde que les 500 derniers messages en stockage local
+    localStorage.setItem(dmStorageKey(nullId), JSON.stringify(hist.slice(-500)));
+  }catch(e){ console.warn('Sauvegarde locale impossible (quota ?)', e); }
+}
+function loadDmHistory(nullId){
+  if (dmHistory.has(nullId)) return; // déjà en mémoire pour cette session
+  try{
+    const raw = localStorage.getItem(dmStorageKey(nullId));
+    if (raw) dmHistory.set(nullId, JSON.parse(raw));
+  }catch(e){ /* ignore */ }
+}
+function deleteConversation(nullId){
+  if (!confirm('Supprimer définitivement cette conversation (localement) ?')) return;
+  dmHistory.delete(nullId);
+  try{ localStorage.removeItem(dmStorageKey(nullId)); }catch(e){}
+  if (currentDmPeer && currentDmPeer.nullId === nullId) renderDmHistory(nullId);
+}
+
+function blockedStorageKey(){ return `nullchat_blocked_${myNullId}`; }
+function loadBlockedIds(){
+  try{
+    const raw = localStorage.getItem(blockedStorageKey());
+    blockedIds.clear();
+    if (raw) JSON.parse(raw).forEach(id => blockedIds.add(id));
+  }catch(e){ /* ignore */ }
+}
+function saveBlockedIds(){
+  try{ localStorage.setItem(blockedStorageKey(), JSON.stringify([...blockedIds])); }catch(e){}
+}
+function blockFriend(nullId){
+  if (!confirm("Bloquer cet utilisateur ? Il ne pourra plus t'envoyer de messages ni t'appeler. La conversation est conservée.")) return;
+  blockedIds.add(nullId);
+  saveBlockedIds();
+  socket.emit('friend:block', { nullId }); // le serveur doit aussi faire respecter le blocage
+  friends.delete(nullId);
+  dmKeys.delete(nullId);
+  if (currentDmPeer && currentDmPeer.nullId === nullId) closeDm();
+  renderFriendList();
+  showToast({ title: 'Utilisateur bloqué', body: 'La conversation reste disponible, l\u2019accès est coupé.' });
+}
+function unblockFriend(nullId){
+  blockedIds.delete(nullId);
+  saveBlockedIds();
+  socket.emit('friend:unblock', { nullId });
+}
+
+/* =========================================================
+   PARAMÈTRES : photo de profil + périphériques audio
+   ========================================================= */
+const MAX_AVATAR_SOURCE_BYTES = 8 * 1024 * 1024; // fichier source max avant compression
+const AVATAR_TARGET_SIZE = 200; // photo réduite à 200x200 avant envoi
+
+function avatarLocalKey(){ return `nullchat_avatar_${myNullId}`; }
+function saveOwnAvatarLocally(dataUrl){
+  try{
+    if (dataUrl) localStorage.setItem(avatarLocalKey(), dataUrl);
+    else localStorage.removeItem(avatarLocalKey());
+  }catch(e){ /* ignore, quota localStorage */ }
+}
+function loadOwnAvatar(){
+  if (myAvatarDataUrl) return; // déjà connu (ex: renvoyé par /api/login)
+  try{
+    const raw = localStorage.getItem(avatarLocalKey());
+    if (raw) myAvatarDataUrl = raw;
+  }catch(e){ /* ignore */ }
+}
+
+function openSettings(){
+  document.getElementById('profilePop').classList.remove('open');
+  document.getElementById('settingsNullId').textContent = myNullId || 'inconnu';
+  renderAvatarInto(document.getElementById('settingsAvatarPreview'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
+  document.getElementById('avatarRemoveRow').style.display = myAvatarDataUrl ? 'block' : 'none';
+  document.getElementById('settingsOverlay').style.display = 'flex';
+  populateAudioDeviceSelects();
+  loadActiveSessions();
+}
+function closeSettings(){
+  document.getElementById('settingsOverlay').style.display = 'none';
+}
+
+async function loadActiveSessions(){
+  const container = document.getElementById('sessionsList');
+  if (!authToken){ container.textContent = ''; return; }
+  container.textContent = 'Chargement…';
+  try{
+    const res = await fetch('/api/sessions', { headers: { 'Authorization': `Bearer ${authToken}` } });
+    if (!res.ok) throw new Error('Erreur serveur');
+    const { sessions } = await res.json();
+    if (!sessions.length){ container.textContent = 'Aucune session active.'; return; }
+    container.innerHTML = sessions.map(s => `
+      <div style="display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border-soft);">
+        <div>
+          <div>${escapeHtml(s.userAgent ? summarizeUserAgent(s.userAgent) : 'Appareil inconnu')} ${s.current ? '<span style="color:var(--online);">(cet appareil)</span>' : ''}</div>
+          <div style="font-size:11px; color:var(--text-faint);">${s.createdAt ? new Date(s.createdAt).toLocaleString() : ''}</div>
+        </div>
+        ${s.current ? '' : `<button class="notif-toggle fx-btn" style="width:auto; padding:6px 10px; font-size:12px;" onclick="revokeSession('${s.id}')">Déconnecter</button>`}
+      </div>
+    `).join('');
+  }catch(e){
+    container.textContent = 'Impossible de charger les sessions.';
+  }
+}
+
+function summarizeUserAgent(ua){
+  // Résumé lisible et court, sans exposer la chaîne complète (empreinte moins bavarde à l'écran).
+  if (/mobile/i.test(ua)) return 'Mobile';
+  if (/chrome/i.test(ua)) return 'Chrome';
+  if (/firefox/i.test(ua)) return 'Firefox';
+  if (/safari/i.test(ua)) return 'Safari';
+  return 'Navigateur';
+}
+
+async function revokeSession(id){
+  if (!authToken) return;
+  try{
+    await fetch(`/api/sessions/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${authToken}` } });
+    loadActiveSessions();
+  }catch(e){ /* ignore */ }
+}
+
+// Redimensionne l'image côté client avant envoi : garde les photos de
+// profil légères (elles transitent par le serveur puis vers tous les amis).
+function resizeImageToDataUrl(file, targetSize){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const reader = new FileReader();
+    reader.onload = () => { img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = targetSize; canvas.height = targetSize;
+      const ctx = canvas.getContext('2d');
+      const side = Math.min(img.width, img.height);
+      const sx = (img.width - side) / 2, sy = (img.height - side) / 2;
+      ctx.drawImage(img, sx, sy, side, side, 0, 0, targetSize, targetSize);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = reject;
+    img.src = reader.result; };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleAvatarSelected(event){
+  const file = event.target.files && event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  if (file.size > MAX_AVATAR_SOURCE_BYTES){
+    showToast({ title: 'Image trop lourde', body: 'Choisis une image de moins de 8 Mo.' });
+    return;
+  }
+  if (!file.type.startsWith('image/')){
+    showToast({ title: 'Format non supporté', body: 'Choisis une image (JPEG, PNG...).' });
+    return;
+  }
+  try{
+    const dataUrl = await resizeImageToDataUrl(file, AVATAR_TARGET_SIZE);
+    myAvatarDataUrl = dataUrl;
+    saveOwnAvatarLocally(dataUrl);
+    renderAvatarInto(document.getElementById('myAvatar'), { username: currentUser, avatarDataUrl: dataUrl });
+    renderAvatarInto(document.getElementById('settingsAvatarPreview'), { username: currentUser, avatarDataUrl: dataUrl });
+    document.getElementById('avatarRemoveRow').style.display = 'block';
+    socket.emit('profile:avatar', { avatarDataUrl: dataUrl });
+    showToast({ title: 'Photo mise à jour', body: 'Visible par tes amis.' });
+  }catch(err){
+    showToast({ title: 'Erreur', body: "Impossible de traiter cette image." });
+  }
+}
+
+function removeAvatar(){
+  myAvatarDataUrl = null;
+  saveOwnAvatarLocally(null);
+  renderAvatarInto(document.getElementById('myAvatar'), { username: currentUser, avatarDataUrl: null });
+  renderAvatarInto(document.getElementById('settingsAvatarPreview'), { username: currentUser, avatarDataUrl: null });
+  document.getElementById('avatarRemoveRow').style.display = 'none';
+  socket.emit('profile:avatar', { avatarDataUrl: null });
+}
+
+/* ---- Choix micro / haut-parleur ---- */
+function audioPrefsKey(){ return `nullchat_audio_prefs_${myNullId || 'anon'}`; }
+function loadAudioPrefs(){
+  try{ return JSON.parse(localStorage.getItem(audioPrefsKey()) || '{}'); }catch(e){ return {}; }
+}
+function saveAudioPrefs(prefs){
+  try{ localStorage.setItem(audioPrefsKey(), JSON.stringify(prefs)); }catch(e){ /* ignore */ }
+}
+function getPreferredInputDeviceId(){ return loadAudioPrefs().inputId || null; }
+function getPreferredOutputDeviceId(){ return loadAudioPrefs().outputId || null; }
+
+async function populateAudioDeviceSelects(){
+  const inputSelect = document.getElementById('audioInputSelect');
+  const outputSelect = document.getElementById('audioOutputSelect');
+  const note = document.getElementById('audioOutputNote');
+  inputSelect.innerHTML = '<option>Chargement...</option>';
+  outputSelect.innerHTML = '<option>Chargement...</option>';
+
+  // Il faut l'autorisation micro pour obtenir les libellés des périphériques (sinon "Micro 1", "Micro 2"...).
+  try{ const s = await navigator.mediaDevices.getUserMedia({ audio: true }); s.getTracks().forEach(t => t.stop()); }
+  catch(e){ /* l'utilisateur peut refuser, on affichera des libellés génériques */ }
+
+  let devices = [];
+  try{ devices = await navigator.mediaDevices.enumerateDevices(); }
+  catch(e){ inputSelect.innerHTML = '<option>Indisponible</option>'; outputSelect.innerHTML = '<option>Indisponible</option>'; return; }
+
+  const inputs = devices.filter(d => d.kind === 'audioinput');
+  const outputs = devices.filter(d => d.kind === 'audiooutput');
+  const prefs = loadAudioPrefs();
+
+  inputSelect.innerHTML = inputs.length
+    ? inputs.map(d => `<option value="${escapeHtml(d.deviceId)}">${escapeHtml(d.label || 'Micro ' + (d.deviceId.slice(0,4)))}</option>`).join('')
+    : '<option value="">Aucun micro détecté</option>';
+  if (prefs.inputId && inputs.some(d => d.deviceId === prefs.inputId)) inputSelect.value = prefs.inputId;
+
+  const supportsSinkId = typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
+  if (!supportsSinkId){
+    outputSelect.innerHTML = '<option value="">Non supporté par ce navigateur</option>';
+    outputSelect.disabled = true;
+    note.textContent = 'Le choix du haut-parleur n\u2019est pas supporté par ce navigateur (essaie Chrome/Edge).';
+  } else {
+    outputSelect.disabled = false;
+    note.textContent = '';
+    outputSelect.innerHTML = outputs.length
+      ? outputs.map(d => `<option value="${escapeHtml(d.deviceId)}">${escapeHtml(d.label || 'Haut-parleur ' + (d.deviceId.slice(0,4)))}</option>`).join('')
+      : '<option value="">Par défaut</option>';
+    if (prefs.outputId && outputs.some(d => d.deviceId === prefs.outputId)) outputSelect.value = prefs.outputId;
+  }
+
+  inputSelect.onchange = () => { saveAudioPrefs({ ...loadAudioPrefs(), inputId: inputSelect.value }); };
+  outputSelect.onchange = () => {
+    saveAudioPrefs({ ...loadAudioPrefs(), outputId: outputSelect.value });
+    applyPreferredAudioOutput();
+  };
+}
+
+async function applyPreferredAudioOutput(){
+  const outputId = getPreferredOutputDeviceId();
+  const remoteAudio = document.getElementById('remoteAudio');
+  if (!outputId || !remoteAudio || typeof remoteAudio.setSinkId !== 'function') return;
+  try{ await remoteAudio.setSinkId(outputId); }catch(e){ /* périphérique débranché ou navigateur non supporté */ }
+}
+
+function pushDmToHistory(nullId, entry){
+  if (!dmHistory.has(nullId)) dmHistory.set(nullId, []);
+  dmHistory.get(nullId).push(entry);
+  saveDmHistory(nullId);
+}
+
+async function sendDM(){
+  if (!currentDmPeer) return;
+  const input = document.getElementById('dmInput');
+  const value = input.value.trim();
+  if (!value) return;
+  await sendDmPayload({ text: value });
+  input.value = '';
+}
+
+/**
+ * Chiffre et envoie n'importe quel type de contenu DM (texte, image,
+ * vidéo, audio). payload: { text } ou { kind, dataUrl, mime, filename }.
+ * Le contenu (texte ou data URL base64) est chiffré comme avant en AES-GCM,
+ * seul le champ transporté change — le serveur continue de ne voir que
+ * du chiffré, quel que soit le type.
+ */
+async function sendDmPayload(payload){
+  if (!currentDmPeer) return;
+  const key = dmKeys.get(currentDmPeer.nullId);
+  if (!key){
+    showToast({ title: 'Chiffrement en cours', body: 'Réessaie dans un instant, la clé sécurisée s\u2019établit.' });
+    ensureDmKey(currentDmPeer);
+    return;
+  }
+
+  const kind = payload.kind || 'text';
+  const rawString = kind === 'text' ? payload.text : payload.dataUrl;
+  const encoded = new TextEncoder().encode(rawString);
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encryptedBuffer = await window.crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, encoded);
+
+  clearTimeout(dmTypingEmitTimeout);
+  socket.emit('dm:typing', { targetNullId: currentDmPeer.nullId, isTyping: false });
+
+  const timestamp = Date.now();
+  socket.emit('dm:message', {
+    targetNullId: currentDmPeer.nullId,
+    targetSocketId: currentDmPeer.socketId,
+    ciphertext: Array.from(new Uint8Array(encryptedBuffer)),
+    iv: Array.from(iv),
+    kind,
+    mime: payload.mime || null,
+    filename: payload.filename || null,
+    timestamp
+  });
+
+  const entry = {
+    author: currentUser, isOwn:true, timestamp, kind,
+    text: kind === 'text' ? payload.text : undefined,
+    dataUrl: kind !== 'text' ? payload.dataUrl : undefined,
+    mime: payload.mime, filename: payload.filename
+  };
+  pushDmToHistory(currentDmPeer.nullId, entry);
+  appendDmBubble(entry);
+}
+
+function readFileAsDataURL(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleDmFileSelected(event){
+  const file = event.target.files && event.target.files[0];
+  event.target.value = ''; // permet de re-sélectionner le même fichier plus tard
+  if (!file || !currentDmPeer) return;
+  if (file.size > MAX_ATTACHMENT_BYTES){
+    showToast({ title: 'Fichier trop lourd', body: 'Limite actuelle : 15 Mo.' });
+    return;
+  }
+  const kind = file.type.startsWith('video/') ? 'video' : file.type.startsWith('image/') ? 'image' : null;
+  if (!kind){
+    showToast({ title: 'Type non supporté', body: 'Seules les images et vidéos sont acceptées ici.' });
+    return;
+  }
+  const dataUrl = await readFileAsDataURL(file);
+  await sendDmPayload({ kind, dataUrl, mime: file.type, filename: file.name });
+}
+
+/* ---------------------------------------------------------
+   Messages vocaux (enregistrement micro -> envoi chiffré)
+   --------------------------------------------------------- */
+async function toggleVoiceRecording(){
+  const micBtn = document.getElementById('dmMicBtn');
+  if (mediaRecorder && mediaRecorder.state === 'recording'){
+    mediaRecorder.stop();
+    return;
+  }
+  if (!currentDmPeer) return;
+  try{
+    const inputId = getPreferredInputDeviceId();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: inputId ? { deviceId: { exact: inputId } } : true });
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      micBtn.classList.remove('recording');
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      if (blob.size === 0) return;
+      const dataUrl = await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+        r.readAsDataURL(blob);
+      });
+      await sendDmPayload({ kind: 'audio', dataUrl, mime: 'audio/webm', filename: 'vocal.webm' });
+    };
+    mediaRecorder.start();
+    micBtn.classList.add('recording');
+    showToast({ title: 'Enregistrement...', body: 'Reclique sur le micro pour envoyer.' });
+  }catch(err){
+    showToast({ title: 'Micro indisponible', body: "Vérifie les permissions du navigateur." });
+  }
+}
+
+document.getElementById('dmInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendDM(); });
+document.getElementById('dmInput').addEventListener('input', () => { notifyTyping(); });
+
+/* =========================================================
+   APPELS VOCAUX (WebRTC)
+   ========================================================= */
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+// Le serveur peut fournir un TURN (nécessaire derrière NAT/CGNAT strict) sans
+// avoir à modifier ce fichier : voir TURN_URL/TURN_USERNAME/TURN_CREDENTIAL.
+async function fetchIceServers(){
+  try{
+    const res = await fetch('/api/ice-servers', { headers: { Authorization: `Bearer ${authToken}` } });
+    if (!res.ok) return;
+    const data = await res.json().catch(() => null);
+    if (Array.isArray(data?.iceServers) && data.iceServers.length){
+      RTC_CONFIG.iceServers = data.iceServers;
+    }
+  }catch(e){ /* pas grave, on garde le STUN par défaut */ }
+}
+
+function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions }){
+  document.getElementById('callOverlay').classList.add('open');
+  document.getElementById('callName').textContent = name;
+  document.getElementById('callStatusText').textContent = statusText;
+  const avatar = document.getElementById('callAvatar');
+  renderAvatarInto(avatar, { username: name, avatarDataUrl });
+  avatar.classList.toggle('ringing', !!ringing);
+
+  const actionsEl = document.getElementById('callActions');
+  actionsEl.innerHTML = '';
+  actions.forEach(a => {
+    const btn = document.createElement('button');
+    btn.className = 'call-btn fx-btn ' + a.cls;
+    btn.innerHTML = a.icon;
+    btn.title = a.title;
+    btn.onclick = a.onClick;
+    actionsEl.appendChild(btn);
+  });
+}
+function closeCallOverlay(){
+  document.getElementById('callOverlay').classList.remove('open');
+  document.getElementById('callAvatar').classList.remove('ringing');
+}
+
+const ICONS = {
+  phoneAccept: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+  phoneDecline: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 1L1 23M1 1l22 22"/></svg>',
+  mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>'
+};
+
+async function getMic(){
+  const inputId = getPreferredInputDeviceId();
+  localStream = await navigator.mediaDevices.getUserMedia({
+    audio: inputId ? { deviceId: { exact: inputId } } : true
+  });
+  return localStream;
+}
+
+function buildPeerConnection(targetSocketId, targetNullId){
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  pc.onicecandidate = (e) => {
+    if (e.candidate){
+      socket.emit('call:ice', { targetNullId, targetSocketId, candidate: e.candidate });
+    }
+  };
+  pc.ontrack = (e) => {
+    document.getElementById('remoteAudio').srcObject = e.streams[0];
+  };
+  return pc;
+}
+
+async function startCall(friend){
+  if (activeCallPeer) return; // un seul appel à la fois
+  activeCallPeer = friend;
+  try{
+    await getMic();
+  } catch(err){
+    showToast({ title: 'Micro indisponible', body: "Autorise l'accès au micro pour appeler." });
+    activeCallPeer = null;
+    return;
+  }
+
+  rtcConn = buildPeerConnection(friend.socketId, friend.nullId);
+  localStream.getTracks().forEach(track => rtcConn.addTrack(track, localStream));
+
+  const offer = await rtcConn.createOffer();
+  await rtcConn.setLocalDescription(offer);
+  socket.emit('call:offer', { targetNullId: friend.nullId, targetSocketId: friend.socketId, sdp: offer });
+
+  openCallOverlay({
+    name: friend.username, statusText: 'Appel en cours…', avatarDataUrl: friend.avatarDataUrl, ringing: true,
+    actions: [{ cls:'hangup', icon: ICONS.phoneDecline, title:'Raccrocher', onClick: hangupCall }]
+  });
+}
+
+function handleIncomingCall({ from, sdp }){
+  if (blockedIds.has(from.nullId)){
+    socket.emit('call:end', { targetNullId: from.nullId, targetSocketId: from.socketId, reason: 'declined' });
+    return;
+  }
+  if (activeCallPeer){
+    // déjà en appel : on décline automatiquement
+    socket.emit('call:end', { targetNullId: from.nullId, targetSocketId: from.socketId, reason: 'declined' });
+    return;
+  }
+  activeCallPeer = from;
+  pendingIncomingSdp = sdp;
+
+  notifyIncoming('Appel entrant', `${from.username} t'appelle`);
+
+  openCallOverlay({
+    name: from.username, statusText: 'Appel entrant…', avatarDataUrl: from.avatarDataUrl, ringing: true,
+    actions: [
+      { cls:'decline', icon: ICONS.phoneDecline, title:'Refuser', onClick: () => declineCall(from) },
+      { cls:'accept', icon: ICONS.phoneAccept, title:'Accepter', onClick: () => acceptCall(from, sdp) }
+    ]
+  });
+}
+let pendingIncomingSdp = null;
+
+async function acceptCall(from, sdp){
+  try{ await getMic(); }
+  catch(err){
+    showToast({ title:'Micro indisponible', body: "Autorise l'accès au micro pour répondre." });
+    declineCall(from);
+    return;
+  }
+  rtcConn = buildPeerConnection(from.socketId, from.nullId);
+  localStream.getTracks().forEach(track => rtcConn.addTrack(track, localStream));
+  await rtcConn.setRemoteDescription(new RTCSessionDescription(sdp));
+  const answer = await rtcConn.createAnswer();
+  await rtcConn.setLocalDescription(answer);
+  socket.emit('call:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, sdp: answer });
+
+  openCallOverlay({
+    name: from.username, statusText: 'En appel', avatarDataUrl: from.avatarDataUrl, ringing: false,
+    actions: [
+      { cls:'mute', icon: ICONS.mic, title:'Muet', onClick: toggleMute },
+      { cls:'hangup', icon: ICONS.phoneDecline, title:'Raccrocher', onClick: hangupCall }
+    ]
+  });
+}
+function declineCall(from){
+  socket.emit('call:end', { targetNullId: from.nullId, targetSocketId: from.socketId, reason: 'declined' });
+  cleanupCall();
+}
+async function handleCallAnswer({ sdp }){
+  if (!rtcConn) return;
+  await rtcConn.setRemoteDescription(new RTCSessionDescription(sdp));
+  openCallOverlay({
+    name: activeCallPeer.username, statusText: 'En appel', avatarDataUrl: activeCallPeer.avatarDataUrl, ringing:false,
+    actions: [
+      { cls:'mute', icon: ICONS.mic, title:'Muet', onClick: toggleMute },
+      { cls:'hangup', icon: ICONS.phoneDecline, title:'Raccrocher', onClick: hangupCall }
+    ]
+  });
+}
+async function handleCallIce({ candidate }){
+  if (!rtcConn || !candidate) return;
+  try{ await rtcConn.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e){ /* ignore */ }
+}
+function toggleMute(){
+  if (!localStream) return;
+  callMuted = !callMuted;
+  localStream.getAudioTracks().forEach(t => t.enabled = !callMuted);
+  const btn = document.querySelector('.call-btn.mute');
+  if (btn) btn.classList.toggle('active-mute', callMuted);
+}
+function hangupCall(){
+  if (activeCallPeer){
+    socket.emit('call:end', { targetNullId: activeCallPeer.nullId, targetSocketId: activeCallPeer.socketId });
+  }
+  cleanupCall();
+}
+function cleanupCall(){
+  if (rtcConn){ rtcConn.close(); rtcConn = null; }
+  if (localStream){ localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  activeCallPeer = null;
+  pendingIncomingSdp = null;
+  callMuted = false;
+  closeCallOverlay();
+}
+
+/* =========================================================
+   MESSAGES (SALON GÉNÉRAL) — logique de chiffrement existante
+   ========================================================= */
+function addSystemMessage(text){
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg system';
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addChatMessage({ author, text, isOwn, timestamp, kind, dataUrl, filename }){
+  const chat = document.getElementById('chat');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'msg' + (isOwn ? ' own' : '');
+
+  const top = document.createElement('div');
+  top.className = 'msg-top';
+
+  const authorSpan = document.createElement('span');
+  authorSpan.className = 'author';
+  authorSpan.style.color = isOwn ? 'var(--accent-2)' : colorForName(author);
+  authorSpan.textContent = author;
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'timestamp';
+  timeSpan.textContent = new Date(timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit' });
+
+  top.appendChild(authorSpan);
+  top.appendChild(timeSpan);
+  wrapper.appendChild(top);
+
+  if (kind === 'image' && isSafeAttachmentDataUrl(dataUrl, 'image')){
+    const img = document.createElement('img');
+    img.src = dataUrl; img.alt = filename || 'image';
+    img.style.cssText = 'max-width:280px;max-height:280px;border-radius:10px;display:block;margin-top:4px;cursor:pointer;';
+    img.onclick = () => window.open(dataUrl, '_blank');
+    wrapper.appendChild(img);
+  } else if (kind === 'video' && isSafeAttachmentDataUrl(dataUrl, 'video')){
+    const vid = document.createElement('video');
+    vid.src = dataUrl; vid.controls = true;
+    vid.style.cssText = 'max-width:280px;max-height:280px;border-radius:10px;display:block;margin-top:4px;';
+    wrapper.appendChild(vid);
+  } else if (kind === 'audio' && isSafeAttachmentDataUrl(dataUrl, 'audio')){
+    const aud = document.createElement('audio');
+    aud.src = dataUrl; aud.controls = true;
+    aud.style.cssText = 'display:block;margin-top:4px;';
+    wrapper.appendChild(aud);
+  } else if (kind === 'image' || kind === 'video' || kind === 'audio'){
+    const bad = document.createElement('div');
+    bad.className = 'text';
+    bad.textContent = '⚠️ Pièce jointe invalide, impossible de l\u2019afficher.';
+    wrapper.appendChild(bad);
+  } else {
+    const textDiv = document.createElement('div');
+    textDiv.className = 'text';
+    if (isOwn) textDiv.textContent = text; else revealText(textDiv, text);
+    wrapper.appendChild(textDiv);
+  }
+
+  chat.appendChild(wrapper);
+  while (chat.children.length > MAX_RENDERED_MESSAGES) chat.removeChild(chat.firstChild);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function setConnectionStatus(state){
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  dot.className = 'status-dot ' + state;
+  text.textContent = state === 'connected' ? 'Connecté' : state === 'disconnected' ? 'Déconnecté' : 'Connexion...';
+  const canType = state === 'connected';
+  document.getElementById('msgInput').disabled = !canType;
+  document.getElementById('sendBtn').disabled = !canType;
+}
+
+async function deriveSharedKeyFor(peerId, peerPublicKeyBytes){
+  const peerPublicKeyBuffer = new Uint8Array(peerPublicKeyBytes).buffer;
+  const peerPublicKey = await window.crypto.subtle.importKey(
+    'raw', peerPublicKeyBuffer, { name:'ECDH', namedCurve:'P-256' }, true, []
+  );
+  const sharedKey = await window.crypto.subtle.deriveKey(
+    { name:'ECDH', public: peerPublicKey }, myKeyPair.privateKey,
+    { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']
+  );
+  peers.set(peerId, { sharedKey });
+}
+
+async function startApp(){
+  document.getElementById('authWrap').style.display = 'none';
+  document.getElementById('chatApp').style.display = 'flex';
+  loadOwnAvatar();
+  renderAvatarInto(document.getElementById('myAvatar'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
+  setConnectionStatus('connecting');
+
+  fetchIceServers(); // best-effort ; les appels retombent sur le STUN par défaut si ça échoue
+
+  socket = io({ reconnectionAttempts: 10, reconnectionDelay: 1000, auth: { token: authToken } });
+
+  socket.on('connect', async () => {
+    setConnectionStatus('connected');
+    renewSession(); // tant que la connexion réussit, on prolonge la session de 2 mois
+    myKeyPair = await window.crypto.subtle.generateKey(
+      { name:'ECDH', namedCurve:'P-256' }, true, ['deriveKey']
+    );
+    const rawPublicKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
+    socket.emit('share_public_key', Array.from(new Uint8Array(rawPublicKey)));
+    if (pendingTutorialAfterLogin){
+      pendingTutorialAfterLogin = false;
+      setTimeout(() => openTutorial(), 500);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    setConnectionStatus('disconnected');
+    peers.clear();
+  });
+
+  // Le token stocké n'est plus valide (expiré côté serveur, session révoquée...) :
+  // on efface la session locale et on revient proprement à l'écran de connexion.
+  socket.on('connect_error', (err) => {
+    const msg = (err && err.message) || '';
+    if (/auth|token|unauthor/i.test(msg)){
+      clearSession();
+      document.getElementById('chatApp').style.display = 'none';
+      document.getElementById('authWrap').style.display = 'flex';
+      setAuthError('Ta session a expiré, reconnecte-toi.');
+    }
+  });
+
+  socket.on('user_joined', (data) => { if (data && data.username) addSystemMessage(`${data.username} a rejoint le salon.`); });
+  socket.on('user_left', (data) => {
+    if (data && data.username) addSystemMessage(`${data.username} a quitté le salon.`);
+    if (data && data.senderId) peers.delete(data.senderId);
+  });
+
+  socket.on('receive_public_key', async (data) => {
+    await deriveSharedKeyFor(data.senderId, data.publicKey);
+    if (data.isNewUser){
+      const pubKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
+      socket.emit('share_public_key_reply', {
+        targetId: data.senderId, publicKey: Array.from(new Uint8Array(pubKey))
+      });
+    }
+  });
+
+  socket.on('encrypted_message', async (data) => {
+    const peer = peers.get(data.senderId);
+    if (!peer){ console.warn("Message reçu d'un pair inconnu, ignoré."); return; }
+    try{
+      const ciphertext = new Uint8Array(data.ciphertext);
+      const iv = new Uint8Array(data.iv);
+      const decryptedBuffer = await window.crypto.subtle.decrypt({ name:'AES-GCM', iv }, peer.sharedKey, ciphertext);
+      const clearContent = new TextDecoder().decode(decryptedBuffer);
+      const kind = data.kind || 'text';
+      addChatMessage({
+        author: data.author, isOwn:false, timestamp: data.timestamp, kind,
+        text: kind === 'text' ? clearContent : undefined,
+        dataUrl: kind !== 'text' ? clearContent : undefined,
+        filename: data.filename
+      });
+      if (currentView !== 'general') notifyIncoming('Nouveau message', `${data.author} dans #général`);
+    } catch(err){ console.error('Échec du déchiffrement:', err); }
+  });
+
+  /* ---------- Événements du système d'amis ---------- */
+  socket.on('friend:list', (data) => {
+    friends.clear();
+    (data.friends || []).forEach(f => friends.set(f.nullId, f));
+    renderFriendList();
+  });
+
+  socket.on('friend:request_received', (data) => {
+    if (blockedIds.has(data.from.nullId)){
+      socket.emit('friend:decline', { requestId: data.requestId });
+      return;
+    }
+    pendingRequests.set(data.requestId, data.from);
+    updateRequestBadge();
+    if (currentView === 'friends') renderFriendList();
+    notifyIncoming('Nouvelle demande d\u2019ami', data.from.username);
+    showToast({
+      title: 'Nouvelle demande d\u2019ami',
+      body: `${data.from.username} (${data.from.nullId})`,
+      actions: [
+        { label:'Accepter', type:'accept', onClick: () => acceptFriendRequest(data.requestId) },
+        { label:'Refuser', type:'decline', onClick: () => declineFriendRequest(data.requestId) }
+      ]
+    });
+  });
+
+  socket.on('friend:added', (data) => {
+    friends.set(data.nullId, data);
+    if (currentView === 'friends') renderFriendList();
+    showToast({ title: 'Nouvel ami', body: `${data.username} a été ajouté.` });
+  });
+
+  // Rattrapage : demandes d'amis reçues pendant qu'on était hors ligne
+  socket.on('friend:pending_list', (data) => {
+    (data.requests || []).forEach(r => {
+      if (blockedIds.has(r.from.nullId)) return;
+      pendingRequests.set(r.requestId, r.from);
+    });
+    updateRequestBadge();
+    if (currentView === 'friends') renderFriendList();
+    if ((data.requests || []).length){
+      showToast({ title: 'Demandes d\u2019ami en attente', body: `${data.requests.length} demande(s) reçue(s) pendant ton absence.` });
+    }
+  });
+
+  // Avatar d'un ami mis à jour en temps réel
+  socket.on('friend:avatar_updated', (data) => {
+    const f = friends.get(data.nullId);
+    if (f){
+      f.avatarDataUrl = data.avatarDataUrl;
+      if (currentView === 'friends') renderFriendList();
+    }
+    if (currentDmPeer && currentDmPeer.nullId === data.nullId){
+      currentDmPeer.avatarDataUrl = data.avatarDataUrl;
+      renderAvatarInto(document.getElementById('dmAvatar'), { username: currentDmPeer.username, avatarDataUrl: data.avatarDataUrl });
+    }
+  });
+
+  socket.on('friend:removed', (data) => {
+    friends.delete(data.nullId);
+    dmKeys.delete(data.nullId);
+    if (currentDmPeer && currentDmPeer.nullId === data.nullId) closeDm();
+    if (currentView === 'friends') renderFriendList();
+  });
+
+  socket.on('friend:status', (data) => {
+    const f = friends.get(data.nullId);
+    if (f){
+      f.online = data.online;
+      f.socketId = data.socketId;
+      // une nouvelle session = nouvelles clés éphémères, on force un nouvel échange
+      if (!data.online) dmKeys.delete(data.nullId);
+    }
+    if (currentDmPeer && currentDmPeer.nullId === data.nullId){
+      const callBtn = document.getElementById('dmCallBtn');
+      const input = document.getElementById('dmInput');
+      callBtn.disabled = !data.online;
+      input.disabled = !data.online;
+      input.placeholder = data.online ? 'Message privé chiffré...' : 'Cet ami est hors ligne';
+      if (data.online) ensureDmKey(currentDmPeer);
+    }
+    if (currentView === 'friends') renderFriendList();
+  });
+
+  socket.on('friend:error', (data) => {
+    const errEl = document.getElementById('friendError');
+    if (errEl) errEl.textContent = data.message || 'Une erreur est survenue.';
+    // Avant ce correctif, un message comme "tu envoies trop vite" n'apparaissait
+    // que dans le panneau "Ajouter un ami" (souvent invisible) : depuis le salon
+    // général ou une DM, l'envoi semblait juste s'arrêter sans aucune explication.
+    // On l'affiche donc aussi en toast, quelle que soit la vue active.
+    showToast({ title: 'Info', body: data.message || 'Une erreur est survenue.' });
+  });
+
+  /* ---------- Messages privés (DM) ---------- */
+  socket.on('dm:key_exchange', async (data) => {
+    const peerPublicKeyBuffer = new Uint8Array(data.publicKey).buffer;
+    const peerPublicKey = await window.crypto.subtle.importKey(
+      'raw', peerPublicKeyBuffer, { name:'ECDH', namedCurve:'P-256' }, true, []
+    );
+    const sharedKey = await window.crypto.subtle.deriveKey(
+      { name:'ECDH', public: peerPublicKey }, myKeyPair.privateKey,
+      { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']
+    );
+    dmKeys.set(data.senderNullId, sharedKey);
+    if (data.isNewUser){
+      const rawPublicKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
+      socket.emit('dm:key_exchange', {
+        targetSocketId: data.senderSocketId,
+        publicKey: Array.from(new Uint8Array(rawPublicKey)),
+        isNewUser: false
+      });
+    }
+  });
+
+  socket.on('dm:message', (data) => handleIncomingDm(data));
+
+  // Messages accumulés pendant que j'étais hors ligne : traités dans l'ordre d'arrivée.
+  socket.on('dm:queued_messages', async (data) => {
+    for (const msg of (data.messages || [])) {
+      await handleIncomingDm(msg, { silent: true });
+    }
+    if ((data.messages || []).length){
+      showToast({ title: 'Messages en attente', body: `${data.messages.length} message(s) reçu(s) pendant ton absence.` });
+      if (currentView === 'friends') renderFriendList();
+    }
+  });
+
+  // Le message n'a pas pu être livré immédiatement : mis en attente côté serveur.
+  socket.on('dm:pending', (data) => {
+    if (currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.targetNullId){
+      showToast({ title: 'Message en attente', body: 'Ton ami est hors ligne, le message lui sera livré à sa reconnexion.' });
+    }
+  });
+
+  // Indicateur "en train d'écrire"
+  socket.on('dm:typing', (data) => {
+    if (currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.nullId){
+      showDmTypingIndicator(!!data.isTyping);
+    }
+  });
+
+  // Accusé de lecture : marque les bulles envoyées comme lues
+  socket.on('dm:read', (data) => {
+    if (currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.nullId){
+      markDmBubblesRead();
+    }
+  });
+
+  /* ---------- Appels ---------- */
+  socket.on('call:incoming', handleIncomingCall);
+  socket.on('call:answer', handleCallAnswer);
+  socket.on('call:ice', handleCallIce);
+  socket.on('call:ended', () => { showToast({ title:'Appel terminé', body:'' }); cleanupCall(); });
+  socket.on('call:declined', () => { showToast({ title:'Appel refusé', body:'' }); cleanupCall(); });
+}
+
+async function sendSecretMessage(){
+  const input = document.getElementById('msgInput');
+  const value = input.value.trim();
+  if (!value) return;
+  await sendGeneralPayload({ text: value });
+  input.value = '';
+  document.getElementById('charCount').textContent = '';
+}
+
+async function sendGeneralPayload(payload){
+  if (peers.size === 0){
+    addSystemMessage("Personne d'autre n'est connecté pour le moment.");
+    return;
+  }
+  const kind = payload.kind || 'text';
+  const rawString = kind === 'text' ? payload.text : payload.dataUrl;
+  const encoded = new TextEncoder().encode(rawString);
+  const targets = [];
+  for (const [peerId, peer] of peers.entries()){
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const encryptedBuffer = await window.crypto.subtle.encrypt({ name:'AES-GCM', iv }, peer.sharedKey, encoded);
+    targets.push({ targetId: peerId, ciphertext: Array.from(new Uint8Array(encryptedBuffer)), iv: Array.from(iv) });
+  }
+
+  const timestamp = Date.now();
+  socket.emit('encrypted_message', { author: currentUser, targets, kind, mime: payload.mime || null, filename: payload.filename || null, timestamp });
+  addChatMessage({
+    author: currentUser, isOwn:true, timestamp, kind,
+    text: kind === 'text' ? payload.text : undefined,
+    dataUrl: kind !== 'text' ? payload.dataUrl : undefined,
+    filename: payload.filename
+  });
+}
+
+async function handleGeneralFileSelected(event){
+  const file = event.target.files && event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  if (file.size > MAX_ATTACHMENT_BYTES){
+    showToast({ title: 'Fichier trop lourd', body: 'Limite actuelle : 15 Mo.' });
+    return;
+  }
+  const kind = file.type.startsWith('video/') ? 'video' : file.type.startsWith('image/') ? 'image' : null;
+  if (!kind){
+    showToast({ title: 'Type non supporté', body: 'Seules les images et vidéos sont acceptées ici.' });
+    return;
+  }
+  const dataUrl = await readFileAsDataURL(file);
+  await sendGeneralPayload({ kind, dataUrl, mime: file.type, filename: file.name });
+}
+
+async function toggleGeneralVoiceRecording(){
+  const micBtn = document.getElementById('genMicBtn');
+  if (mediaRecorder && mediaRecorder.state === 'recording'){
+    mediaRecorder.stop();
+    return;
+  }
+  try{
+    const inputId = getPreferredInputDeviceId();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: inputId ? { deviceId: { exact: inputId } } : true });
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      micBtn.classList.remove('recording');
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      if (blob.size === 0) return;
+      const dataUrl = await readFileAsDataURL(blob);
+      await sendGeneralPayload({ kind: 'audio', dataUrl, mime: 'audio/webm', filename: 'vocal.webm' });
+    };
+    mediaRecorder.start();
+    micBtn.classList.add('recording');
+    showToast({ title: 'Enregistrement...', body: 'Reclique sur le micro pour envoyer.' });
+  }catch(err){
+    showToast({ title: 'Micro indisponible', body: "Vérifie les permissions du navigateur." });
+  }
+}
+
+document.getElementById('msgInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendSecretMessage(); });
+document.getElementById('msgInput').addEventListener('input', (e) => {
+  document.getElementById('charCount').textContent = `${e.target.value.length}/2000`;
+});
+document.getElementById('addFriendInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendFriendRequest(); });
+
+/* =========================================================
+   TUTORIEL D'ONBOARDING
+   ========================================================= */
+const TUTORIAL_STEPS = [
+  {
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>',
+    title: 'Bienvenue sur NullChat !',
+    text: "Tout ce que tu envoies ici est chiffré de bout en bout : personne d'autre que toi et ton correspondant ne peut lire tes messages. Voici un petit guide pour prendre tes marques, ça prend 30 secondes."
+  },
+  {
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    title: 'Ton NULLID, ta carte d\'identité',
+    text: "Clique sur ton avatar en bas à gauche : tu y trouveras ton <b>NULLID</b>, un code unique (ex : <code>A3F9-72CD</code>). C'est ce code que tu dois donner à tes amis (et qu'ils doivent te donner) pour vous connecter."
+  },
+  {
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+    title: 'Ajouter un ami',
+    text: "Va dans l'onglet <b>Amis</b> (icône à gauche), colle le NULLID de la personne dans la case en haut et clique sur <b>Ajouter</b>. Une fois la demande acceptée, elle apparaît dans ta liste et tu peux lui écrire en privé."
+  },
+  {
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+    title: 'Écrire un message',
+    text: "Le salon <b>#général</b> est ouvert à tout le monde connecté. Pour une discussion privée, clique sur un ami dans ta liste. Tu peux aussi envoyer une photo, une vidéo 📎 ou un message vocal 🎤 avec les boutons à côté du champ de texte."
+  },
+  {
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>',
+    title: 'Appeler un ami',
+    text: "Depuis une conversation privée, clique sur l'icône téléphone en haut pour lancer un appel audio chiffré. Ton ami reçoit une notification et peut accepter ou refuser."
+  },
+  {
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>',
+    title: 'Besoin d\'un rappel ?',
+    text: "Tu retrouveras ce guide à tout moment via l'icône <b>?</b> dans la barre de navigation. Une fois connecté, tu n'auras pas à ressaisir ton mot de passe à chaque visite : seulement environ tous les deux mois, pour ta sécurité. Bonne discussion !"
+  }
+];
+
+function openTutorial(){
+  tutorialStepIndex = 0;
+  renderTutorialStep();
+  document.getElementById('tutoOverlay').classList.add('open');
+}
+function closeTutorial(){
+  document.getElementById('tutoOverlay').classList.remove('open');
+  try{ localStorage.setItem(TUTORIAL_SEEN_KEY, '1'); }catch(e){}
+}
+function tutorialNext(){
+  if (tutorialStepIndex >= TUTORIAL_STEPS.length - 1){ closeTutorial(); return; }
+  tutorialStepIndex++;
+  renderTutorialStep();
+}
+function tutorialPrev(){
+  if (tutorialStepIndex <= 0) return;
+  tutorialStepIndex--;
+  renderTutorialStep();
+}
+function renderTutorialStep(){
+  const step = TUTORIAL_STEPS[tutorialStepIndex];
+  document.getElementById('tutoIcon').innerHTML = step.icon;
+  document.getElementById('tutoTitle').textContent = step.title;
+  document.getElementById('tutoText').innerHTML = step.text;
+  document.getElementById('tutoPrevBtn').style.visibility = tutorialStepIndex === 0 ? 'hidden' : 'visible';
+  document.getElementById('tutoNextBtn').textContent = tutorialStepIndex === TUTORIAL_STEPS.length - 1 ? "C'est parti !" : 'Suivant';
+  const dots = document.getElementById('tutoDots');
+  dots.innerHTML = '';
+  TUTORIAL_STEPS.forEach((_, i) => {
+    const d = document.createElement('div');
+    d.className = 'tuto-dot' + (i === tutorialStepIndex ? ' active' : '');
+    dots.appendChild(d);
+  });
+}
+
+/* =========================================================
+   EFFET RIPPLE SUR LES BOUTONS (retour visuel au clic)
+   ========================================================= */
+document.addEventListener('pointerdown', (e) => {
+  const btn = e.target.closest('.fx-btn');
+  if (!btn || btn.disabled) return;
+  const rect = btn.getBoundingClientRect();
+  const size = Math.max(rect.width, rect.height);
+  const ripple = document.createElement('span');
+  ripple.className = 'fx-ripple';
+  ripple.style.width = ripple.style.height = size + 'px';
+  ripple.style.left = (e.clientX - rect.left - size / 2) + 'px';
+  ripple.style.top = (e.clientY - rect.top - size / 2) + 'px';
+  btn.appendChild(ripple);
+  setTimeout(() => ripple.remove(), 600);
+});
+
+/* =========================================================
+   RECONNEXION AUTOMATIQUE (session valable ~2 mois)
+   ========================================================= */
+attemptAutoLogin();
+
+/* =========================================================
+   DÉCOR DE L'ÉCRAN DE CONNEXION (rideau de caractères chiffrés)
+   ========================================================= */
+(function initCipherRain(){
+  const host = document.getElementById('cipherRain');
+  if (!host || prefersReducedMotion()) return;
+  const glyphs = '01ABCDEF#$%&*+-/<>[]{}=?';
+  const colCount = Math.max(14, Math.floor(window.innerWidth / 42));
+  for (let i = 0; i < colCount; i++){
+    const col = document.createElement('div');
+    col.className = 'cipher-col';
+    const left = (i / colCount) * 100 + (Math.random() * 2 - 1);
+    col.style.left = left + '%';
+    const lines = 26 + Math.floor(Math.random() * 10);
+    let text = '';
+    for (let l = 0; l < lines; l++){
+      const groupLen = 4 + Math.floor(Math.random() * 4);
+      let group = '';
+      for (let c = 0; c < groupLen; c++) group += glyphs[(Math.random() * glyphs.length) | 0];
+      text += group + '\n';
+    }
+    col.textContent = text;
+    col.style.animationDuration = (14 + Math.random() * 16) + 's';
+    col.style.animationDelay = '-' + (Math.random() * 20) + 's';
+    host.appendChild(col);
+  }
+})();
+</script>
+</body>
+</html>
