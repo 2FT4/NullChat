@@ -811,9 +811,9 @@ input:disabled{ opacity:.5; }
   color:#fff;
   text-shadow:
     0 0 4px currentColor,
-    0 0 10px var(--accent, #7c5cff),
-    0 0 18px var(--accent, #7c5cff),
-    0 0 32px var(--accent, #7c5cff);
+    0 0 10px var(--neon-color, #ff2d47),
+    0 0 18px var(--neon-color, #ff2d47),
+    0 0 32px var(--neon-color, #ff2d47);
   animation: fxNeonFlicker 2.6s infinite alternate;
 }
 @keyframes fxNeonFlicker{
@@ -863,6 +863,56 @@ input:disabled{ opacity:.5; }
 @keyframes fxShineSweep{
   0%{ background-position: 200% 0; }
   100%{ background-position: -50% 0; }
+}
+
+/* --- Pulse --- */
+.fx-pulse{ display:inline-block; animation: fxPulse 1.4s ease-in-out infinite; transform-origin:center; }
+@keyframes fxPulse{
+  0%, 100%{ transform: scale(1); }
+  50%{ transform: scale(1.12); }
+}
+
+/* --- Secousse (shake) : jitter continu, différent du glitch (pas de dédoublement couleur) --- */
+.fx-shake .ln{ display:inline-block; animation: fxShake 0.42s ease-in-out infinite; animation-delay: calc(var(--i, 0) * 0.045s); }
+@keyframes fxShake{
+  0%, 100%{ transform: rotate(0deg) translateX(0); }
+  25%{ transform: rotate(-6deg) translateX(-1px); }
+  75%{ transform: rotate(6deg) translateX(1px); }
+}
+
+/* --- Contour (outline) : lettres évidées, statique --- */
+.fx-outline{
+  color: transparent;
+  -webkit-text-stroke: 1.5px var(--outline-color, var(--text-primary));
+  text-stroke: 1.5px var(--outline-color, var(--text-primary));
+}
+
+/* --- Ombre 3D --- */
+.fx-shadow3d{
+  color: var(--shadow3d-color, var(--text-primary));
+  text-shadow:
+    1px 1px 0 var(--accent-1), 2px 2px 0 var(--accent-1), 3px 3px 0 var(--accent-1),
+    4px 4px 6px rgba(0,0,0,0.4);
+}
+
+/* --- Soulignement animé --- */
+.fx-underline{ position:relative; display:inline-block; padding-bottom:3px; }
+.fx-underline::after{
+  content:""; position:absolute; left:0; right:0; bottom:0; height:2px;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent-3), var(--accent-2));
+  background-size: 250% 100%;
+  animation: fxUnderlineSweep 2.2s linear infinite;
+}
+@keyframes fxUnderlineSweep{
+  0%{ background-position: 0% 0; }
+  100%{ background-position: 250% 0; }
+}
+
+/* --- Scintillement (sparkle) : chaque lettre clignote légèrement --- */
+.fx-sparkle .ln{ display:inline-block; animation: fxSparkle 1.8s ease-in-out infinite; animation-delay: calc(var(--i, 0) * 0.13s); }
+@keyframes fxSparkle{
+  0%, 100%{ opacity:1; filter:none; }
+  50%{ opacity:0.45; filter: drop-shadow(0 0 4px #fff); }
 }
 
 /* --- Aperçu dans les Paramètres --- */
@@ -999,7 +1049,7 @@ input:disabled{ opacity:.5; }
           <button class="icon-btn fx-btn" id="genMicBtn" title="Message vocal" onclick="toggleGeneralVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
-          <input type="text" id="msgInput" placeholder="Envoyer un message" disabled maxlength="2000">
+          <input type="text" id="msgInput" placeholder="Envoyer un message chiffré..." disabled maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendSecretMessage()" id="sendBtn" disabled>Envoyer</button>
         </div>
         <div class="char-count" id="charCount"></div>
@@ -1066,7 +1116,7 @@ input:disabled{ opacity:.5; }
   <div class="label-small">Compte</div>
   <button class="logout-btn fx-btn" style="background:var(--bg-raised);color:var(--text-primary);margin-bottom:8px;" onclick="openSettings()">Paramètres</button>
   <button class="logout-btn fx-btn" onclick="handleLogout()">Se déconnecter</button>
-  <div class="credit-line">Made by <span>2FT4</span></div>
+  <div class="credit-line">Fait par <span>2FT4</span></div>
 </div>
 
 <!-- Modale Paramètres -->
@@ -1080,12 +1130,10 @@ input:disabled{ opacity:.5; }
     </div>
 
     <div class="label-small">Photo de profil</div>
-<div style="display:flex; align-items:center; gap:14px; margin:8px 0 18px 0;">
-  <div class="avatar" id="settingsAvatarPreview" style="width:56px;height:56px;font-size:20px;"></div>
-  <button class="settings-btn fx-btn" onclick="document.getElementById('avatarFileInput').click()" style="display:inline-flex; align-items:center; justify-content:center; line-height:1; padding:8px 16px;">
-    Changer la photo
-  </button>
-</div>
+    <div style="display:flex; align-items:center; gap:14px; margin:8px 0 18px 0;">
+      <div class="avatar" id="settingsAvatarPreview" style="width:56px;height:56px;font-size:20px;"></div>
+      <div>
+        <button class="settings-btn fx-btn" onclick="document.getElementById('avatarFileInput').click()">Changer la photo</button>
         <input type="file" id="avatarFileInput" accept="image/*" style="display:none" onchange="handleAvatarSelected(event)">
         <div id="avatarRemoveRow" style="margin-top:6px; display:none;">
           <span class="switch-link" onclick="removeAvatar()">Retirer la photo</span>
@@ -1100,14 +1148,11 @@ input:disabled{ opacity:.5; }
     <div class="label-small" style="margin-top:0;">Effet</div>
     <div class="name-style-grid" id="nameEffectGrid"></div>
 
-  <div class="label-small" style="margin-top:0;">Couleur(s) du pseudo</div>
-<div class="name-color-row" id="nameColorChips"></div>
-<div style="display:flex; gap:8px; align-items:center; margin:10px 0 4px 0;">
-  <input type="color" id="nameColorPicker" value="#7c5cff" style="width:40px; height:36px; padding:0; border:none; border-radius:6px; cursor:pointer; background:none;">
-  <button class="settings-btn fx-btn" onclick="addNameColor()" style="display:inline-flex; align-items:center; justify-content:center; height:36px; line-height:1; padding:0 16px;">
-    Ajouter une couleur
-  </button>
-</div>
+    <div class="label-small" style="margin-top:0;">Couleur(s) du pseudo</div>
+    <div class="name-color-row" id="nameColorChips"></div>
+    <div style="display:flex; gap:8px; align-items:center; margin:10px 0 4px 0;">
+      <input type="color" id="nameColorPicker" value="#7c5cff" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
+      <button class="settings-btn fx-btn" onclick="addNameColor()">Ajouter une couleur</button>
       <span class="switch-link" style="margin-left:auto;" onclick="clearNameColors()">Réinitialiser</span>
     </div>
     <div class="sub" style="font-size:12px; color:var(--text-muted); margin:4px 0 16px 0;">
@@ -1309,26 +1354,44 @@ const NAME_FONTS = {
   none:  { label: 'Normale',        sample: 'Abc' },
   bold:  { label: 'Gras',           sample: '𝗔𝗯𝗰', base: 0x1D400, baseLower: 0x1D41A, baseDigit: 0x1D7CE },
   italic:{ label: 'Italique',       sample: '𝘈𝘣𝘤', base: 0x1D434, baseLower: 0x1D44E },
+  boldItalic:{ label: 'Gras italique', sample: '𝑨𝒃𝒄', base: 0x1D468, baseLower: 0x1D482 },
   script:{ label: 'Cursive',        sample: '𝒜𝒷𝒸', base: 0x1D49C, baseLower: 0x1D4B6, exceptions: { 'B':'\u212C','E':'\u2130','F':'\u2131','H':'\u210B','I':'\u2110','L':'\u2112','M':'\u2133','R':'\u211B','e':'\u212F','g':'\u210A','o':'\u2134' } },
   gothic:{ label: 'Gothique',       sample: '𝔄𝔟𝔠', base: 0x1D504, baseLower: 0x1D51E, exceptions: { 'C':'\u212D','H':'\u210C','I':'\u2111','R':'\u211C','Z':'\u2128' } },
   double:{ label: 'Double',         sample: '𝔸𝕓𝕔', base: 0x1D538, baseLower: 0x1D552, baseDigit: 0x1D7D8, exceptions: { 'C':'\u2102','H':'\u210D','N':'\u2115','P':'\u2119','Q':'\u211A','R':'\u211D','Z':'\u2124' } },
   mono:  { label: 'Monospace',      sample: '𝙰𝚋𝚌', base: 0x1D670, baseLower: 0x1D68A, baseDigit: 0x1D7F6 },
+  sans:  { label: 'Sans-serif',     sample: '𝖠𝖻𝖼', base: 0x1D5A0, baseLower: 0x1D5BA, baseDigit: 0x1D7E2 },
+  sansBold:{ label: 'Sans gras',    sample: '𝗔𝗯𝗰', base: 0x1D5D4, baseLower: 0x1D5EE, baseDigit: 0x1D7EC },
+  fullwidth:{ label: 'Large',       sample: 'Ａｂｃ', base: 0xFF21, baseLower: 0xFF41, baseDigit: 0xFF10 },
   bubble:{ label: 'Bulle',          sample: 'Ⓐⓑⓒ', base: 0x24B6, baseLower: 0x24D0 },
-  smallcaps:{ label: 'Petites maj.', sample: 'ᴬʙᶜ', map: { a:'ᴀ',b:'ʙ',c:'ᴄ',d:'ᴅ',e:'ᴇ',f:'ꜰ',g:'ɢ',h:'ʜ',i:'ɪ',j:'ᴊ',k:'ᴋ',l:'ʟ',m:'ᴍ',n:'ɴ',o:'ᴏ',p:'ᴘ',q:'Q',r:'ʀ',s:'s',t:'ᴛ',u:'ᴜ',v:'ᴠ',w:'ᴡ',x:'x',y:'ʏ',z:'ᴢ' } }
+  smallcaps:{ label: 'Petites maj.', sample: 'ᴬʙᶜ', map: { a:'ᴀ',b:'ʙ',c:'ᴄ',d:'ᴅ',e:'ᴇ',f:'ꜰ',g:'ɢ',h:'ʜ',i:'ɪ',j:'ᴊ',k:'ᴋ',l:'ʟ',m:'ᴍ',n:'ɴ',o:'ᴏ',p:'ᴘ',q:'Q',r:'ʀ',s:'s',t:'ᴛ',u:'ᴜ',v:'ᴠ',w:'ᴡ',x:'x',y:'ʏ',z:'ᴢ' } },
+  upsideDown:{ label: 'Envers',     sample: 'ɔqɐ', flip:true, map: { a:'ɐ',b:'q',c:'ɔ',d:'p',e:'ǝ',f:'ɟ',g:'ƃ',h:'ɥ',i:'ı',j:'ɾ',k:'ʞ',l:'ʅ',m:'ɯ',n:'u',o:'o',p:'d',q:'b',r:'ɹ',s:'s',t:'ʇ',u:'n',v:'ʌ',w:'ʍ',x:'x',y:'ʎ',z:'z','0':'0','1':'Ɩ','2':'ᄅ','3':'Ɛ','4':'ㄣ','5':'5','6':'9','7':'ㄥ','8':'8','9':'6' } },
+  strike:{ label: 'Barré',          sample: 'A̶b̶c̶', combining: '\u0336' },
+  underlineFont:{ label: 'Souligné (police)', sample: 'A̲b̲c̲', combining: '\u0332' }
 };
 const NAME_EFFECTS = {
   none:   { label: 'Aucun' },
-  wave:   { label: 'Vague',       cls: 'fx-wave',   perLetter: true },
+  wave:   { label: 'Vague',       cls: 'fx-wave',      perLetter: true },
   neon:   { label: 'Néon',        cls: 'fx-neon' },
   rainbow:{ label: 'Arc-en-ciel', cls: 'fx-rainbow' },
-  glitch: { label: 'Glitch',      cls: 'fx-glitch', perLetter: true },
-  shine:  { label: 'Brillance',   cls: 'fx-shine' }
+  glitch: { label: 'Glitch',      cls: 'fx-glitch',    perLetter: true },
+  shine:  { label: 'Brillance',   cls: 'fx-shine' },
+  pulse:  { label: 'Pulsation',   cls: 'fx-pulse' },
+  shake:  { label: 'Secousse',    cls: 'fx-shake',     perLetter: true },
+  outline:{ label: 'Contour',     cls: 'fx-outline' },
+  shadow3d:{ label: 'Ombre 3D',   cls: 'fx-shadow3d' },
+  underline:{ label: 'Soulignement', cls: 'fx-underline' },
+  sparkle:{ label: 'Scintillement', cls: 'fx-sparkle', perLetter: true }
 };
 
 // Convertit une chaîne normale vers son équivalent Unicode stylisé.
 function toFancyFont(text, fontKey){
   const def = NAME_FONTS[fontKey];
   if (!def || fontKey === 'none') return text || '';
+  if (def.combining){
+    let out = '';
+    for (const ch of String(text || '')) out += ch === ' ' ? ch : (ch + def.combining);
+    return out;
+  }
   let out = '';
   for (const ch of String(text || '')){
     if (def.map){
@@ -1347,6 +1410,7 @@ function toFancyFont(text, fontKey){
       out += ch;
     }
   }
+  if (def.flip) out = [...out].reverse().join('');
   return out;
 }
 
@@ -1372,10 +1436,22 @@ function styledNameHTML(rawName, font, effect, colors){
   }
 
   let colorStyle = '';
-  if (colors.length === 1){
-    colorStyle = `color:${colors[0]};`;
+  if (effect === 'neon'){
+    const glow = colors.length ? colors[0] : '#ff2d47';
+    colorStyle += `--neon-color:${glow};`;
+    if (colors.length <= 1){ colorStyle += `color:${glow};`; }
+  }
+  if (effect === 'outline'){
+    const stroke = colors.length ? colors[0] : 'var(--text-primary)';
+    colorStyle += `--outline-color:${stroke};`;
+  }
+  if (effect === 'shadow3d' && colors.length){
+    colorStyle += `--shadow3d-color:${colors[0]};`;
+  }
+  if (colors.length === 1 && effect !== 'neon'){
+    colorStyle += `color:${colors[0]};`;
   } else if (colors.length >= 2){
-    colorStyle = `background-image:linear-gradient(90deg,${colors.join(',')});-webkit-background-clip:text;background-clip:text;color:transparent;`;
+    colorStyle += `background-image:linear-gradient(90deg,${colors.join(',')});-webkit-background-clip:text;background-clip:text;color:transparent;`;
   }
 
   if (!fx.cls){
