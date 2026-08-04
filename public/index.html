@@ -63,18 +63,21 @@
   - "profile:avatar"      { avatarDataUrl }  [NOUVEAU] data URL image ou null
                              pour retirer l'avatar (250 Ko max, redimensionné
                              côté client avant envoi).
-  - "profile:style"       { nameFont, nameEffect }  [NOUVEAU] préférence de
-                             style du pseudo (police "Instagram" + effet
-                             visuel wave/néon/etc.). Le serveur doit stocker
-                             ces deux champs et les renvoyer avec l'utilisateur
-                             dans "friend:list", "friend:added", "friend:status",
-                             "friend:request_received" et dans "author"/
-                             "senderNullId" des messages, comme pour avatarDataUrl.
-                             Valeurs attendues : nameFont/nameEffect = chaînes
-                             courtes (clés), ex: "bold", "gothic", "none". Ne
-                             jamais faire confiance à du HTML envoyé par le
-                             client : ce ne sont que des clés d'un ensemble fixe
-                             connu du client, jamais du texte libre.
+  - "profile:style"       { nameFont, nameEffect, nameColors }  [NOUVEAU] préférence
+                             de style du pseudo (police "Instagram" + effet visuel
+                             wave/néon/etc. + jusqu'à 6 couleurs personnalisées).
+                             Le serveur doit stocker ces champs et les renvoyer avec
+                             l'utilisateur dans "friend:list", "friend:added",
+                             "friend:status", "friend:request_received" et dans
+                             "author"/"senderNullId" des messages, comme pour
+                             avatarDataUrl. Valeurs attendues : nameFont/nameEffect
+                             = chaînes courtes (clés), ex: "bold", "gothic", "none".
+                             nameColors = tableau de 0 à 6 chaînes hexadécimales
+                             strictes ("#rrggbb") ; le serveur doit rejeter/filtrer
+                             toute valeur qui ne respecte pas ce format avant
+                             stockage. Ne jamais faire confiance à du HTML envoyé
+                             par le client : ce ne sont que des clés/couleurs d'un
+                             format fixe connu du client, jamais du texte libre.
   - "dm:typing"           { targetNullId, isTyping }  [NOUVEAU]
   - "dm:read"             { targetNullId, messageId? }  [NOUVEAU]
 
@@ -132,9 +135,9 @@
   - "friend:removed"         { nullId }
   - "friend:status"          { nullId, online, socketId }
   - "friend:avatar_updated"  { nullId, avatarDataUrl }  [NOUVEAU]
-  - "friend:style_updated"   { nullId, nameFont, nameEffect }  [NOUVEAU] diffusé
-                               à ses amis en ligne quand quelqu'un change son
-                               style de pseudo (miroir de "profile:style").
+  - "friend:style_updated"   { nullId, nameFont, nameEffect, nameColors }  [NOUVEAU]
+                               diffusé à ses amis en ligne quand quelqu'un change
+                               son style de pseudo (miroir de "profile:style").
   - "friend:error"           { message }
   - "dm:key_exchange"        { senderNullId, senderSocketId, publicKey, isNewUser }
   - "dm:message"             { messageId, senderNullId, author, ciphertext, iv, timestamp }
@@ -869,6 +872,16 @@ input:disabled{ opacity:.5; }
   cursor:pointer; text-align:center; font-family: var(--font-body);
 }
 .name-style-swatch.active{ border-color: var(--accent, #7c5cff); background: var(--bg-panel-2); }
+.name-color-row{ display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+.name-color-chip{
+  width:28px; height:28px; border-radius:50%; border:2px solid var(--border-soft);
+  cursor:pointer; position:relative; padding:0; flex:none;
+}
+.name-color-chip::after{
+  content:'✕'; position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-size:11px; color:#fff; opacity:0; text-shadow:0 0 2px #000;
+}
+.name-color-chip:hover::after{ opacity:1; }
 </style>
 </head>
 <body>
@@ -1077,6 +1090,18 @@ input:disabled{ opacity:.5; }
     <div class="name-style-grid" id="nameFontGrid"></div>
     <div class="label-small" style="margin-top:0;">Effet</div>
     <div class="name-style-grid" id="nameEffectGrid"></div>
+
+    <div class="label-small" style="margin-top:0;">Couleur(s) du pseudo</div>
+    <div class="name-color-row" id="nameColorChips"></div>
+    <div style="display:flex; gap:8px; align-items:center; margin:10px 0 4px 0;">
+      <input type="color" id="nameColorPicker" value="#7c5cff" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
+      <button class="notif-toggle fx-btn" style="width:auto;padding:7px 12px;border-radius:var(--radius-sm);" onclick="addNameColor()">Ajouter une couleur</button>
+      <span class="switch-link" style="margin-left:auto;" onclick="clearNameColors()">Réinitialiser</span>
+    </div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:4px 0 16px 0;">
+      Aucune couleur = couleur par défaut. Une seule = pseudo uni. Plusieurs = dégradé (ou une couleur différente par lettre avec les effets Vague/Glitch). 6 maximum, clique sur une pastille pour la retirer.
+    </div>
+
     <div class="sub" style="font-size:12px; color:var(--text-muted); margin:-8px 0 16px 0;">
       Visible par tes amis dans les messages, la liste d'amis et les appels. Ton pseudo réel (utilisé pour te connecter) ne change pas.
     </div>
@@ -1144,6 +1169,7 @@ let myNullId = null;
 let myAvatarDataUrl = null;
 let myNameFont = 'none';
 let myNameEffect = 'none';
+let myNameColors = []; // 0 = couleur par défaut, 1 = uni, 2+ = dégradé / multicolore
 let authToken = null;
 let socket = null;
 let myKeyPair = null;
@@ -1205,13 +1231,13 @@ function colorForName(name){
 }
 function initialFor(name){ return (name || '?').trim().charAt(0).toUpperCase(); }
 
-// Retrouve la préférence de style (police/effet) à appliquer à l'auteur d'un message.
+// Retrouve la préférence de style (police/effet/couleurs) à appliquer à l'auteur d'un message.
 function nameStyleForAuthor(author, isOwn){
-  if (isOwn) return { font: myNameFont, effect: myNameEffect };
+  if (isOwn) return { font: myNameFont, effect: myNameEffect, colors: myNameColors };
   for (const f of friends.values()){
-    if (f.username === author) return { font: f.nameFont || 'none', effect: f.nameEffect || 'none' };
+    if (f.username === author) return { font: f.nameFont || 'none', effect: f.nameEffect || 'none', colors: Array.isArray(f.nameColors) ? f.nameColors : [] };
   }
-  return { font: 'none', effect: 'none' };
+  return { font: 'none', effect: 'none', colors: [] };
 }
 
 // Affiche une photo de profil si disponible, sinon retombe sur l'initiale colorée.
@@ -1313,21 +1339,38 @@ function toFancyFont(text, fontKey){
 }
 
 // Construit le HTML (échappé) d'un pseudo stylisé, prêt à insérer via innerHTML.
-// rawName = pseudo réel (jamais modifié en base) ; font/effect = clés fixes ci-dessus.
-function styledNameHTML(rawName, font, effect){
+// rawName = pseudo réel (jamais modifié en base) ; font/effect = clés fixes ci-dessus ;
+// colors = tableau de couleurs hex (#rrggbb) validées, 0 à 6 éléments.
+function styledNameHTML(rawName, font, effect, colors){
+  colors = Array.isArray(colors) ? colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 6) : [];
   const fancy = toFancyFont(rawName || '', font || 'none');
   const fx = NAME_EFFECTS[effect] || NAME_EFFECTS.none;
-  if (!fx.cls) return escapeHtml(fancy);
+
   if (fx.perLetter){
     let i = 0;
     const letters = [...fancy].map(ch => {
-      const span = `<span class="ln" style="--i:${i}">${escapeHtml(ch === ' ' ? '\u00A0' : ch)}</span>`;
+      let style = `--i:${i}`;
+      if (colors.length >= 2) style += `;color:${colors[i % colors.length]}`;
+      else if (colors.length === 1) style += `;color:${colors[0]}`;
+      const span = `<span class="ln" style="${style}">${escapeHtml(ch === ' ' ? '\u00A0' : ch)}</span>`;
       i++;
       return span;
     }).join('');
     return `<span class="styled-name ${fx.cls}">${letters}</span>`;
   }
-  return `<span class="styled-name ${fx.cls}">${escapeHtml(fancy)}</span>`;
+
+  let colorStyle = '';
+  if (colors.length === 1){
+    colorStyle = `color:${colors[0]};`;
+  } else if (colors.length >= 2){
+    colorStyle = `background-image:linear-gradient(90deg,${colors.join(',')});-webkit-background-clip:text;background-clip:text;color:transparent;`;
+  }
+
+  if (!fx.cls){
+    if (!colorStyle) return escapeHtml(fancy);
+    return `<span style="${colorStyle}">${escapeHtml(fancy)}</span>`;
+  }
+  return `<span class="styled-name ${fx.cls}"${colorStyle ? ` style="${colorStyle}"` : ''}>${escapeHtml(fancy)}</span>`;
 }
 
 // --- Gestion de la préférence de style du pseudo (locale + envoyée aux amis) ---
@@ -1338,27 +1381,50 @@ function loadNameStylePref(){
       const s = JSON.parse(raw);
       if (s && NAME_FONTS[s.font]) myNameFont = s.font;
       if (s && NAME_EFFECTS[s.effect]) myNameEffect = s.effect;
+      if (s && Array.isArray(s.colors)) myNameColors = s.colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 6);
     }
   }catch(e){}
 }
 function saveNameStylePref(){
-  try{ localStorage.setItem(NAME_STYLE_KEY, JSON.stringify({ font: myNameFont, effect: myNameEffect })); }catch(e){}
+  try{ localStorage.setItem(NAME_STYLE_KEY, JSON.stringify({ font: myNameFont, effect: myNameEffect, colors: myNameColors })); }catch(e){}
+}
+// Sauvegarde, rediffuse aux amis et rafraîchit l'UI après tout changement de style.
+function commitNameStyle(){
+  saveNameStylePref();
+  renderNameStylePicker();
+  const pn = document.getElementById('profileName');
+  if (pn) pn.innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect, myNameColors);
+  if (socket && socket.connected){
+    socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect, nameColors: myNameColors });
+  }
 }
 function applyNameStyle(font, effect){
   myNameFont = NAME_FONTS[font] ? font : 'none';
   myNameEffect = NAME_EFFECTS[effect] ? effect : 'none';
-  saveNameStylePref();
-  renderNameStylePicker();
-  const pn = document.getElementById('profileName');
-  if (pn) pn.innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect);
-  if (socket && socket.connected){
-    socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect });
-  }
+  commitNameStyle();
+}
+function addNameColor(){
+  const input = document.getElementById('nameColorPicker');
+  const hex = (input?.value || '').toLowerCase();
+  if (!/^#[0-9a-f]{6}$/.test(hex)) return;
+  if (myNameColors.includes(hex)) return;
+  if (myNameColors.length >= 6){ showToast({ title: 'Limite atteinte', body: '6 couleurs maximum sur un pseudo.' }); return; }
+  myNameColors.push(hex);
+  commitNameStyle();
+}
+function removeNameColor(hex){
+  myNameColors = myNameColors.filter(c => c !== hex);
+  commitNameStyle();
+}
+function clearNameColors(){
+  myNameColors = [];
+  commitNameStyle();
 }
 function renderNameStylePicker(){
   const fontGrid = document.getElementById('nameFontGrid');
   const fxGrid = document.getElementById('nameEffectGrid');
   const preview = document.getElementById('nameStylePreview');
+  const colorChips = document.getElementById('nameColorChips');
   if (!fontGrid || !fxGrid) return;
   fontGrid.innerHTML = Object.entries(NAME_FONTS).map(([key, def]) => `
     <div class="name-style-swatch${key === myNameFont ? ' active' : ''}" data-font="${key}" title="${escapeHtml(def.label)}">${escapeHtml(def.sample)}</div>
@@ -1372,7 +1438,13 @@ function renderNameStylePicker(){
   fxGrid.querySelectorAll('[data-fx]').forEach(el => {
     el.onclick = () => applyNameStyle(myNameFont, el.getAttribute('data-fx'));
   });
-  if (preview) preview.innerHTML = styledNameHTML(currentUser || 'Pseudo', myNameFont, myNameEffect);
+  if (colorChips){
+    colorChips.innerHTML = myNameColors.map(c => `<button type="button" class="name-color-chip" style="background:${c}" data-color="${c}" title="Retirer ${c}"></button>`).join('');
+    colorChips.querySelectorAll('[data-color]').forEach(el => {
+      el.onclick = () => removeNameColor(el.getAttribute('data-color'));
+    });
+  }
+  if (preview) preview.innerHTML = styledNameHTML(currentUser || 'Pseudo', myNameFont, myNameEffect, myNameColors);
 }
 loadNameStylePref();
 
@@ -1606,7 +1678,7 @@ function toggleProfilePop(evt){
   const rect = evt.currentTarget.getBoundingClientRect();
   pop.style.left = (rect.right + 12) + 'px';
   pop.style.top = (rect.bottom - 200) + 'px';
-  document.getElementById('profileName').innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect);
+  document.getElementById('profileName').innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect, myNameColors);
   document.getElementById('profileNullId').textContent = myNullId || 'inconnu';
   document.getElementById('notifToggle').classList.toggle('on', notifsEnabled);
   pop.classList.add('open');
@@ -1770,7 +1842,7 @@ function renderFriendList(){
       row.innerHTML = `
         <div class="avatar" style="${avatarStyleAttr(req)}">${req.avatarDataUrl ? '' : escapeHtml(initialFor(req.username))}</div>
         <div class="friend-meta">
-          <div class="friend-name">${styledNameHTML(req.username, req.nameFont || 'none', req.nameEffect || 'none')}</div>
+          <div class="friend-name">${styledNameHTML(req.username, req.nameFont || 'none', req.nameEffect || 'none', req.nameColors || [])}</div>
           <div class="friend-sub">${escapeHtml(req.nullId)}</div>
         </div>
         <div class="friend-actions">
@@ -1806,7 +1878,7 @@ function renderFriendList(){
         <div class="avatar-dot" style="background:${f.online ? 'var(--online)' : 'var(--text-faint)'}; width:11px; height:11px; border-color: var(--bg-panel-2);"></div>
       </div>
       <div class="friend-meta">
-        <div class="friend-name">${styledNameHTML(f.username, f.nameFont || 'none', f.nameEffect || 'none')} ${unread > 0 ? `<span class="unread-pill">${unread}</span>` : ''}</div>
+        <div class="friend-name">${styledNameHTML(f.username, f.nameFont || 'none', f.nameEffect || 'none', f.nameColors || [])} ${unread > 0 ? `<span class="unread-pill">${unread}</span>` : ''}</div>
         <div class="friend-sub">${escapeHtml(f.nullId)} · ${f.online ? 'en ligne' : 'hors ligne'}</div>
       </div>
       <div class="friend-actions">
@@ -1849,7 +1921,7 @@ function openDm(friend){
   currentDmPeer = friend;
   unreadDm.delete(friend.nullId);
   renderAvatarInto(document.getElementById('dmAvatar'), friend);
-  document.getElementById('dmPeerName').innerHTML = styledNameHTML(friend.username, friend.nameFont || 'none', friend.nameEffect || 'none');
+  document.getElementById('dmPeerName').innerHTML = styledNameHTML(friend.username, friend.nameFont || 'none', friend.nameEffect || 'none', friend.nameColors || []);
   const callBtn = document.getElementById('dmCallBtn');
   callBtn.disabled = !friend.online;
   callBtn.onclick = () => startCall(friend);
@@ -1962,7 +2034,7 @@ function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, f
   const authorSpan = document.createElement('span');
   authorSpan.className = 'author';
   authorSpan.style.color = isOwn ? 'var(--accent-2)' : colorForName(author);
-  { const st = nameStyleForAuthor(author, isOwn); authorSpan.innerHTML = styledNameHTML(author, st.font, st.effect); }
+  { const st = nameStyleForAuthor(author, isOwn); authorSpan.innerHTML = styledNameHTML(author, st.font, st.effect, st.colors); }
   const timeSpan = document.createElement('span');
   timeSpan.className = 'timestamp';
   timeSpan.textContent = new Date(timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit' });
@@ -2407,7 +2479,7 @@ async function fetchIceServers(){
 
 function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions }){
   document.getElementById('callOverlay').classList.add('open');
-  { const st = nameStyleForAuthor(name, false); document.getElementById('callName').innerHTML = styledNameHTML(name, st.font, st.effect); }
+  { const st = nameStyleForAuthor(name, false); document.getElementById('callName').innerHTML = styledNameHTML(name, st.font, st.effect, st.colors); }
   document.getElementById('callStatusText').textContent = statusText;
   const avatar = document.getElementById('callAvatar');
   renderAvatarInto(avatar, { username: name, avatarDataUrl });
@@ -2591,7 +2663,7 @@ function addChatMessage({ author, text, isOwn, timestamp, kind, dataUrl, filenam
   const authorSpan = document.createElement('span');
   authorSpan.className = 'author';
   authorSpan.style.color = isOwn ? 'var(--accent-2)' : colorForName(author);
-  { const st = nameStyleForAuthor(author, isOwn); authorSpan.innerHTML = styledNameHTML(author, st.font, st.effect); }
+  { const st = nameStyleForAuthor(author, isOwn); authorSpan.innerHTML = styledNameHTML(author, st.font, st.effect, st.colors); }
 
   const timeSpan = document.createElement('span');
   timeSpan.className = 'timestamp';
@@ -2677,7 +2749,7 @@ async function startApp(){
     socket.emit('share_public_key', Array.from(new Uint8Array(rawPublicKey)));
     // Resynchronise la préférence de style de pseudo (police/effet) auprès du serveur,
     // au cas où elle aurait changé sur un autre appareil ou avant que ce socket existe.
-    socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect });
+    socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect, nameColors: myNameColors });
     if (pendingTutorialAfterLogin){
       pendingTutorialAfterLogin = false;
       setTimeout(() => openTutorial(), 500);
@@ -2781,17 +2853,19 @@ async function startApp(){
     }
   });
 
-  // Style de pseudo d'un ami mis à jour en temps réel (police/effet)
+  // Style de pseudo d'un ami mis à jour en temps réel (police/effet/couleurs)
   socket.on('friend:style_updated', (data) => {
     const f = friends.get(data.nullId);
     if (f){
       f.nameFont = data.nameFont || 'none';
       f.nameEffect = data.nameEffect || 'none';
+      f.nameColors = Array.isArray(data.nameColors) ? data.nameColors : [];
     }
     if (currentDmPeer && currentDmPeer.nullId === data.nullId){
       currentDmPeer.nameFont = data.nameFont || 'none';
       currentDmPeer.nameEffect = data.nameEffect || 'none';
-      document.getElementById('dmPeerName').innerHTML = styledNameHTML(currentDmPeer.username, currentDmPeer.nameFont, currentDmPeer.nameEffect);
+      currentDmPeer.nameColors = Array.isArray(data.nameColors) ? data.nameColors : [];
+      document.getElementById('dmPeerName').innerHTML = styledNameHTML(currentDmPeer.username, currentDmPeer.nameFont, currentDmPeer.nameEffect, currentDmPeer.nameColors);
     }
     if (currentView === 'friends') renderFriendList();
   });
