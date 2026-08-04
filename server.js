@@ -52,6 +52,12 @@ const LIMITS = {
   avatarMaxDataUrlLength: 250 * 1024,
   offlineDmQueueMaxPerUser: 200,
   offlineDmQueueTtlMs: 14 * 24 * 60 * 60 * 1000,
+  serverNameMin: 2,
+  serverNameMax: 40,
+  serverInviteCodeLength: 6,
+  serverMaxMembers: 100,
+  serverMaxOwnedPerUser: 20,
+  serverMaxJoinedPerUser: 50,
 };
 
 const app = express();
@@ -116,6 +122,14 @@ const dmOfflineQueue = new Map();
 const friends = new Map();          
 const pendingRequests = new Map();  
 const blocked = new Map();          
+
+// Serveurs (groupes chiffrés créés par les utilisateurs) — en mémoire
+// uniquement pour l'instant (ne survit pas à un redémarrage), même limitation
+// que connectedSockets/userSockets/dmOfflineQueue. Si une persistance est
+// souhaitée plus tard, il suffit d'ajouter les méthodes correspondantes dans
+// db.js sur le même modèle que createUser/addFriendPair etc.
+const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId> }
+const inviteCodeToServerId = new Map(); // inviteCode -> serverId
 
 // ==========================================
 // HYDRATATION DEPUIS LA BASE SQLITE (au démarrage)
@@ -272,6 +286,7 @@ const friendRequestRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 10 
 const messageRateLimit = createRateLimiter({ windowMs: 10 * 1000, max: 40 });
 const attachmentRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 10 });
 const socketEventRateLimit = createRateLimiter({ windowMs: 5 * 1000, max: 120 });
+const serverActionRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 15 });
 
 function clientIp(req) {
   return req.ip || req.socket.remoteAddress || 'unknown';
@@ -659,6 +674,108 @@ function notifyFriendsStatus(nullId, online) {
   }
 }
 
+// ==========================================
+// HELPERS — SERVEURS (groupes chiffrés)
+// ==========================================
+function serverRoom(serverId) {
+  return `server:${serverId}`;
+}
+
+function generateInviteCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans caractères ambigus (0/O, 1/I)
+  let code;
+  do {
+    code = '';
+    for (let i = 0; i < LIMITS.serverInviteCodeLength; i++) {
+      code += alphabet[crypto.randomInt(alphabet.length)];
+    }
+  } while (inviteCodeToServerId.has(code));
+  return code;
+}
+
+function isValidServerName(name) {
+  return typeof name === 'string' && name.trim().length >= LIMITS.serverNameMin && name.trim().length <= LIMITS.serverNameMax;
+}
+
+function isMemberOfServer(nullId, serverId) {
+  const srv = chatServers.get(serverId);
+  return !!srv && !!nullId && srv.members.has(nullId);
+}
+
+function ownedServerCount(nullId) {
+  let count = 0;
+  for (const srv of chatServers.values()) if (srv.ownerNullId === nullId) count++;
+  return count;
+}
+
+function joinedServerCount(nullId) {
+  let count = 0;
+  for (const srv of chatServers.values()) if (srv.members.has(nullId)) count++;
+  return count;
+}
+
+function getServerMembersInfo(serverId) {
+  const srv = chatServers.get(serverId);
+  if (!srv) return [];
+  const list = [];
+  for (const memberNullId of srv.members) {
+    const memberUsername = nullIdToUser.get(memberNullId);
+    if (!memberUsername) continue;
+    const isOnline = userSockets.has(memberNullId);
+    const memberUser = getUserByNullId(memberNullId);
+    list.push({
+      nullId: memberNullId,
+      username: memberUsername,
+      online: isOnline,
+      socketId: isOnline ? userSockets.get(memberNullId) : null,
+      avatarDataUrl: memberUser?.avatarDataUrl || null
+    });
+  }
+  return list;
+}
+
+function serializeServer(serverId) {
+  const srv = chatServers.get(serverId);
+  if (!srv) return null;
+  return {
+    id: srv.id,
+    name: srv.name,
+    inviteCode: srv.inviteCode,
+    ownerNullId: srv.ownerNullId,
+    members: getServerMembersInfo(serverId)
+  };
+}
+
+function sendServerListAndJoinRooms(socket, nullId) {
+  const mine = [];
+  for (const srv of chatServers.values()) {
+    if (srv.members.has(nullId)) {
+      socket.join(serverRoom(srv.id));
+      mine.push(serializeServer(srv.id));
+    }
+  }
+  if (mine.length) socket.emit('server:list', { servers: mine });
+}
+
+function broadcastServerMembers(serverId) {
+  const srv = chatServers.get(serverId);
+  if (!srv) return;
+  io.to(serverRoom(serverId)).emit('server:members', { serverId, members: getServerMembersInfo(serverId) });
+}
+
+function notifyServersMemberStatus(nullId, online) {
+  for (const srv of chatServers.values()) {
+    if (srv.members.has(nullId)) {
+      io.to(serverRoom(srv.id)).emit('server:member_status', {
+        serverId: srv.id,
+        nullId,
+        online,
+        socketId: online ? userSockets.get(nullId) || null : null
+      });
+    }
+  }
+}
+
 function safeHandler(socket, handler) {
   return (data) => {
     if (!socketEventRateLimit(socket.id)) return;
@@ -684,6 +801,8 @@ io.on('connection', (socket) => {
     sendFriendList(socket, nullId);
     sendPendingFriendRequests(socket, nullId);
     flushOfflineDms(socket, nullId);
+    sendServerListAndJoinRooms(socket, nullId);
+    notifyServersMemberStatus(nullId, true);
   }
 
   socket.broadcast.emit('user_joined', { username });
@@ -1001,11 +1120,156 @@ io.on('connection', (socket) => {
     io.to(data.targetSocketId).emit(eventName, { nullId });
   }));
 
+  // ==========================================
+  // SERVEURS (groupes chiffrés créés par les utilisateurs)
+  // ==========================================
+  socket.on('server:create', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!isValidServerName(name)) {
+      return socket.emit('server:error', {
+        message: `Nom de serveur invalide (${LIMITS.serverNameMin} à ${LIMITS.serverNameMax} caractères).`
+      });
+    }
+    if (ownedServerCount(nullId) >= LIMITS.serverMaxOwnedPerUser) {
+      return socket.emit('server:error', { message: 'Tu as atteint la limite de serveurs possédés.' });
+    }
+
+    const id = crypto.randomUUID();
+    const inviteCode = generateInviteCode();
+    const srv = { id, name, inviteCode, ownerNullId: nullId, members: new Set([nullId]) };
+    chatServers.set(id, srv);
+    inviteCodeToServerId.set(inviteCode, id);
+
+    socket.join(serverRoom(id));
+    socket.emit('server:created', serializeServer(id));
+  }));
+
+  socket.on('server:join', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const inviteCode = typeof data.inviteCode === 'string' ? data.inviteCode.trim().toUpperCase() : '';
+    const serverId = inviteCodeToServerId.get(inviteCode);
+    const srv = serverId ? chatServers.get(serverId) : null;
+    if (!srv) {
+      return socket.emit('server:error', { message: 'Code d’invitation invalide.' });
+    }
+    if (srv.members.has(nullId)) {
+      socket.join(serverRoom(srv.id));
+      return socket.emit('server:joined', serializeServer(srv.id));
+    }
+    if (srv.members.size >= LIMITS.serverMaxMembers) {
+      return socket.emit('server:error', { message: 'Ce serveur a atteint son nombre maximal de membres.' });
+    }
+    if (joinedServerCount(nullId) >= LIMITS.serverMaxJoinedPerUser) {
+      return socket.emit('server:error', { message: 'Tu as atteint la limite de serveurs rejoints.' });
+    }
+
+    srv.members.add(nullId);
+    socket.join(serverRoom(srv.id));
+    socket.emit('server:joined', serializeServer(srv.id));
+
+    // Les autres membres en ligne reçoivent la liste à jour ; le nouveau membre
+    // déclenche l'échange de clés côté client (dm-like) une fois qu'il a reçu
+    // sa propre liste "server:joined".
+    socket.to(serverRoom(srv.id)).emit('server:members', { serverId: srv.id, members: getServerMembersInfo(srv.id) });
+  }));
+
+  socket.on('server:leave', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const srv = chatServers.get(data.serverId);
+    if (!srv || !srv.members.has(nullId)) return;
+
+    srv.members.delete(nullId);
+    socket.leave(serverRoom(srv.id));
+
+    if (srv.members.size === 0) {
+      chatServers.delete(srv.id);
+      inviteCodeToServerId.delete(srv.inviteCode);
+    } else {
+      if (srv.ownerNullId === nullId) {
+        srv.ownerNullId = srv.members.values().next().value; // transfert au membre le plus ancien restant
+      }
+      broadcastServerMembers(srv.id);
+    }
+    socket.emit('server:left', { serverId: srv.id });
+  }));
+
+  socket.on('server:key_exchange', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    if (!isValidPublicKey(data.publicKey)) return;
+    const srv = chatServers.get(data.serverId);
+    if (!srv || !isMemberOfServer(nullId, srv.id)) return;
+
+    const payload = {
+      serverId: srv.id,
+      senderSocketId: socket.id,
+      senderNullId: nullId,
+      publicKey: data.publicKey,
+      isNewMember: !!data.isNewMember
+    };
+
+    if (data.targetSocketId) {
+      const target = connectedSockets.get(data.targetSocketId);
+      if (!target?.nullId || !isMemberOfServer(target.nullId, srv.id)) return;
+      io.to(data.targetSocketId).emit('server:key_exchange', payload);
+    } else {
+      socket.to(serverRoom(srv.id)).emit('server:key_exchange', payload);
+    }
+  }));
+
+  socket.on('server:message', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const kind = data.kind || 'text';
+    if (!isValidKind(kind)) return;
+    const isAttachment = kind !== 'text';
+
+    if (!messageRateLimit(socket.id)) {
+      return socket.emit('server:error', { message: 'Tu envoies des messages trop vite, ralentis un peu.' });
+    }
+    if (isAttachment && !attachmentRateLimit(socket.id)) {
+      return socket.emit('server:error', { message: 'Trop de pièces jointes envoyées d’un coup, ralentis un peu.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv || !isMemberOfServer(nullId, srv.id)) return;
+    if (!Array.isArray(data.targets)) return;
+    if (!isValidMeta(data.mime, LIMITS.mimeMax) || !isValidMeta(data.filename, LIMITS.filenameMax)) return;
+
+    const messageId = crypto.randomUUID();
+    data.targets.slice(0, LIMITS.serverMaxMembers).forEach(t => {
+      if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
+      const target = connectedSockets.get(t.targetId);
+      if (!target?.nullId || !isMemberOfServer(target.nullId, srv.id)) return;
+      if (!isValidByteArray(t.ciphertext, ciphertextLimitFor(kind))) return;
+      if (!isValidByteArray(t.iv, LIMITS.ivBytes)) return;
+
+      io.to(t.targetId).emit('server:message', {
+        serverId: srv.id,
+        messageId,
+        senderSocketId: socket.id,
+        senderNullId: nullId,
+        author: username,
+        ciphertext: t.ciphertext,
+        iv: t.iv,
+        kind,
+        mime: data.mime || null,
+        filename: data.filename || null,
+        timestamp: Date.now()
+      });
+    });
+  }));
+
   socket.on('disconnect', () => {
     connectedSockets.delete(socket.id);
     if (nullId && userSockets.get(nullId) === socket.id) {
       userSockets.delete(nullId);
       notifyFriendsStatus(nullId, false);
+      notifyServersMemberStatus(nullId, false);
     }
     socket.broadcast.emit('user_left', { username, senderId: socket.id });
   });

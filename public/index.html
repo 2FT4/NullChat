@@ -86,6 +86,31 @@
                               clair. Limite de taille de payload à imposer
                               comme pour "dm:message".
 
+  --- Serveurs : événements supplémentaires envoyés par le serveur ---
+  (les événements "server:key_exchange" et "server:message" sont réutilisés
+  dans les deux sens, exactement comme "dm:key_exchange" et "dm:message" :
+  le serveur relaie en ajoutant senderSocketId/senderNullId.)
+  - "server:list"          { servers: [{ id, name, inviteCode, ownerNullId,
+                               members:[{nullId,username,online,socketId,
+                               avatarDataUrl}] }] }  envoyé à la connexion.
+  - "server:created"       { id, name, inviteCode, ownerNullId, members }
+                              accusé après "server:create".
+  - "server:joined"        { id, name, inviteCode, ownerNullId, members }
+                              accusé après "server:join" réussi.
+  - "server:left"          { serverId }  accusé après "server:leave".
+  - "server:error"         { message }  ex: code d'invitation invalide.
+  - "server:member_status" { serverId, nullId, online, socketId }
+  - "server:members"       { serverId, members }  liste complète, ex à
+                              chaque arrivée/départ d'un membre.
+  - "server:key_exchange"  { serverId, senderSocketId, senderNullId,
+                               publicKey, isNewMember }
+  - "server:message"       { serverId, messageId, senderSocketId,
+                               senderNullId, author, ciphertext, iv, kind,
+                               mime, filename, timestamp }  le serveur
+                               éclate le tableau "targets" envoyé par
+                               l'auteur et livre à chaque membre son
+                               ciphertext individuel sous ce même événement.
+
   --- Envoyés par le serveur, écoutés ici ---
   - "friend:list"            { friends: [{ nullId, username, online, socketId, avatarDataUrl }] }
   - "friend:request_received"{ requestId, from: { nullId, username, avatarDataUrl } }
