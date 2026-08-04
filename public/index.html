@@ -999,7 +999,7 @@ input:disabled{ opacity:.5; }
           <button class="icon-btn fx-btn" id="genMicBtn" title="Message vocal" onclick="toggleGeneralVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
-          <input type="text" id="msgInput" placeholder="Envoyer un message chiffré..." disabled maxlength="2000">
+          <input type="text" id="msgInput" placeholder="Envoyer un message" disabled maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendSecretMessage()" id="sendBtn" disabled>Envoyer</button>
         </div>
         <div class="char-count" id="charCount"></div>
@@ -1066,7 +1066,7 @@ input:disabled{ opacity:.5; }
   <div class="label-small">Compte</div>
   <button class="logout-btn fx-btn" style="background:var(--bg-raised);color:var(--text-primary);margin-bottom:8px;" onclick="openSettings()">Paramètres</button>
   <button class="logout-btn fx-btn" onclick="handleLogout()">Se déconnecter</button>
-  <div class="credit-line">Fait par <span>2FT4</span></div>
+  <div class="credit-line">Made by <span>2FT4</span></div>
 </div>
 
 <!-- Modale Paramètres -->
@@ -1080,10 +1080,12 @@ input:disabled{ opacity:.5; }
     </div>
 
     <div class="label-small">Photo de profil</div>
-    <div style="display:flex; align-items:center; gap:14px; margin:8px 0 18px 0;">
-      <div class="avatar" id="settingsAvatarPreview" style="width:56px;height:56px;font-size:20px;"></div>
-      <div>
-        <button class="settings-btn fx-btn" onclick="document.getElementById('avatarFileInput').click()">Changer la photo</button>
+<div style="display:flex; align-items:center; gap:14px; margin:8px 0 18px 0;">
+  <div class="avatar" id="settingsAvatarPreview" style="width:56px;height:56px;font-size:20px;"></div>
+  <button class="settings-btn fx-btn" onclick="document.getElementById('avatarFileInput').click()" style="display:inline-flex; align-items:center; justify-content:center; line-height:1; padding:8px 16px;">
+    Changer la photo
+  </button>
+</div>
         <input type="file" id="avatarFileInput" accept="image/*" style="display:none" onchange="handleAvatarSelected(event)">
         <div id="avatarRemoveRow" style="margin-top:6px; display:none;">
           <span class="switch-link" onclick="removeAvatar()">Retirer la photo</span>
@@ -1098,11 +1100,14 @@ input:disabled{ opacity:.5; }
     <div class="label-small" style="margin-top:0;">Effet</div>
     <div class="name-style-grid" id="nameEffectGrid"></div>
 
-    <div class="label-small" style="margin-top:0;">Couleur(s) du pseudo</div>
-    <div class="name-color-row" id="nameColorChips"></div>
-    <div style="display:flex; gap:8px; align-items:center; margin:10px 0 4px 0;">
-      <input type="color" id="nameColorPicker" value="#7c5cff" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
-      <button class="settings-btn fx-btn" onclick="addNameColor()">Ajouter une couleur</button>
+  <div class="label-small" style="margin-top:0;">Couleur(s) du pseudo</div>
+<div class="name-color-row" id="nameColorChips"></div>
+<div style="display:flex; gap:8px; align-items:center; margin:10px 0 4px 0;">
+  <input type="color" id="nameColorPicker" value="#7c5cff" style="width:40px; height:36px; padding:0; border:none; border-radius:6px; cursor:pointer; background:none;">
+  <button class="settings-btn fx-btn" onclick="addNameColor()" style="display:inline-flex; align-items:center; justify-content:center; height:36px; line-height:1; padding:0 16px;">
+    Ajouter une couleur
+  </button>
+</div>
       <span class="switch-link" style="margin-left:auto;" onclick="clearNameColors()">Réinitialiser</span>
     </div>
     <div class="sub" style="font-size:12px; color:var(--text-muted); margin:4px 0 16px 0;">
