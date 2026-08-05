@@ -172,10 +172,16 @@
   NULLID de confiance définis côté serveur, ex. variable d'env OWNER_NULLIDS),
   totalement différente du "owner" d'un serveur créé par un utilisateur. Le
   client n'est qu'une interface : il affiche ces actions si myNullId figure
-  dans une constante locale (voir OWNER_NULLIDS dans le JS) mais ça ne PROUVE
-  rien — le serveur doit revalider indépendamment que le nullId associé au
-  socket émetteur fait bien partie de sa propre liste OWNER avant d'agir,
-  sans quoi n'importe qui pourrait forger ces événements depuis la console.
+  dans une constante locale (voir OWNER_NULLIDS/COOWNER_NULLIDS dans le JS)
+  mais ça ne PROUVE rien — le serveur doit revalider indépendamment que le
+  nullId associé au socket émetteur fait bien partie de sa propre liste
+  d'admins globaux avant d'agir, sans quoi n'importe qui pourrait forger ces
+  événements depuis la console.
+  "Owner" et "Co-Owner" ont EXACTEMENT les mêmes droits (bannir/débannir de
+  toute l'app) ; seul le libellé affiché diffère. Le plus simple côté serveur
+  est de garder une seule liste de confiance regroupant les deux (ex.
+  OWNER_NULLIDS = owner + co-owners), la distinction Owner/Co-Owner n'étant
+  qu'un affichage côté client.
   - "app:ban_user"          { nullId, reason? }  bannit un compte de TOUTE
                               l'app : le serveur doit déconnecter tous ses
                               sockets actifs et refuser tout futur
@@ -664,17 +670,18 @@ input:disabled{ opacity:.5; }
 
 /* --- Profil / NULLID popover --- */
 .profile-pop{
-  position:fixed; z-index:40; display:none; width:250px;
+  position:fixed; z-index:40; display:none; width:230px;
   background: var(--bg-raised); border:1px solid var(--border-soft); border-radius: var(--radius-md);
-  padding: 16px; box-shadow: 0 12px 30px rgba(0,0,0,0.5); overflow:hidden;
+  padding: 13px; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+  max-height: calc(100vh - 24px); overflow-y:auto; overflow-x:hidden;
 }
 .profile-pop.open{ display:block; }
 .profile-banner{
-  height:64px; margin:-16px -16px 30px -16px; position:relative;
+  height:50px; margin:-13px -13px 24px -13px; position:relative;
   background-color: var(--bg-panel-2); background-size:cover; background-position:center;
 }
 .profile-pop-avatar{
-  position:absolute; left:14px; bottom:-22px; width:52px; height:52px; font-size:18px;
+  position:absolute; left:12px; bottom:-18px; width:44px; height:44px; font-size:16px;
   border:3px solid var(--bg-raised); box-shadow:0 2px 10px rgba(0,0,0,0.45);
 }
 .profile-pop .pname{ font-family: var(--font-display); font-weight:700; font-size:15px; margin-bottom:10px; }
@@ -1489,7 +1496,7 @@ input:disabled{ opacity:.5; }
     <div id="sessionsList" style="margin:8px 0 4px 0; font-size:13px; color:var(--text-muted);">Chargement…</div>
 
     <div id="ownerPanelSection" style="display:none; margin-top:20px; padding-top:16px; border-top:1px solid var(--border-soft);">
-      <div class="label-small" style="color:var(--danger);">Administration NullChat (Owner)</div>
+      <div class="label-small" id="ownerPanelTitle" style="color:var(--danger);">Administration NullChat (Owner)</div>
       <div class="sub" style="font-size:12px; color:var(--text-muted); margin:6px 0 10px 0;">
         Réservé au propriétaire de l'application. Bannir ici déconnecte le compte et l'empêche de se reconnecter à toute l'app (pas juste un serveur), jusqu'à ce qu'il soit débanni.
       </div>
@@ -1613,7 +1620,18 @@ let currentServerId = null;
 // client : le serveur DOIT revérifier indépendamment ce nullId avant d'agir (voir contrat
 // réseau en tête de fichier, section "Owner de l'application").
 const OWNER_NULLIDS = ['TON-NULLID-ICI'];
-function isAppOwner(){ return !!myNullId && OWNER_NULLIDS.includes(myNullId); }
+// Ajoute ici les NULLID d'amis à qui tu veux donner exactement les mêmes droits
+// d'administration globale que toi (bannir/débannir de toute l'app). Ils apparaîtront
+// avec le libellé "Co-Owner" au lieu de "Owner", mais les permissions sont identiques.
+// Ex: const COOWNER_NULLIDS = ['A3F9-72CD', 'B7K2-91XZ'];
+const COOWNER_NULLIDS = [];
+function isAppOwner(){ return !!myNullId && (OWNER_NULLIDS.includes(myNullId) || COOWNER_NULLIDS.includes(myNullId)); }
+function appOwnerRoleLabel(){
+  if (!myNullId) return '';
+  if (OWNER_NULLIDS.includes(myNullId)) return 'Owner';
+  if (COOWNER_NULLIDS.includes(myNullId)) return 'Co-Owner';
+  return '';
+}
 let appBannedUsers = []; // rempli via l'évènement "app:banned_users" (réservé owner)
 
 function banUserFromApp(nullId, username){
@@ -1637,6 +1655,8 @@ function renderAppOwnerPanel(){
   if (!section) return;
   if (!isAppOwner()){ section.style.display = 'none'; return; }
   section.style.display = 'block';
+  const title = document.getElementById('ownerPanelTitle');
+  if (title) title.textContent = `Administration NullChat (${appOwnerRoleLabel()})`;
   const list = document.getElementById('ownerBannedList');
   if (!list) return;
   if (appBannedUsers.length === 0){
@@ -2490,15 +2510,30 @@ function toggleProfilePop(evt){
   const isOpen = pop.classList.contains('open');
   if (isOpen){ pop.classList.remove('open'); return; }
   const rect = evt.currentTarget.getBoundingClientRect();
-  pop.style.left = (rect.right + 12) + 'px';
-  pop.style.top = (rect.bottom - 200) + 'px';
   document.getElementById('profileName').innerHTML = styledNameHTML(currentUser || '', myNameFont, myNameEffect, myNameColors);
   document.getElementById('profileNullId').textContent = myNullId || 'inconnu';
   document.getElementById('notifToggle').classList.toggle('on', notifsEnabled);
   renderAvatarInto(document.getElementById('profilePopAvatar'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
   document.getElementById('profileBanner').style.backgroundImage = bannerCssValue();
   pop.style.background = bgCssValue() || '';
+  // Le contenu du popover a une hauteur variable (avatar, bannière, éventuel panneau
+  // Owner/Co-Owner...). On l'ouvre d'abord hors champ pour mesurer sa vraie hauteur,
+  // puis on cale sa position pour qu'il reste toujours entièrement visible à l'écran
+  // (avant, un décalage fixe pouvait pousser le bouton "Paramètres" hors de l'écran).
+  pop.style.visibility = 'hidden';
   pop.classList.add('open');
+  const popHeight = pop.offsetHeight;
+  const popWidth = pop.offsetWidth;
+  const margin = 12;
+  let top = rect.bottom - 200;
+  if (top + popHeight > window.innerHeight - margin) top = window.innerHeight - margin - popHeight;
+  if (top < margin) top = margin;
+  let left = rect.right + 12;
+  if (left + popWidth > window.innerWidth - margin) left = window.innerWidth - margin - popWidth;
+  if (left < margin) left = margin;
+  pop.style.top = top + 'px';
+  pop.style.left = left + 'px';
+  pop.style.visibility = '';
 }
 document.addEventListener('click', (e) => {
   const pop = document.getElementById('profilePop');
