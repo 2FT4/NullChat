@@ -18,6 +18,23 @@ const TOKEN_TTL_MS = Number(process.env.TOKEN_TTL_MS || 60 * 24 * 60 * 60 * 1000
 const MAX_SESSIONS_PER_USER = Number(process.env.MAX_SESSIONS_PER_USER || 8);
 const INDEX_FILE = process.env.INDEX_FILE || 'index_2.html';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+// "Owner de l'app" = modération globale du produit, à ne JAMAIS confondre avec
+// le ownerNullId d'un serveur créé par un utilisateur. Le client n'affiche le
+// panneau qu'à titre indicatif (OWNER_NULLIDS côté front) ; c'est cette liste
+// serveur, définie uniquement via variable d'environnement, qui fait foi.
+// Le client ne peut jamais s'y ajouter lui-même.
+const OWNER_NULLIDS = new Set(
+  (process.env.OWNER_NULLIDS || '')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean)
+);
+function isAppOwner(candidateNullId) {
+  return !!candidateNullId && OWNER_NULLIDS.has(candidateNullId);
+}
+if (OWNER_NULLIDS.size === 0) {
+  console.warn('⚠️ OWNER_NULLIDS est vide : personne ne peut utiliser la modération globale de l’app.');
+}
 // NB : l'ancienne route /api/upload + le dossier /uploads servi en statique
 // ont été retirés. Le client n'appelle jamais /api/upload (les médias
 // transitent uniquement chiffrés via les sockets dm:message/encrypted_message)
@@ -62,6 +79,20 @@ const LIMITS = {
   serverMaxMembers: 100,
   serverMaxOwnedPerUser: 20,
   serverMaxJoinedPerUser: 50,
+  nameFonts: new Set([
+    'none', 'upperCase', 'lowerCase', 'bold', 'italic', 'boldItalic', 'script',
+    'boldScript', 'gothic', 'boldFraktur', 'double', 'mono', 'sans', 'sansBold',
+    'fullwidth', 'bubble', 'squared', 'circledNeg', 'regional', 'smallcaps'
+  ]),
+  nameEffects: new Set([
+    'none', 'wave', 'neon', 'rainbow', 'glitch', 'shine', 'pulse', 'shake',
+    'outline', 'shadow3d', 'underline', 'sparkle', 'fire', 'ice', 'blink',
+    'rotate3d', 'jelly', 'heartbeat'
+  ]),
+  nameColorsMax: 6,
+  hexColorRegex: /^#[0-9a-fA-F]{6}$/,
+  profilePresets: new Set(['crimson', 'sunset', 'ocean', 'purple', 'forest', 'candy', 'midnight', 'gold']),
+  bannerMaxDataUrlLength: 400 * 1024,
 };
 
 const app = express();
@@ -137,8 +168,16 @@ const blocked = new Map();
 // que connectedSockets/userSockets/dmOfflineQueue. Si une persistance est
 // souhaitée plus tard, il suffit d'ajouter les méthodes correspondantes dans
 // db.js sur le même modèle que createUser/addFriendPair etc.
-const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId> }
+const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId>, admins: Set<nullId>, bannedNullIds: Set<nullId> }
 const inviteCodeToServerId = new Map(); // inviteCode -> serverId
+
+// Bannissements globaux de l'app (owner de l'app uniquement), en mémoire
+// uniquement pour l'instant — même limitation que chatServers : ne survit
+// pas à un redémarrage. Si une persistance est souhaitée, ajouter une table
+// dédiée dans db.js (ex: db.banUserFromApp / db.loadAllAppBans) sur le même
+// modèle que les autres méthodes.
+// nullId -> { nullId, username, reason, bannedAt }
+const appBannedUsers = new Map();
 
 // ==========================================
 // HYDRATATION DEPUIS LA BASE SQLITE (au démarrage)
@@ -155,7 +194,18 @@ function loadStateFromDb() {
       passwordHash: u.passwordHash,
       nullId: u.nullId,
       publicKey: u.publicKey,
-      avatarDataUrl: u.avatarDataUrl || null
+      avatarDataUrl: u.avatarDataUrl || null,
+      // ⚠️ Pas encore persistés en base (db.js n'a pas de colonnes dédiées) :
+      // ces préférences de style/thème repartent à zéro après un redémarrage,
+      // même limitation que pour chatServers. À étendre dans db.js si une
+      // persistance est souhaitée (mêmes méthodes que updateAvatar).
+      nameFont: 'none',
+      nameEffect: 'none',
+      nameColors: [],
+      bannerType: 'none',
+      bannerValue: null,
+      bgType: 'none',
+      bgValue: null
     });
     nullIdToUser.set(u.nullId, u.username);
     if (!friends.has(u.nullId)) friends.set(u.nullId, new Set());
@@ -255,6 +305,22 @@ function isValidAvatarDataUrl(dataUrl) {
   );
 }
 
+function isValidHexColor(v) {
+  return typeof v === 'string' && LIMITS.hexColorRegex.test(v);
+}
+
+function isValidNameColors(arr) {
+  return Array.isArray(arr) && arr.length <= LIMITS.nameColorsMax && arr.every(isValidHexColor);
+}
+
+function isValidBannerDataUrl(dataUrl) {
+  return (
+    typeof dataUrl === 'string' &&
+    dataUrl.length <= LIMITS.bannerMaxDataUrlLength &&
+    /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/]+=*$/.test(dataUrl)
+  );
+}
+
 function getUserByNullId(targetNullId) {
   const uname = nullIdToUser.get(targetNullId);
   return uname ? users.get(uname.toLowerCase()) : null;
@@ -343,6 +409,13 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
     if (users.has(cleanUsername.toLowerCase())) {
       return res.status(409).json({ error: "Ce nom d'utilisateur existe déjà." });
     }
+    // Empêche un compte banni de l'app de simplement recréer un compte au
+    // même pseudo pour contourner son bannissement.
+    for (const ban of appBannedUsers.values()) {
+      if (ban.username && ban.username.toLowerCase() === cleanUsername.toLowerCase()) {
+        return res.status(403).json({ error: 'Ce compte est banni de NullChat.' });
+      }
+    }
 
     let nullId;
     if (customNullId) {
@@ -367,7 +440,14 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
       passwordHash,
       nullId,
       publicKey: publicKey || null,
-      avatarDataUrl: null
+      avatarDataUrl: null,
+      nameFont: 'none',
+      nameEffect: 'none',
+      nameColors: [],
+      bannerType: 'none',
+      bannerValue: null,
+      bgType: 'none',
+      bgValue: null
     };
 
     users.set(cleanUsername.toLowerCase(), newUser);
@@ -425,6 +505,10 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
     const user = users.get(usernameKey);
     if (!user) {
       return res.status(401).json({ error: 'Identifiants invalides.' });
+    }
+
+    if (appBannedUsers.has(user.nullId)) {
+      return res.status(403).json({ error: 'Ce compte est banni de NullChat.' });
     }
 
     const validPassword = await bcrypt.compare(password, user.passwordHash);
@@ -609,6 +693,10 @@ io.use((socket, next) => {
     return next(new Error('Token invalide ou expiré.'));
   }
 
+  if (appBannedUsers.has(session.nullId)) {
+    return next(new Error('Ce compte est banni de NullChat.'));
+  }
+
   session.expiresAt = Date.now() + TOKEN_TTL_MS;
   socket.user = { username: session.username, nullId: session.nullId };
   next();
@@ -639,7 +727,10 @@ function sendFriendList(socket, nullId) {
         username: friendUsername,
         online: isOnline,
         socketId: isOnline ? userSockets.get(fNullId) : null,
-        avatarDataUrl: friendUser?.avatarDataUrl || null
+        avatarDataUrl: friendUser?.avatarDataUrl || null,
+        nameFont: friendUser?.nameFont || 'none',
+        nameEffect: friendUser?.nameEffect || 'none',
+        nameColors: friendUser?.nameColors || []
       });
     }
   }
@@ -654,7 +745,14 @@ function sendPendingFriendRequests(socket, nullId) {
       const fromUser = getUserByNullId(r.fromNullId);
       return {
         requestId: r.id,
-        from: { nullId: r.fromNullId, username: fromUsername, avatarDataUrl: fromUser?.avatarDataUrl || null }
+        from: {
+          nullId: r.fromNullId,
+          username: fromUsername,
+          avatarDataUrl: fromUser?.avatarDataUrl || null,
+          nameFont: fromUser?.nameFont || 'none',
+          nameEffect: fromUser?.nameEffect || 'none',
+          nameColors: fromUser?.nameColors || []
+        }
       };
     })
     .filter(r => r.from.username);
@@ -711,6 +809,18 @@ function isMemberOfServer(nullId, serverId) {
   return !!srv && !!nullId && srv.members.has(nullId);
 }
 
+function isServerOwnerOf(srv, nullId) {
+  return !!srv && !!nullId && srv.ownerNullId === nullId;
+}
+
+function isServerAdminOf(srv, nullId) {
+  return !!srv && !!nullId && srv.admins.has(nullId);
+}
+
+function canModerateServer(srv, nullId) {
+  return isServerOwnerOf(srv, nullId) || isServerAdminOf(srv, nullId);
+}
+
 function ownedServerCount(nullId) {
   let count = 0;
   for (const srv of chatServers.values()) if (srv.ownerNullId === nullId) count++;
@@ -751,7 +861,9 @@ function serializeServer(serverId) {
     name: srv.name,
     inviteCode: srv.inviteCode,
     ownerNullId: srv.ownerNullId,
-    members: getServerMembersInfo(serverId)
+    members: getServerMembersInfo(serverId),
+    admins: [...srv.admins],
+    bannedNullIds: [...srv.bannedNullIds]
   };
 }
 
@@ -769,7 +881,12 @@ function sendServerListAndJoinRooms(socket, nullId) {
 function broadcastServerMembers(serverId) {
   const srv = chatServers.get(serverId);
   if (!srv) return;
-  io.to(serverRoom(serverId)).emit('server:members', { serverId, members: getServerMembersInfo(serverId) });
+  io.to(serverRoom(serverId)).emit('server:members', {
+    serverId,
+    members: getServerMembersInfo(serverId),
+    admins: [...srv.admins],
+    bannedNullIds: [...srv.bannedNullIds]
+  });
 }
 
 function notifyServersMemberStatus(nullId, online) {
@@ -905,7 +1022,14 @@ io.on('connection', (socket) => {
       const senderUser = getUserByNullId(nullId);
       io.to(targetSocketId).emit('friend:request_received', {
         requestId,
-        from: { nullId, username, avatarDataUrl: senderUser?.avatarDataUrl || null }
+        from: {
+          nullId,
+          username,
+          avatarDataUrl: senderUser?.avatarDataUrl || null,
+          nameFont: senderUser?.nameFont || 'none',
+          nameEffect: senderUser?.nameEffect || 'none',
+          nameColors: senderUser?.nameColors || []
+        }
       });
     }
   }));
@@ -935,21 +1059,29 @@ io.on('connection', (socket) => {
     if (!fromUsername || !toUsername) return;
 
     if (fromSocket) {
+      const toUser = getUserByNullId(toNullId);
       io.to(fromSocket).emit('friend:added', {
         nullId: toNullId,
         username: toUsername,
         online: userSockets.has(toNullId),
         socketId: userSockets.get(toNullId) || null,
-        avatarDataUrl: getUserByNullId(toNullId)?.avatarDataUrl || null
+        avatarDataUrl: toUser?.avatarDataUrl || null,
+        nameFont: toUser?.nameFont || 'none',
+        nameEffect: toUser?.nameEffect || 'none',
+        nameColors: toUser?.nameColors || []
       });
     }
     if (toSocket) {
+      const fromUser = getUserByNullId(fromNullId);
       io.to(toSocket).emit('friend:added', {
         nullId: fromNullId,
         username: fromUsername,
         online: userSockets.has(fromNullId),
         socketId: userSockets.get(fromNullId) || null,
-        avatarDataUrl: getUserByNullId(fromNullId)?.avatarDataUrl || null
+        avatarDataUrl: fromUser?.avatarDataUrl || null,
+        nameFont: fromUser?.nameFont || 'none',
+        nameEffect: fromUser?.nameEffect || 'none',
+        nameColors: fromUser?.nameColors || []
       });
     }
   }));
@@ -1017,6 +1149,69 @@ io.on('connection', (socket) => {
         io.to(friendSocketId).emit('friend:avatar_updated', { nullId, avatarDataUrl });
       }
     }
+  }));
+
+  socket.on('profile:style', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    // Jamais de texte libre : uniquement des clés fixes connues du client,
+    // et des couleurs hexadécimales strictes — on ne fait confiance à rien
+    // d'autre venant du client (voir avertissement en tête de fichier HTML).
+    const nameFont = LIMITS.nameFonts.has(data.nameFont) ? data.nameFont : 'none';
+    const nameEffect = LIMITS.nameEffects.has(data.nameEffect) ? data.nameEffect : 'none';
+    if (data.nameColors !== undefined && !isValidNameColors(data.nameColors)) {
+      return socket.emit('friend:error', { message: 'Couleurs de pseudo invalides.' });
+    }
+    const nameColors = isValidNameColors(data.nameColors) ? data.nameColors : [];
+
+    const user = getUserByNullId(nullId);
+    if (!user) return;
+    user.nameFont = nameFont;
+    user.nameEffect = nameEffect;
+    user.nameColors = nameColors;
+
+    const userFriendsList = friends.get(nullId) || new Set();
+    for (const fNullId of userFriendsList) {
+      const friendSocketId = userSockets.get(fNullId);
+      if (friendSocketId) {
+        io.to(friendSocketId).emit('friend:style_updated', { nullId, nameFont, nameEffect, nameColors });
+      }
+    }
+  }));
+
+  socket.on('profile:theme', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const bannerType = ['none', 'image', 'preset'].includes(data.bannerType) ? data.bannerType : 'none';
+    const bgType = ['none', 'preset'].includes(data.bgType) ? data.bgType : 'none';
+
+    let bannerValue = null;
+    if (bannerType === 'image') {
+      if (!isValidBannerDataUrl(data.bannerValue)) {
+        return socket.emit('friend:error', { message: 'Bannière invalide ou trop volumineuse (400 Ko max).' });
+      }
+      bannerValue = data.bannerValue;
+    } else if (bannerType === 'preset') {
+      if (!LIMITS.profilePresets.has(data.bannerValue)) {
+        return socket.emit('friend:error', { message: 'Bannière invalide.' });
+      }
+      bannerValue = data.bannerValue;
+    }
+
+    let bgValue = null;
+    if (bgType === 'preset') {
+      if (!LIMITS.profilePresets.has(data.bgValue)) {
+        return socket.emit('friend:error', { message: 'Fond de profil invalide.' });
+      }
+      bgValue = data.bgValue;
+    }
+
+    const user = getUserByNullId(nullId);
+    if (!user) return;
+    user.bannerType = bannerType;
+    user.bannerValue = bannerValue;
+    user.bgType = bgType;
+    user.bgValue = bgValue;
+    // Pas de diffusion aux amis : côté client, seul le "propre profil" affiche
+    // pour l'instant la bannière/le fond (voir note dans le contrat réseau).
   }));
 
   socket.on('dm:key_exchange', safeHandler(socket, (data = {}) => {
@@ -1149,7 +1344,12 @@ io.on('connection', (socket) => {
 
     const id = crypto.randomUUID();
     const inviteCode = generateInviteCode();
-    const srv = { id, name, inviteCode, ownerNullId: nullId, members: new Set([nullId]) };
+    const srv = {
+      id, name, inviteCode, ownerNullId: nullId,
+      members: new Set([nullId]),
+      admins: new Set(),       // ne contient jamais le owner (déjà géré via ownerNullId)
+      bannedNullIds: new Set()
+    };
     chatServers.set(id, srv);
     inviteCodeToServerId.set(inviteCode, id);
 
@@ -1167,6 +1367,9 @@ io.on('connection', (socket) => {
     const srv = serverId ? chatServers.get(serverId) : null;
     if (!srv) {
       return socket.emit('server:error', { message: 'Code d’invitation invalide.' });
+    }
+    if (srv.bannedNullIds.has(nullId)) {
+      return socket.emit('server:error', { message: 'Tu es banni de ce serveur.' });
     }
     if (srv.members.has(nullId)) {
       socket.join(serverRoom(srv.id));
@@ -1195,6 +1398,7 @@ io.on('connection', (socket) => {
     if (!srv || !srv.members.has(nullId)) return;
 
     srv.members.delete(nullId);
+    srv.admins.delete(nullId);
     socket.leave(serverRoom(srv.id));
 
     if (srv.members.size === 0) {
@@ -1203,6 +1407,7 @@ io.on('connection', (socket) => {
     } else {
       if (srv.ownerNullId === nullId) {
         srv.ownerNullId = srv.members.values().next().value; // transfert au membre le plus ancien restant
+        srv.admins.delete(srv.ownerNullId); // le nouveau owner n'est plus listé comme "admin"
       }
       broadcastServerMembers(srv.id);
     }
@@ -1271,6 +1476,192 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
     });
+  }));
+
+  // ==========================================
+  // SERVEURS — MODÉRATION (owner + admins)
+  // ==========================================
+  // Le owner ne peut jamais être rétrogradé/exclu/banni ; ces trois handlers
+  // le vérifient explicitement avant toute action, indépendamment de ce que
+  // le client affiche ou non (voir avertissement en tête du fichier HTML).
+  socket.on('server:promote', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!isServerOwnerOf(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Seul le propriétaire du serveur peut nommer un admin.' });
+    }
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId) || !srv.members.has(targetNullId)) {
+      return socket.emit('server:error', { message: 'Membre introuvable dans ce serveur.' });
+    }
+    if (targetNullId === srv.ownerNullId) return; // déjà "au-dessus" d'admin, no-op silencieux
+
+    srv.admins.add(targetNullId);
+    io.to(serverRoom(srv.id)).emit('server:role_changed', { serverId: srv.id, nullId: targetNullId, role: 'admin' });
+  }));
+
+  socket.on('server:demote', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!isServerOwnerOf(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Seul le propriétaire du serveur peut retirer un admin.' });
+    }
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId) || !srv.admins.has(targetNullId)) return;
+
+    srv.admins.delete(targetNullId);
+    io.to(serverRoom(srv.id)).emit('server:role_changed', { serverId: srv.id, nullId: targetNullId, role: 'member' });
+  }));
+
+  socket.on('server:kick', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId) || !srv.members.has(targetNullId)) {
+      return socket.emit('server:error', { message: 'Membre introuvable dans ce serveur.' });
+    }
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    if (targetNullId === srv.ownerNullId) {
+      return socket.emit('server:error', { message: 'Impossible d’exclure le propriétaire du serveur.' });
+    }
+    // Un admin ne peut pas exclure un autre admin (seul le owner le peut).
+    if (!isServerOwnerOf(srv, nullId) && srv.admins.has(targetNullId)) {
+      return socket.emit('server:error', { message: 'Un admin ne peut pas exclure un autre admin.' });
+    }
+
+    srv.members.delete(targetNullId);
+    srv.admins.delete(targetNullId);
+
+    const targetSocketId = userSockets.get(targetNullId);
+    if (targetSocketId) {
+      io.sockets.sockets.get(targetSocketId)?.leave(serverRoom(srv.id));
+      io.to(targetSocketId).emit('server:kicked', { serverId: srv.id });
+    }
+    broadcastServerMembers(srv.id);
+  }));
+
+  socket.on('server:ban', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId) || !srv.members.has(targetNullId)) {
+      return socket.emit('server:error', { message: 'Membre introuvable dans ce serveur.' });
+    }
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    if (targetNullId === srv.ownerNullId) {
+      return socket.emit('server:error', { message: 'Impossible de bannir le propriétaire du serveur.' });
+    }
+    if (!isServerOwnerOf(srv, nullId) && srv.admins.has(targetNullId)) {
+      return socket.emit('server:error', { message: 'Un admin ne peut pas bannir un autre admin.' });
+    }
+
+    srv.members.delete(targetNullId);
+    srv.admins.delete(targetNullId);
+    srv.bannedNullIds.add(targetNullId);
+
+    const targetSocketId = userSockets.get(targetNullId);
+    if (targetSocketId) {
+      io.sockets.sockets.get(targetSocketId)?.leave(serverRoom(srv.id));
+      io.to(targetSocketId).emit('server:banned', { serverId: srv.id, reason: data.reason || null });
+    }
+    broadcastServerMembers(srv.id);
+  }));
+
+  socket.on('server:unban', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId)) return;
+    srv.bannedNullIds.delete(targetNullId);
+    broadcastServerMembers(srv.id);
+  }));
+
+  // ==========================================
+  // MODÉRATION GLOBALE DE L'APP (owner de l'app uniquement)
+  // ==========================================
+  // ⚠️ Revalidation indépendante obligatoire : le client n'affiche ces
+  // boutons que si son NULLID figure dans une constante locale, ça ne PROUVE
+  // rien — n'importe qui pourrait forger ces événements depuis la console.
+  // On ne fait donc jamais confiance qu'au nullId issu du socket authentifié
+  // et à OWNER_NULLIDS défini côté serveur (variable d'environnement).
+  socket.on('app:ban_user', safeHandler(socket, (data = {}) => {
+    if (!isAppOwner(nullId)) {
+      return socket.emit('friend:error', { message: 'Action non autorisée.' });
+    }
+    const targetNullId = data.nullId;
+    if (!isValidNullId(targetNullId)) return;
+    if (isAppOwner(targetNullId)) {
+      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner de l’app.' });
+    }
+
+    const targetUsername = nullIdToUser.get(targetNullId) || null;
+    appBannedUsers.set(targetNullId, {
+      nullId: targetNullId,
+      username: targetUsername,
+      reason: typeof data.reason === 'string' ? data.reason.slice(0, 300) : null,
+      bannedAt: Date.now()
+    });
+
+    // Déconnecte TOUTES les sockets actives de ce nullId (pas seulement la
+    // dernière connue via userSockets, au cas où plusieurs onglets/sessions
+    // seraient ouverts) et révoque tous ses tokens actifs.
+    for (const [sockId, info] of connectedSockets.entries()) {
+      if (info.nullId !== targetNullId) continue;
+      const targetSocket = io.sockets.sockets.get(sockId);
+      if (!targetSocket) continue;
+      targetSocket.emit('app:user_banned', { reason: data.reason || null });
+      targetSocket.disconnect(true);
+    }
+    if (targetUsername) {
+      const tokens = usernameToTokens.get(targetUsername.toLowerCase());
+      if (tokens) for (const t of [...tokens]) revokeToken(t);
+    }
+
+    log('Compte banni de l’app par', nullId, ':', targetNullId);
+  }));
+
+  socket.on('app:unban_user', safeHandler(socket, (data = {}) => {
+    if (!isAppOwner(nullId)) {
+      return socket.emit('friend:error', { message: 'Action non autorisée.' });
+    }
+    const targetNullId = data.nullId;
+    if (!isValidNullId(targetNullId)) return;
+    appBannedUsers.delete(targetNullId);
+    log('Compte débanni de l’app par', nullId, ':', targetNullId);
+  }));
+
+  socket.on('app:list_banned', safeHandler(socket, () => {
+    if (!isAppOwner(nullId)) {
+      return socket.emit('friend:error', { message: 'Action non autorisée.' });
+    }
+    socket.emit('app:banned_users', { users: [...appBannedUsers.values()] });
   }));
 
   socket.on('disconnect', () => {
