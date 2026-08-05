@@ -137,6 +137,59 @@
                               clair. Limite de taille de payload à imposer
                               comme pour "dm:message".
 
+  --- Serveurs : modération (admins de serveur)  [NOUVEAU] ---
+  Chaque serveur a un "owner" (ownerNullId, déjà existant) et peut avoir
+  plusieurs "admins". Le owner ne peut pas être rétrogradé/exclu/banni.
+  - "server:promote"       { serverId, targetNullId }  passe targetNullId
+                              admin de ce serveur. Émetteur DOIT être le
+                              owner (le serveur vérifie, jamais le client).
+  - "server:demote"        { serverId, targetNullId }  retire le rôle admin.
+                              Émetteur DOIT être le owner.
+  - "server:kick"          { serverId, targetNullId }  exclut un membre
+                              (il pourra revenir avec le code d'invitation).
+                              Émetteur DOIT être owner ou admin ; un admin ne
+                              peut pas exclure le owner ni un autre admin.
+  - "server:ban"           { serverId, targetNullId }  exclut ET empêche de
+                              revenir tant qu'il n'est pas débanni (le serveur
+                              doit rejeter son "server:join" sur ce serverId).
+                              Mêmes règles de permission que "server:kick".
+  - "server:unban"         { serverId, targetNullId }  lève un bannissement
+                              de serveur. Owner ou admin.
+
+  --- Serveurs : modération, événements envoyés par le serveur  [NOUVEAU] ---
+  - "server:list" / "server:created" / "server:joined" / "server:members"
+                              doivent maintenant inclure, par serveur :
+                              admins: [nullId, ...] et bannedNullIds: [nullId, ...]
+                              (en plus des champs déjà listés plus haut).
+  - "server:kicked"         { serverId, reason? }  envoyé au membre exclu,
+                              pour que son client quitte la vue localement.
+  - "server:banned"         { serverId, reason? }  envoyé au membre banni.
+  - "server:role_changed"   { serverId, nullId, role }  role ∈ ('member'|'admin'),
+                              diffusé à tous les membres pour rafraîchir l'UI.
+
+  --- Owner de l'application (modération globale, pas juste un serveur)  [NOUVEAU] ---
+  ⚠️ Le/la "owner de l'app" est une notion GLOBALE au produit (une poignée de
+  NULLID de confiance définis côté serveur, ex. variable d'env OWNER_NULLIDS),
+  totalement différente du "owner" d'un serveur créé par un utilisateur. Le
+  client n'est qu'une interface : il affiche ces actions si myNullId figure
+  dans une constante locale (voir OWNER_NULLIDS dans le JS) mais ça ne PROUVE
+  rien — le serveur doit revalider indépendamment que le nullId associé au
+  socket émetteur fait bien partie de sa propre liste OWNER avant d'agir,
+  sans quoi n'importe qui pourrait forger ces événements depuis la console.
+  - "app:ban_user"          { nullId, reason? }  bannit un compte de TOUTE
+                              l'app : le serveur doit déconnecter tous ses
+                              sockets actifs et refuser tout futur
+                              /api/login (et idéalement /api/register avec le
+                              même pseudo) tant qu'il est banni.
+  - "app:unban_user"        { nullId }  lève un bannissement global.
+  - "app:list_banned"       {}  demande la liste des comptes actuellement
+                              bannis de l'app (réservé aux OWNER_NULLIDS).
+  - "app:banned_users"      { users: [{ nullId, username?, bannedAt }] }
+                              réponse du serveur à "app:list_banned".
+  - "app:user_banned"       { reason? }  envoyé à l'utilisateur juste avant
+                              de couper sa connexion, pour qu'il comprenne
+                              pourquoi il est déconnecté de force.
+
   --- Serveurs : événements supplémentaires envoyés par le serveur ---
   (les événements "server:key_exchange" et "server:message" sont réutilisés
   dans les deux sens, exactement comme "dm:key_exchange" et "dm:message" :
@@ -412,12 +465,12 @@ input:disabled{ opacity:.5; }
    APPLICATION
    ========================================================= */
 #chatApp{
-  width: 96vw; max-width: 1200px; height: 88vh;
+  width: 100vw; max-width: none; height: 100vh; height: 100dvh;
   background: var(--bg-panel);
-  border-radius: var(--radius-lg);
+  border-radius: 0;
   display:none;
-  border: 1px solid var(--border-soft);
-  box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+  border: none;
+  box-shadow: none;
   overflow:hidden;
 }
 .app-shell{ display:flex; height:100%; width:100%; }
@@ -571,7 +624,7 @@ input:disabled{ opacity:.5; }
 .dm-call-btn:disabled{ opacity:.3; cursor:not-allowed; }
 .dm-call-btn svg{ width:16px; height:16px; }
 
-#chat, #dmChat{ flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding: 18px 20px; }
+#chat, #dmChat, #serverChat{ flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding: 18px 20px; }
 
 .msg{
   background: var(--bg-panel-2); padding: 9px 14px; border-radius: var(--radius-md);
@@ -818,7 +871,7 @@ input:disabled{ opacity:.5; }
   .main-area{ min-height:0; }
   .chat-header{ padding: 12px 14px; }
   .chat-header .title{ font-size:14px; }
-  #chat, #dmChat{ padding: 12px 14px; }
+  #chat, #dmChat, #serverChat{ padding: 12px 14px; }
   .msg{ max-width:85%; }
   .chat-input-box{ padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)) 12px; gap:8px; }
   .char-count{ padding: 0 14px; }
@@ -1210,7 +1263,7 @@ input:disabled{ opacity:.5; }
           <button class="icon-btn fx-btn" id="genMicBtn" title="Message vocal" onclick="toggleGeneralVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
-          <input type="text" id="msgInput" placeholder="Envoyée..." disabled maxlength="2000">
+          <input type="text" id="msgInput" placeholder="Envoyer un message chiffré..." disabled maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendSecretMessage()" id="sendBtn" disabled>Envoyer</button>
         </div>
         <div class="char-count" id="charCount"></div>
@@ -1277,6 +1330,9 @@ input:disabled{ opacity:.5; }
             </span>
             <span id="serverMemberStatus" style="font-size:11px; color:var(--text-faint); font-weight:400;"></span>
           </span>
+          <button class="dm-call-btn fx-btn" id="serverMembersBtn" title="Membres" onclick="openServerMembersModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </button>
           <button class="dm-call-btn fx-btn" id="serverInviteBtn" title="Copier le code d'invitation" onclick="copyServerInvite()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
@@ -1431,6 +1487,35 @@ input:disabled{ opacity:.5; }
 
     <div class="label-small" style="margin-top:18px;">Sessions actives</div>
     <div id="sessionsList" style="margin:8px 0 4px 0; font-size:13px; color:var(--text-muted);">Chargement…</div>
+
+    <div id="ownerPanelSection" style="display:none; margin-top:20px; padding-top:16px; border-top:1px solid var(--border-soft);">
+      <div class="label-small" style="color:var(--danger);">Administration NullChat (Owner)</div>
+      <div class="sub" style="font-size:12px; color:var(--text-muted); margin:6px 0 10px 0;">
+        Réservé au propriétaire de l'application. Bannir ici déconnecte le compte et l'empêche de se reconnecter à toute l'app (pas juste un serveur), jusqu'à ce qu'il soit débanni.
+      </div>
+      <div class="add-friend-row">
+        <input type="text" id="ownerBanInput" placeholder="NULLID à bannir (ex: A3F9-72CD)" style="text-transform:uppercase;">
+        <button class="btn-mini fx-btn" style="background:var(--danger); color:#fff;" onclick="banUserFromAppByInput()">Bannir</button>
+      </div>
+      <div class="label-small" style="margin-top:14px;">Comptes actuellement bannis</div>
+      <div id="ownerBannedList" style="margin:8px 0 4px 0;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Modale Membres du serveur (rôles, exclusion, bannissement) -->
+<div class="settings-overlay" id="serverMembersOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
+  <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(440px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+      <div style="font-family:var(--font-display); font-weight:700; font-size:18px;" id="serverMembersTitle">Membres</div>
+      <button class="icon-btn fx-btn" onclick="closeServerMembersModal()" title="Fermer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:0 0 14px 0;">
+      Le propriétaire du serveur peut nommer des admins. Les admins peuvent exclure ou bannir des membres (mais pas le propriétaire, ni un autre admin).
+    </div>
+    <div id="serverMembersList"></div>
   </div>
 </div>
 
@@ -1521,6 +1606,78 @@ const serverHistory = new Map();
 const unreadServer = new Map();
 // Serveur actuellement ouvert
 let currentServerId = null;
+
+// ---- Owner de l'application (modération globale, PAS le "owner" d'un serveur créé) ----
+// Remplace la valeur ci-dessous par TON NULLID (visible dans Paramètres) pour débloquer
+// le panneau d'administration globale ("Bannir de l'app"). Ce n'est qu'un affichage côté
+// client : le serveur DOIT revérifier indépendamment ce nullId avant d'agir (voir contrat
+// réseau en tête de fichier, section "Owner de l'application").
+const OWNER_NULLIDS = ['TON-NULLID-ICI'];
+function isAppOwner(){ return !!myNullId && OWNER_NULLIDS.includes(myNullId); }
+let appBannedUsers = []; // rempli via l'évènement "app:banned_users" (réservé owner)
+
+function banUserFromApp(nullId, username){
+  if (!isAppOwner() || !nullId) return;
+  if (!confirm(`Bannir ${username ? username + ' (' + nullId + ')' : nullId} de toute l'application ?\nCette personne sera déconnectée et ne pourra plus se reconnecter tant qu'elle n'est pas débannie.`)) return;
+  socket.emit('app:ban_user', { nullId });
+  showToast({ title: 'Bannissement envoyé', body: `${username || nullId} va être banni de l'app.` });
+  setTimeout(requestAppBannedUsers, 400);
+}
+function unbanUserFromApp(nullId){
+  if (!isAppOwner() || !nullId) return;
+  socket.emit('app:unban_user', { nullId });
+  setTimeout(requestAppBannedUsers, 400);
+}
+function requestAppBannedUsers(){
+  if (!isAppOwner() || !socket || !socket.connected) return;
+  socket.emit('app:list_banned', {});
+}
+function renderAppOwnerPanel(){
+  const section = document.getElementById('ownerPanelSection');
+  if (!section) return;
+  if (!isAppOwner()){ section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  const list = document.getElementById('ownerBannedList');
+  if (!list) return;
+  if (appBannedUsers.length === 0){
+    list.innerHTML = '<div class="sub" style="font-size:12px; color:var(--text-muted);">Aucun compte banni actuellement.</div>';
+    return;
+  }
+  list.innerHTML = appBannedUsers.map(u => `
+    <div class="friend-row" style="cursor:default; padding:8px 10px;">
+      <div class="friend-meta">
+        <div class="friend-name">${escapeHtml(u.username || 'Inconnu')}</div>
+        <div class="friend-sub">${escapeHtml(u.nullId)}</div>
+      </div>
+      <div class="friend-actions">
+        <button class="settings-btn fx-btn" data-unban="${escapeHtml(u.nullId)}">Débannir</button>
+      </div>
+    </div>
+  `).join('');
+  list.querySelectorAll('[data-unban]').forEach(btn => {
+    btn.onclick = () => unbanUserFromApp(btn.getAttribute('data-unban'));
+  });
+}
+function banUserFromAppByInput(){
+  const input = document.getElementById('ownerBanInput');
+  if (!input) return;
+  const nullId = input.value.trim().toUpperCase();
+  if (!nullId) return;
+  banUserFromApp(nullId);
+  input.value = '';
+}
+
+// S'assure qu'un objet serveur reçu du réseau a bien des tableaux admins/bannedNullIds
+// (rétro-compatible si le serveur ne les envoie pas encore).
+function normalizeServer(srv){
+  if (!srv) return srv;
+  if (!Array.isArray(srv.admins)) srv.admins = srv.ownerNullId ? [srv.ownerNullId] : [];
+  if (!Array.isArray(srv.bannedNullIds)) srv.bannedNullIds = [];
+  return srv;
+}
+function isServerOwner(srv, nullId){ return !!srv && srv.ownerNullId === (nullId || myNullId); }
+function isServerAdmin(srv, nullId){ return !!srv && Array.isArray(srv.admins) && srv.admins.includes(nullId || myNullId); }
+function canModerateServer(srv){ return isServerOwner(srv) || isServerAdmin(srv); }
 
 // ---- Perf : évite le gel de l'UI après beaucoup de messages ----
 const MAX_RENDERED_MESSAGES = 200; // messages gardés dans le DOM par salon/conv
@@ -2551,6 +2708,7 @@ function renderFriendList(){
         <button class="icon-btn fx-btn danger" title="Retirer" data-action="remove">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
         </button>
+        ${isAppOwner() ? `<button class="icon-btn fx-btn danger" title="Bannir de l'app" data-action="appban" style="background:var(--danger); color:#fff;">⛔</button>` : ''}
       </div>
     `;
     row.addEventListener('click', () => openDm(f));
@@ -2558,6 +2716,8 @@ function renderFriendList(){
     if (f.online) callBtn.onclick = (e) => { e.stopPropagation(); startCall(f); };
     row.querySelector('[data-action="remove"]').onclick = (e) => { e.stopPropagation(); removeFriend(f.nullId); };
     row.querySelector('[data-action="block"]').onclick = (e) => { e.stopPropagation(); blockFriend(f.nullId); };
+    const appBanBtn = row.querySelector('[data-action="appban"]');
+    if (appBanBtn) appBanBtn.onclick = (e) => { e.stopPropagation(); banUserFromApp(f.nullId, f.username); };
     scroll.appendChild(row);
   }
 }
@@ -2874,6 +3034,96 @@ function copyServerInvite(){
   showToast({ title: 'Code copié', body: `Partage "${srv.inviteCode}" pour inviter quelqu\u2019un sur ${srv.name}.` });
 }
 
+/* =========================================================
+   ADMINISTRATION D'UN SERVEUR (owner + admins)
+   ========================================================= */
+function openServerMembersModal(){
+  if (!currentServerId) return;
+  renderServerMembersModal();
+  document.getElementById('serverMembersOverlay').style.display = 'flex';
+}
+function closeServerMembersModal(){
+  document.getElementById('serverMembersOverlay').style.display = 'none';
+}
+function roleLabelFor(srv, nullId){
+  if (isServerOwner(srv, nullId)) return 'Propriétaire';
+  if (isServerAdmin(srv, nullId)) return 'Admin';
+  return 'Membre';
+}
+function renderServerMembersModal(){
+  const overlay = document.getElementById('serverMembersOverlay');
+  if (!overlay || overlay.style.display === 'none') return;
+  const srv = myServers.get(currentServerId);
+  if (!srv) return;
+  normalizeServer(srv);
+  document.getElementById('serverMembersTitle').textContent = `Membres — ${srv.name}`;
+  const iCanModerate = canModerateServer(srv);
+  const iAmOwner = isServerOwner(srv);
+  const list = document.getElementById('serverMembersList');
+  const members = [...srv.members].sort((a, b) => {
+    const rank = m => isServerOwner(srv, m.nullId) ? 0 : isServerAdmin(srv, m.nullId) ? 1 : 2;
+    return rank(a) - rank(b) || a.username.localeCompare(b.username);
+  });
+  list.innerHTML = members.map(m => {
+    const role = roleLabelFor(srv, m.nullId);
+    const isMe = m.nullId === myNullId;
+    const targetIsOwner = isServerOwner(srv, m.nullId);
+    const targetIsAdmin = isServerAdmin(srv, m.nullId);
+    let actions = '';
+    if (iAmOwner && !isMe && !targetIsOwner){
+      actions += targetIsAdmin
+        ? `<button class="icon-btn fx-btn" title="Retirer l'admin" data-demote="${escapeHtml(m.nullId)}">−Admin</button>`
+        : `<button class="icon-btn fx-btn" title="Nommer admin" data-promote="${escapeHtml(m.nullId)}">+Admin</button>`;
+    }
+    if (iCanModerate && !isMe && !targetIsOwner && !(targetIsAdmin && !iAmOwner)){
+      actions += `<button class="icon-btn fx-btn" title="Exclure" data-kick="${escapeHtml(m.nullId)}">Exclure</button>`;
+      actions += `<button class="icon-btn fx-btn danger" title="Bannir du serveur" data-serverban="${escapeHtml(m.nullId)}">Bannir</button>`;
+    }
+    if (isAppOwner() && !isMe){
+      actions += `<button class="icon-btn fx-btn danger" title="Bannir de toute l'app" data-appban="${escapeHtml(m.nullId)}" data-username="${escapeHtml(m.username)}">⛔ App</button>`;
+    }
+    return `
+      <div class="friend-row" style="cursor:default; padding:8px 10px;">
+        <div style="position:relative;">
+          <div class="avatar" style="${avatarStyleAttr(m)}">${m.avatarDataUrl ? '' : escapeHtml(initialFor(m.username))}</div>
+          <div class="avatar-dot" style="background:${m.online ? 'var(--online)' : 'var(--text-faint)'}; width:11px; height:11px; border-color: var(--bg-panel-2);"></div>
+        </div>
+        <div class="friend-meta">
+          <div class="friend-name">${escapeHtml(m.username)}${isMe ? ' <span style="color:var(--text-faint);">(toi)</span>' : ''}</div>
+          <div class="friend-sub">${role}</div>
+        </div>
+        <div class="friend-actions" style="flex-wrap:wrap; justify-content:flex-end; gap:4px;">${actions}</div>
+      </div>
+    `;
+  }).join('');
+  list.querySelectorAll('[data-promote]').forEach(b => b.onclick = () => promoteServerAdmin(b.getAttribute('data-promote')));
+  list.querySelectorAll('[data-demote]').forEach(b => b.onclick = () => demoteServerAdmin(b.getAttribute('data-demote')));
+  list.querySelectorAll('[data-kick]').forEach(b => b.onclick = () => kickServerMember(b.getAttribute('data-kick')));
+  list.querySelectorAll('[data-serverban]').forEach(b => b.onclick = () => banServerMember(b.getAttribute('data-serverban')));
+  list.querySelectorAll('[data-appban]').forEach(b => b.onclick = () => banUserFromApp(b.getAttribute('data-appban'), b.getAttribute('data-username')));
+}
+function promoteServerAdmin(nullId){
+  if (!currentServerId) return;
+  socket.emit('server:promote', { serverId: currentServerId, targetNullId: nullId });
+}
+function demoteServerAdmin(nullId){
+  if (!currentServerId) return;
+  socket.emit('server:demote', { serverId: currentServerId, targetNullId: nullId });
+}
+function kickServerMember(nullId){
+  if (!currentServerId) return;
+  if (!confirm('Exclure ce membre du serveur ? Il pourra revenir avec le code d\u2019invitation.')) return;
+  socket.emit('server:kick', { serverId: currentServerId, targetNullId: nullId });
+}
+function banServerMember(nullId){
+  if (!currentServerId) return;
+  if (!confirm('Bannir ce membre de ce serveur ? Il ne pourra plus le rejoindre tant qu\u2019il n\u2019est pas débanni.')) return;
+  socket.emit('server:ban', { serverId: currentServerId, targetNullId: nullId });
+}
+function unbanServerMember(serverId, nullId){
+  socket.emit('server:unban', { serverId, targetNullId: nullId });
+}
+
 // Établit une clé partagée (ECDH) avec chaque membre en ligne du serveur
 // avec qui on n'a pas encore de session, sur le même principe que les DM.
 async function ensureServerKeysWithOnlineMembers(serverId){
@@ -2996,6 +3246,16 @@ function appendServerBubble({ author, text, isOwn, timestamp, kind, dataUrl, mim
   box.scrollTop = box.scrollHeight;
 }
 
+function addSystemServerMessage(text){
+  const box = document.getElementById('serverChat');
+  if (!box) return;
+  const div = document.createElement('div');
+  div.className = 'msg system';
+  div.textContent = text;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
 async function sendServerMessage(){
   if (!currentServerId) return;
   const input = document.getElementById('serverInput');
@@ -3007,12 +3267,13 @@ async function sendServerMessage(){
 
 async function sendServerPayload(payload){
   if (!currentServerId) return;
+  // On tente d'établir/rafraîchir les clés avec les membres actuellement en ligne, mais
+  // on n'attend plus dessus pour envoyer : sinon, seul dans un serveur qu'on vient de
+  // créer (aucun autre membre en ligne pour échanger une clé), il était impossible
+  // d'écrire quoi que ce soit — le message reste au moins visible dans son propre historique.
+  ensureServerKeysWithOnlineMembers(currentServerId);
+  if (!serverKeys.has(currentServerId)) serverKeys.set(currentServerId, new Map());
   const keys = serverKeys.get(currentServerId);
-  if (!keys || keys.size === 0){
-    showToast({ title: 'Chiffrement en cours', body: 'Réessaie dans un instant, la clé sécurisée s\u2019établit avec les membres en ligne.' });
-    ensureServerKeysWithOnlineMembers(currentServerId);
-    return;
-  }
 
   const kind = payload.kind || 'text';
   const rawString = kind === 'text' ? payload.text : payload.dataUrl;
@@ -3038,6 +3299,10 @@ async function sendServerPayload(payload){
   };
   pushServerToHistory(currentServerId, entry);
   appendServerBubble(entry);
+
+  if (targets.length === 0){
+    addSystemServerMessage("Personne d'autre n'est en ligne dans ce serveur pour le moment : ce message ne restera visible que par toi.");
+  }
 }
 
 async function handleServerFileSelected(event){
@@ -3119,6 +3384,8 @@ function openSettings(){
   renderNameStylePicker();
   renderProfileThemePicker();
   renderAppThemePicker();
+  renderAppOwnerPanel();
+  requestAppBannedUsers();
   document.getElementById('settingsOverlay').style.display = 'flex';
   populateAudioDeviceSelects();
   loadActiveSessions();
@@ -3883,14 +4150,14 @@ async function startApp(){
   /* ---------- Serveurs (groupes chiffrés façon Discord) ---------- */
   socket.on('server:list', (data) => {
     myServers.clear();
-    (data.servers || []).forEach(s => myServers.set(s.id, s));
+    (data.servers || []).forEach(s => myServers.set(s.id, normalizeServer(s)));
     if (currentView === 'servers') renderServerList();
     (data.servers || []).forEach(s => ensureServerKeysWithOnlineMembers(s.id));
   });
 
   socket.on('server:created', (data) => {
     if (!data) return;
-    myServers.set(data.id, data);
+    myServers.set(data.id, normalizeServer(data));
     if (currentView === 'servers') renderServerList();
     showToast({ title: 'Serveur créé', body: `"${data.name}" — code : ${data.inviteCode}` });
     openServer(data.id);
@@ -3898,7 +4165,7 @@ async function startApp(){
 
   socket.on('server:joined', (data) => {
     if (!data) return;
-    myServers.set(data.id, data);
+    myServers.set(data.id, normalizeServer(data));
     if (currentView === 'servers') renderServerList();
     showToast({ title: 'Serveur rejoint', body: data.name });
     ensureServerKeysWithOnlineMembers(data.id);
@@ -3910,6 +4177,36 @@ async function startApp(){
     serverKeys.delete(data.serverId);
     if (currentServerId === data.serverId) closeServer();
     if (currentView === 'servers') renderServerList();
+  });
+
+  socket.on('server:kicked', (data) => {
+    const srv = myServers.get(data.serverId);
+    myServers.delete(data.serverId);
+    serverKeys.delete(data.serverId);
+    if (currentServerId === data.serverId) closeServer();
+    if (currentView === 'servers') renderServerList();
+    showToast({ title: 'Exclu du serveur', body: (srv ? `Tu as été exclu de "${srv.name}"` : "Tu as été exclu d'un serveur") + (data.reason ? ` — ${data.reason}` : '.') });
+  });
+
+  socket.on('server:banned', (data) => {
+    const srv = myServers.get(data.serverId);
+    myServers.delete(data.serverId);
+    serverKeys.delete(data.serverId);
+    if (currentServerId === data.serverId) closeServer();
+    if (currentView === 'servers') renderServerList();
+    showToast({ title: 'Banni du serveur', body: (srv ? `Tu as été banni de "${srv.name}"` : "Tu as été banni d'un serveur") + (data.reason ? ` — ${data.reason}` : '.') });
+  });
+
+  socket.on('server:role_changed', (data) => {
+    const srv = myServers.get(data.serverId);
+    if (!srv) return;
+    normalizeServer(srv);
+    srv.admins = srv.admins.filter(id => id !== data.nullId);
+    if (data.role === 'admin') srv.admins.push(data.nullId);
+    if (currentServerId === data.serverId) renderServerMembersModal();
+    if (data.nullId === myNullId){
+      showToast({ title: data.role === 'admin' ? 'Tu es maintenant admin' : "Rôle d'admin retiré", body: srv.name });
+    }
   });
 
   socket.on('server:error', (data) => {
@@ -3933,6 +4230,7 @@ async function startApp(){
       const onlineCount = srv.members.filter(m => m.online).length;
       document.getElementById('serverMemberStatus').textContent = `${srv.members.length} membre${srv.members.length > 1 ? 's' : ''} · ${onlineCount} en ligne`;
       if (data.online) ensureServerKeysWithOnlineMembers(data.serverId);
+      renderServerMembersModal();
     }
     if (currentView === 'servers') renderServerList();
   });
@@ -3941,12 +4239,24 @@ async function startApp(){
     const srv = myServers.get(data.serverId);
     if (!srv) return;
     srv.members = data.members || [];
+    normalizeServer(srv);
     if (currentServerId === data.serverId){
       const onlineCount = srv.members.filter(m => m.online).length;
       document.getElementById('serverMemberStatus').textContent = `${srv.members.length} membre${srv.members.length > 1 ? 's' : ''} · ${onlineCount} en ligne`;
       ensureServerKeysWithOnlineMembers(data.serverId);
+      renderServerMembersModal();
     }
     if (currentView === 'servers') renderServerList();
+  });
+
+  socket.on('app:user_banned', (data) => {
+    showToast({ title: 'Compte banni', body: (data && data.reason) ? data.reason : "Ton compte a été banni de NullChat par un administrateur." });
+    setTimeout(() => handleLogout(), 1800);
+  });
+
+  socket.on('app:banned_users', (data) => {
+    appBannedUsers = (data && data.users) || [];
+    renderAppOwnerPanel();
   });
 
   socket.on('server:key_exchange', async (data) => {
