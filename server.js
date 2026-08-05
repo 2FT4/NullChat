@@ -41,7 +41,11 @@ const LIMITS = {
   passwordMax: 128,
   messageMax: 4000,
   ciphertextMaxBytes: 20000,
-  mediaCiphertextMaxBytes: 25 * 1024 * 1024, // ~25 Mo
+  // ⚠️ 10 Go tel que demandé. Voir l'avertissement juste en dessous : à cette
+  // taille, ce n'est plus vraiment "une limite de sécurité", c'est surtout
+  // une limite théorique — en pratique, presque aucun client/serveur ne tiendra
+  // le coup avant de l'atteindre (voir notes dans le message livré à l'utilisateur).
+  mediaCiphertextMaxBytes: 10 * 1024 * 1024 * 1024, // 10 Go
   ivBytes: 12,
   publicKeyMaxBytes: 200,
   mimeMax: 100,
@@ -62,6 +66,11 @@ const LIMITS = {
 
 const app = express();
 const server = http.createServer(app);
+// ⚠️ maxHttpBufferSize suit mediaCiphertextMaxBytes (10 Go + marge). Node va
+// tenter d'allouer un buffer de cette taille par message reçu : n'importe qui
+// (même un simple bug client, pas besoin d'être malveillant) peut donc faire
+// exploser la mémoire du process avec un seul envoi. À surveiller de près /
+// à mettre derrière un process manager qui redémarre automatiquement si besoin.
 const io = new Server(server, {
   cors: { origin: CORS_ORIGIN, methods: ['GET', 'POST'] },
   maxHttpBufferSize: LIMITS.mediaCiphertextMaxBytes + 2 * 1024 * 1024
