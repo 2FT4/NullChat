@@ -1683,12 +1683,12 @@ let currentServerId = null;
 // le panneau d'administration globale ("Bannir de l'app"). Ce n'est qu'un affichage côté
 // client : le serveur DOIT revérifier indépendamment ce nullId avant d'agir (voir contrat
 // réseau en tête de fichier, section "Owner de l'application").
-const OWNER_NULLIDS = ['TON-NULLID-ICI'];
+const OWNER_NULLIDS = ['OWNERISPEAK'];
 // Ajoute ici les NULLID d'amis à qui tu veux donner exactement les mêmes droits
 // d'administration globale que toi (bannir/débannir de toute l'app). Ils apparaîtront
 // avec le libellé "Co-Owner" au lieu de "Owner", mais les permissions sont identiques.
 // Ex: const COOWNER_NULLIDS = ['A3F9-72CD', 'B7K2-91XZ'];
-const COOWNER_NULLIDS = [];
+const COOWNER_NULLIDS = ['ISNABDD'];
 function isAppOwner(){ return !!myNullId && (OWNER_NULLIDS.includes(myNullId) || COOWNER_NULLIDS.includes(myNullId)); }
 function appOwnerRoleLabel(){
   if (!myNullId) return '';

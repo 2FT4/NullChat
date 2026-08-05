@@ -251,6 +251,78 @@ function loadStateFromDb() {
 loadStateFromDb();
 
 // ==========================================
+// PERSISTANCE DES SESSIONS (activeTokens) SUR DISQUE
+// ==========================================
+// Avant : activeTokens/usernameToTokens n'existaient qu'en mémoire, donc
+// chaque redémarrage du process (ex: nodemon qui relance le serveur à
+// chaque modification de fichier en dev) déconnectait tout le monde et
+// invalidait tous les tokens ("Ta session a expiré, reconnecte-toi.").
+// Ici on sauvegarde les sessions actives dans un petit fichier JSON local
+// et on les recharge au démarrage, comme pour users/friends/blocked.
+// ⚠️ Ce fichier contient des tokens de session en clair (même niveau de
+// sensibilité que les passwordHash déjà en base) : il doit rester en
+// dehors de PUBLIC_DIR (jamais servi en statique) et hors de tout dépôt
+// git public — à ajouter dans .gitignore si ce n'est pas déjà le cas.
+const DATA_DIR = path.join(__dirname, 'data');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+
+function loadSessionsFromDisk() {
+  try {
+    if (!fs.existsSync(SESSIONS_FILE)) return;
+    const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+    const now = Date.now();
+    let restored = 0;
+    for (const entry of arr) {
+      if (!entry || !entry.token || !entry.username || !entry.nullId) continue;
+      if (!entry.expiresAt || entry.expiresAt <= now) continue; // session déjà expirée, on l'ignore
+      activeTokens.set(entry.token, {
+        username: entry.username,
+        nullId: entry.nullId,
+        expiresAt: entry.expiresAt,
+        createdAt: entry.createdAt || now,
+        userAgent: entry.userAgent || ''
+      });
+      const key = entry.username.toLowerCase();
+      if (!usernameToTokens.has(key)) usernameToTokens.set(key, new Set());
+      usernameToTokens.get(key).add(entry.token);
+      restored++;
+    }
+    log(`Sessions rechargées depuis le disque : ${restored} session(s) active(s).`);
+  } catch (e) {
+    logError('Erreur chargement sessions.json :', e);
+  }
+}
+loadSessionsFromDisk();
+
+// Écriture debounced (regroupée) pour éviter de réécrire le fichier à
+// chaque connexion socket (le renouvellement de session a lieu à chaque
+// connexion) : on attend 500ms sans nouvelle demande avant d'écrire.
+let saveSessionsTimer = null;
+function saveSessionsToDisk() {
+  if (saveSessionsTimer) return;
+  saveSessionsTimer = setTimeout(() => {
+    saveSessionsTimer = null;
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      const arr = [...activeTokens.entries()].map(([token, s]) => ({
+        token,
+        username: s.username,
+        nullId: s.nullId,
+        expiresAt: s.expiresAt,
+        createdAt: s.createdAt,
+        userAgent: s.userAgent
+      }));
+      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(arr), 'utf8');
+    } catch (e) {
+      logError('Erreur sauvegarde sessions.json :', e);
+    }
+  }, 500);
+  saveSessionsTimer.unref();
+}
+
+// ==========================================
 // UTILITAIRES & VALIDATION
 // ==========================================
 function generateNullId() {
@@ -499,6 +571,7 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
     const usernameKey = cleanUsername.toLowerCase();
     if (!usernameToTokens.has(usernameKey)) usernameToTokens.set(usernameKey, new Set());
     usernameToTokens.get(usernameKey).add(token);
+    saveSessionsToDisk();
 
     log('Nouveau compte créé :', cleanUsername, nullId);
     return res.status(201).json({
@@ -561,6 +634,7 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
         .slice(0, tokensForUser.size - MAX_SESSIONS_PER_USER)
         .forEach(({ t }) => revokeToken(t));
     }
+    saveSessionsToDisk();
 
     return res.json({
       success: true,
