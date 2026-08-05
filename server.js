@@ -178,6 +178,31 @@ const inviteCodeToServerId = new Map(); // inviteCode -> serverId
 // modèle que les autres méthodes.
 // nullId -> { nullId, username, reason, bannedAt }
 const appBannedUsers = new Map();
+// ip -> { ip, reason, bannedAt, bannedBy }
+const appBannedIps = new Map();
+// deviceId -> { deviceId, reason, bannedAt, bannedBy }
+const appBannedDevices = new Map();
+
+// Co-owners de l'app : nommés dynamiquement PAR un owner (OWNER_NULLIDS),
+// ont exactement les mêmes droits de modération globale qu'un owner
+// (bannir/débannir par NULLID, IP, appareil), mais ne peuvent PAS nommer ou
+// retirer d'autres co-owners — seul un vrai owner (OWNER_NULLIDS, fixé côté
+// serveur) le peut. Ceci évite qu'un co-owner puisse en cascade s'auto-donner
+// des alliés incontrôlables. En mémoire uniquement (repart à zéro au reboot).
+// nullId -> { nullId, username, addedAt, addedBy }
+const appCoOwners = new Map();
+function isAppCoOwner(candidateNullId) {
+  return !!candidateNullId && appCoOwners.has(candidateNullId);
+}
+function isAppOwnerOrCoOwner(candidateNullId) {
+  return isAppOwner(candidateNullId) || isAppCoOwner(candidateNullId);
+}
+function appRoleOf(candidateNullId) {
+  if (isAppOwner(candidateNullId)) return 'owner';
+  if (isAppCoOwner(candidateNullId)) return 'coowner';
+  return null;
+}
+
 
 // ==========================================
 // HYDRATATION DEPUIS LA BASE SQLITE (au démarrage)
