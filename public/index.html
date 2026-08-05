@@ -592,7 +592,7 @@ input:disabled{ opacity:.5; }
 .request-row:hover{ background: var(--bg-raised); }
 
 /* --- Zone principale --- */
-.main-area{ flex:1; display:flex; flex-direction:column; min-width:0; }
+.main-area{ flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 .chat-header{
   display:flex; align-items:center; justify-content:space-between;
   padding: 14px 20px; border-bottom: 1px solid var(--border-soft);
@@ -630,7 +630,7 @@ input:disabled{ opacity:.5; }
 .dm-call-btn:disabled{ opacity:.3; cursor:not-allowed; }
 .dm-call-btn svg{ width:16px; height:16px; }
 
-#chat, #dmChat, #serverChat{ flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding: 18px 20px; }
+#chat, #dmChat, #serverChat{ flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding: 18px 20px; }
 
 .msg{
   background: var(--bg-panel-2); padding: 9px 14px; border-radius: var(--radius-md);
@@ -1270,7 +1270,7 @@ input:disabled{ opacity:.5; }
           <button class="icon-btn fx-btn" id="genMicBtn" title="Message vocal" onclick="toggleGeneralVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
-          <input type="text" id="msgInput" placeholder="Envoyer un message chiffré..." disabled maxlength="2000">
+          <input type="text" id="msgInput" placeholder="Envoyer un message..." disabled maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendSecretMessage()" id="sendBtn" disabled>Envoyer</button>
         </div>
         <div class="char-count" id="charCount"></div>
@@ -1312,7 +1312,7 @@ input:disabled{ opacity:.5; }
           <button class="icon-btn fx-btn" id="dmMicBtn" title="Message vocal" onclick="toggleVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
-          <input type="text" id="dmInput" placeholder="Message privé chiffré..." maxlength="2000">
+          <input type="text" id="dmInput" placeholder="Message privé..." maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendDM()" id="dmSendBtn">Envoyer</button>
         </div>
       </div>
@@ -1356,7 +1356,7 @@ input:disabled{ opacity:.5; }
           <button class="icon-btn fx-btn" id="serverMicBtn" title="Message vocal" onclick="toggleServerVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
-          <input type="text" id="serverInput" placeholder="Message chiffré au serveur..." maxlength="2000">
+          <input type="text" id="serverInput" placeholder="Message au serveur..." maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendServerMessage()" id="serverSendBtn">Envoyer</button>
         </div>
       </div>
@@ -1440,11 +1440,29 @@ input:disabled{ opacity:.5; }
       <input type="file" id="bannerFileInput" accept="image/*" style="display:none" onchange="handleBannerImageSelected(event)">
       <span class="switch-link" style="margin:0;" onclick="clearBanner()">Retirer</span>
     </div>
-    <div class="name-color-row" id="bannerPresetGrid" style="margin-bottom:18px;"></div>
+    <div class="name-color-row" id="bannerPresetGrid" style="margin-bottom:10px;"></div>
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:18px;">
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">Début
+        <input type="color" id="bannerGradientStart" value="#8b0000" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">Fin
+        <input type="color" id="bannerGradientEnd" value="#ff2d47" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
+      </label>
+      <button class="settings-btn fx-btn" style="margin-top:16px;" onclick="applyBannerCustomGradient()">Appliquer mon dégradé</button>
+    </div>
 
     <div class="label-small" style="margin-top:0;">Fond du profil</div>
     <div class="profile-theme-preview" id="bgPreview" style="height:40px; margin:8px 0 10px 0;"></div>
     <div class="name-color-row" id="bgPresetGrid"></div>
+    <div style="display:flex; gap:8px; align-items:center; margin-top:10px;">
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">Début
+        <input type="color" id="bgGradientStart" value="#8b0000" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">Fin
+        <input type="color" id="bgGradientEnd" value="#ff2d47" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
+      </label>
+      <button class="settings-btn fx-btn" style="margin-top:16px;" onclick="applyProfileBgCustomGradient()">Appliquer mon dégradé</button>
+    </div>
     <div style="margin-top:8px;">
       <span class="switch-link" style="margin:0;" onclick="clearProfileBg()">Réinitialiser le fond</span>
     </div>
@@ -1530,7 +1548,7 @@ input:disabled{ opacity:.5; }
       <span class="switch-link" style="margin-left:auto;" onclick="clearNameColors()">Réinitialiser</span>
     </div>
     <div class="sub" style="font-size:12px; color:var(--text-muted); margin:4px 0 16px 0;">
-      Aucune couleur = couleur par défaut. Une seule = pseudo uni. Plusieurs = dégradé (ou une couleur différente par lettre avec les effets Vague/Glitch). 6 maximum, clique sur une pastille pour la retirer.
+      Aucune couleur = couleur par défaut. Une seule = pseudo uni. Plusieurs = dégradé (ou une couleur différente par lettre avec les effets Vague/Glitch). 16 maximum, clique sur une pastille pour la retirer.
     </div>
 
     <div class="sub" style="font-size:12px; color:var(--text-muted); margin:-8px 0 16px 0;">
@@ -1943,7 +1961,7 @@ function toFancyFont(text, fontKey){
 // rawName = pseudo réel (jamais modifié en base) ; font/effect = clés fixes ci-dessus ;
 // colors = tableau de couleurs hex (#rrggbb) validées, 0 à 6 éléments.
 function styledNameHTML(rawName, font, effect, colors){
-  colors = Array.isArray(colors) ? colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 6) : [];
+  colors = Array.isArray(colors) ? colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 16) : [];
   const fancy = toFancyFont(rawName || '', font || 'none');
   const fx = NAME_EFFECTS[effect] || NAME_EFFECTS.none;
 
@@ -1998,7 +2016,7 @@ function loadNameStylePref(){
       const s = JSON.parse(raw);
       if (s && NAME_FONTS[s.font]) myNameFont = s.font;
       if (s && NAME_EFFECTS[s.effect]) myNameEffect = s.effect;
-      if (s && Array.isArray(s.colors)) myNameColors = s.colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 6);
+      if (s && Array.isArray(s.colors)) myNameColors = s.colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 16);
     }
   }catch(e){}
 }
@@ -2025,7 +2043,7 @@ function addNameColor(){
   const hex = (input?.value || '').toLowerCase();
   if (!/^#[0-9a-f]{6}$/.test(hex)) return;
   if (myNameColors.includes(hex)) return;
-  if (myNameColors.length >= 6){ showToast({ title: 'Limite atteinte', body: '6 couleurs maximum sur un pseudo.' }); return; }
+  if (myNameColors.length >= 16){ showToast({ title: 'Limite atteinte', body: '16 couleurs maximum sur un pseudo.' }); return; }
   myNameColors.push(hex);
   commitNameStyle();
 }
@@ -2082,35 +2100,49 @@ const PROFILE_PRESETS = {
   forest:   { label: 'Forêt',     css: 'linear-gradient(135deg,#134e5e,#71b280)' },
   candy:    { label: 'Bonbon',    css: 'linear-gradient(135deg,#ff9a9e,#fecfef)' },
   midnight: { label: 'Minuit',    css: 'linear-gradient(135deg,#0f2027,#203a43,#2c5364)' },
-  gold:     { label: 'Or',        css: 'linear-gradient(135deg,#f7971e,#ffd200)' }
+  gold:     { label: 'Or',        css: 'linear-gradient(135deg,#f7971e,#ffd200)' },
+  lime:     { label: 'Citron vert', css: 'linear-gradient(135deg,#00b09b,#96c93d)' },
+  flamingo: { label: 'Flamant',   css: 'linear-gradient(135deg,#ee9ca7,#ffdde1)' },
+  cobalt:   { label: 'Cobalt',    css: 'linear-gradient(135deg,#1e3c72,#2a5298)' },
+  peach:    { label: 'Pêche',     css: 'linear-gradient(135deg,#ffb88c,#de6262)' },
+  emerald:  { label: 'Émeraude',  css: 'linear-gradient(135deg,#0ba360,#3cba92)' },
+  royal:    { label: 'Royal',     css: 'linear-gradient(135deg,#141e30,#243b55)' },
+  bubblegum:{ label: 'Chewing-gum', css: 'linear-gradient(135deg,#dd5e89,#f7bb97)' },
+  steel:    { label: 'Acier',     css: 'linear-gradient(135deg,#485563,#29323c)' }
 };
 const MAX_BANNER_SOURCE_BYTES = 8 * 1024 * 1024;
 const BANNER_TARGET_W = 480, BANNER_TARGET_H = 160;
 
-// { type: 'none'|'image'|'preset', value: null|dataUrl|presetKey }
+// { type: 'none'|'image'|'preset'|'gradient', value: null|dataUrl|presetKey|{c1,c2} }
 let myProfileBanner = { type: 'none', value: null };
-// { type: 'none'|'preset', value: null|presetKey }
+// { type: 'none'|'preset'|'gradient', value: null|presetKey|{c1,c2} }
 let myProfileBg = { type: 'none', value: null };
 
+function isValidGradientValue(v){
+  return v && typeof v === 'object' && /^#[0-9a-fA-F]{6}$/.test(v.c1 || '') && /^#[0-9a-fA-F]{6}$/.test(v.c2 || '');
+}
 function loadProfileTheme(){
   try{
     const raw = localStorage.getItem(PROFILE_THEME_KEY);
     if (!raw) return;
     const s = JSON.parse(raw);
-    if (s?.banner && ['none','image','preset'].includes(s.banner.type)) myProfileBanner = s.banner;
-    if (s?.bg && ['none','preset'].includes(s.bg.type)) myProfileBg = s.bg;
+    if (s?.banner && ['none','image','preset','gradient'].includes(s.banner.type) && (s.banner.type !== 'gradient' || isValidGradientValue(s.banner.value))) myProfileBanner = s.banner;
+    if (s?.bg && ['none','preset','gradient'].includes(s.bg.type) && (s.bg.type !== 'gradient' || isValidGradientValue(s.bg.value))) myProfileBg = s.bg;
   }catch(e){}
 }
 function saveProfileTheme(){
   try{ localStorage.setItem(PROFILE_THEME_KEY, JSON.stringify({ banner: myProfileBanner, bg: myProfileBg })); }catch(e){}
 }
+function customGradientCss(value){ return `linear-gradient(135deg,${value.c1},${value.c2})`; }
 function bannerCssValue(){
   if (myProfileBanner.type === 'image') return `url("${myProfileBanner.value}")`;
   if (myProfileBanner.type === 'preset') return PROFILE_PRESETS[myProfileBanner.value]?.css || 'none';
+  if (myProfileBanner.type === 'gradient' && isValidGradientValue(myProfileBanner.value)) return customGradientCss(myProfileBanner.value);
   return 'none';
 }
 function bgCssValue(){
   if (myProfileBg.type === 'preset') return PROFILE_PRESETS[myProfileBg.value]?.css || 'none';
+  if (myProfileBg.type === 'gradient' && isValidGradientValue(myProfileBg.value)) return customGradientCss(myProfileBg.value);
   return null; // null = on retombe sur var(--bg-raised) via la CSS de base
 }
 function applyProfileTheme(){
@@ -2131,6 +2163,20 @@ function setBannerPreset(key){ myProfileBanner = { type:'preset', value:key }; a
 function clearBanner(){ myProfileBanner = { type:'none', value:null }; applyProfileTheme(); }
 function setProfileBgPreset(key){ myProfileBg = { type:'preset', value:key }; applyProfileTheme(); }
 function clearProfileBg(){ myProfileBg = { type:'none', value:null }; applyProfileTheme(); }
+function applyBannerCustomGradient(){
+  const c1 = document.getElementById('bannerGradientStart')?.value;
+  const c2 = document.getElementById('bannerGradientEnd')?.value;
+  if (!c1 || !c2) return;
+  myProfileBanner = { type:'gradient', value:{ c1, c2 } };
+  applyProfileTheme();
+}
+function applyProfileBgCustomGradient(){
+  const c1 = document.getElementById('bgGradientStart')?.value;
+  const c2 = document.getElementById('bgGradientEnd')?.value;
+  if (!c1 || !c2) return;
+  myProfileBg = { type:'gradient', value:{ c1, c2 } };
+  applyProfileTheme();
+}
 
 function resizeBannerToDataUrl(file, targetW, targetH){
   return new Promise((resolve, reject) => {
@@ -2846,7 +2892,7 @@ function openDm(friend){
 
   const input = document.getElementById('dmInput');
   input.disabled = !friend.online;
-  input.placeholder = friend.online ? 'Message privé chiffré...' : 'Cet ami est hors ligne';
+  input.placeholder = friend.online ? 'Message privé...' : 'Cet ami est hors ligne';
 
   loadDmHistory(friend.nullId);
   renderDmHistory(friend.nullId);
@@ -2989,6 +3035,13 @@ function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, f
     textDiv.className = 'text';
     if (isOwn || !animate) textDiv.textContent = text; else revealText(textDiv, text);
     wrapper.appendChild(textDiv);
+  }
+  if (isOwn){
+    const sentMarker = document.createElement('div');
+    sentMarker.className = 'sent-marker';
+    sentMarker.style.cssText = 'font-size:11px;color:var(--text-faint);text-align:right;margin-top:2px;';
+    sentMarker.textContent = 'Envoyée';
+    wrapper.appendChild(sentMarker);
   }
 
   box.appendChild(wrapper);
@@ -3337,6 +3390,13 @@ function appendServerBubble({ author, text, isOwn, timestamp, kind, dataUrl, mim
     textDiv.className = 'text';
     if (isOwn || !animate) textDiv.textContent = text; else revealText(textDiv, text);
     wrapper.appendChild(textDiv);
+  }
+  if (isOwn){
+    const sentMarker = document.createElement('div');
+    sentMarker.className = 'sent-marker';
+    sentMarker.style.cssText = 'font-size:11px;color:var(--text-faint);text-align:right;margin-top:2px;';
+    sentMarker.textContent = 'Envoyée';
+    wrapper.appendChild(sentMarker);
   }
 
   box.appendChild(wrapper);
@@ -4229,7 +4289,7 @@ async function startApp(){
       const input = document.getElementById('dmInput');
       callBtn.disabled = !data.online;
       input.disabled = !data.online;
-      input.placeholder = data.online ? 'Message privé chiffré...' : 'Cet ami est hors ligne';
+      input.placeholder = data.online ? 'Message privé...' : 'Cet ami est hors ligne';
       if (data.online) ensureDmKey(currentDmPeer);
     }
     if (currentView === 'friends') renderFriendList();
