@@ -16,6 +16,19 @@
     }
   }catch(e){}
 })();
+// Applique immédiatement le thème de couleurs choisi par l'utilisateur (fond + accent),
+// avant même le premier rendu, pour éviter un flash avec les couleurs par défaut.
+(function(){
+  try{
+    var raw = localStorage.getItem('nullchat_app_theme_v1');
+    if (raw){
+      var t = JSON.parse(raw);
+      if (t && t.vars){
+        Object.keys(t.vars).forEach(function(k){ document.documentElement.style.setProperty(k, t.vars[k]); });
+      }
+    }
+  }catch(e){}
+})();
 </script>
 <title>NullChat</title>
 <script src="/socket.io/socket.io.js"></script>
@@ -1321,6 +1334,30 @@ input:disabled{ opacity:.5; }
       </button>
     </div>
 
+    <div class="label-small">Apparence de l'application</div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:6px 0 10px 0;">
+      Change les couleurs de fond et d'accent de toute l'app (écran de connexion inclus). Choisis un thème prêt à l'emploi ou personnalise tes propres couleurs.
+    </div>
+    <div class="name-color-row" id="appThemePresetGrid" style="margin-bottom:12px;"></div>
+    <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:center; margin-bottom:6px;">
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">
+        Fond principal
+        <input type="color" id="appThemeBgInput" style="width:44px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;" oninput="setAppThemeCustomColor('bg', this.value)">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">
+        Panneaux
+        <input type="color" id="appThemePanelInput" style="width:44px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;" oninput="setAppThemeCustomColor('panel', this.value)">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-muted);">
+        Accent
+        <input type="color" id="appThemeAccentInput" style="width:44px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;" oninput="setAppThemeCustomColor('accent', this.value)">
+      </label>
+      <span class="switch-link" style="margin-left:auto; align-self:flex-end;" onclick="resetAppTheme()">Réinitialiser</span>
+    </div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:4px 0 18px 0;">
+      Choisir une couleur ci-dessus bascule automatiquement sur le thème "Personnalisé". Ce réglage reste sur cet appareil (il n'est pas envoyé au serveur).
+    </div>
+
     <div class="label-small">Photo de profil</div>
     <div style="display:flex; align-items:center; gap:14px; margin:8px 0 18px 0;">
       <div class="avatar" id="settingsAvatarPreview" style="width:56px;height:56px;font-size:20px;"></div>
@@ -1444,9 +1481,11 @@ let myKeyPair = null;
 let currentView = 'general';
 let currentFriendTab = 'online';
 
-// --- Persistance de session : on ne redemande le mot de passe qu'après 2 mois d'inactivité ---
+// --- Persistance de session : quasi-permanente, on reste connecté d'un lancement à l'autre ---
+// (la session se prolonge automatiquement à chaque ouverture réussie de l'app via renewSession(),
+// donc en pratique le mot de passe n'est redemandé qu'après une déconnexion manuelle ou ~10 ans d'inactivité)
 const SESSION_STORAGE_KEY = 'nullchat_session_v1';
-const SESSION_DURATION_MS = 60 * 24 * 60 * 60 * 1000; // ~2 mois
+const SESSION_DURATION_MS = 3650 * 24 * 60 * 60 * 1000; // ~10 ans
 const NEW_ACCOUNT_FLAG_KEY = 'nullchat_new_account';
 const TUTORIAL_SEEN_KEY = 'nullchat_tutorial_seen';
 const NAME_STYLE_KEY = 'nullchat_name_style_v1';
@@ -1919,6 +1958,147 @@ function renderProfileThemePicker(){
   if (bgPreview) bgPreview.style.backgroundImage = bgCssValue() || 'none';
 }
 loadProfileTheme();
+
+/* =========================================================
+   THÈME DE L'APPLICATION (couleurs du fond + accent, écran
+   d'accueil/connexion inclus) — presets prêts à l'emploi ou
+   couleurs 100% personnalisées. Purement local (jamais envoyé
+   au serveur, contrairement au thème de profil ci-dessus).
+   ========================================================= */
+const APP_THEME_KEY = 'nullchat_app_theme_v1';
+const APP_THEME_PRESETS = {
+  default:  { label: 'Rouge foncé (défaut)', vars: {
+    '--bg-deepest':'#08080a', '--bg-panel':'#131316', '--bg-panel-2':'#1b1b20', '--bg-raised':'#24242b',
+    '--border-soft':'#3d1418', '--accent-1':'#8b0000', '--accent-2':'#ff2d47', '--accent-solid':'#990000',
+    '--accent-grad':'linear-gradient(135deg,#8b0000,#ff2d47)', '--accent-ring':'rgba(255,45,71,0.22)', '--accent-glow':'rgba(255,45,71,0.35)'
+  }},
+  ocean:    { label: 'Océan', vars: {
+    '--bg-deepest':'#05090c', '--bg-panel':'#0e1a20', '--bg-panel-2':'#142530', '--bg-raised':'#1c313f',
+    '--border-soft':'#123240', '--accent-1':'#146a8c', '--accent-2':'#4fd1e8', '--accent-solid':'#1f7fa0',
+    '--accent-grad':'linear-gradient(135deg,#2193b0,#6dd5ed)', '--accent-ring':'rgba(79,209,232,0.22)', '--accent-glow':'rgba(79,209,232,0.35)'
+  }},
+  forest:   { label: 'Forêt', vars: {
+    '--bg-deepest':'#060b08', '--bg-panel':'#0f1a13', '--bg-panel-2':'#16241b', '--bg-raised':'#203024',
+    '--border-soft':'#1c3a26', '--accent-1':'#1e5a3a', '--accent-2':'#58d68d', '--accent-solid':'#237a4f',
+    '--accent-grad':'linear-gradient(135deg,#134e5e,#71b280)', '--accent-ring':'rgba(88,214,141,0.22)', '--accent-glow':'rgba(88,214,141,0.35)'
+  }},
+  purple:   { label: 'Violet', vars: {
+    '--bg-deepest':'#0a071a', '--bg-panel':'#140f24', '--bg-panel-2':'#1c1530', '--bg-raised':'#271d40',
+    '--border-soft':'#3a1a5c', '--accent-1':'#5b0fc7', '--accent-2':'#a06bff', '--accent-solid':'#6d28d9',
+    '--accent-grad':'linear-gradient(135deg,#8e2de2,#4a00e0)', '--accent-ring':'rgba(160,107,255,0.22)', '--accent-glow':'rgba(160,107,255,0.35)'
+  }},
+  midnight: { label: 'Minuit', vars: {
+    '--bg-deepest':'#05070a', '--bg-panel':'#0c141c', '--bg-panel-2':'#121e29', '--bg-raised':'#1a2836',
+    '--border-soft':'#16334a', '--accent-1':'#12475e', '--accent-2':'#4fa6d1', '--accent-solid':'#1c6288',
+    '--accent-grad':'linear-gradient(135deg,#0f2027,#203a43,#2c5364)', '--accent-ring':'rgba(79,166,209,0.22)', '--accent-glow':'rgba(79,166,209,0.35)'
+  }},
+  gold:     { label: 'Or', vars: {
+    '--bg-deepest':'#0a0805', '--bg-panel':'#171106', '--bg-panel-2':'#22190a', '--bg-raised':'#322512',
+    '--border-soft':'#4a3512', '--accent-1':'#a5690a', '--accent-2':'#ffd200', '--accent-solid':'#c98a12',
+    '--accent-grad':'linear-gradient(135deg,#f7971e,#ffd200)', '--accent-ring':'rgba(255,210,0,0.22)', '--accent-glow':'rgba(255,210,0,0.35)'
+  }}
+};
+const APP_THEME_VAR_KEYS = ['--bg-deepest','--bg-panel','--bg-panel-2','--bg-raised','--border-soft','--accent-1','--accent-2','--accent-solid','--accent-grad','--accent-ring','--accent-glow'];
+
+// { mode: 'preset'|'custom', preset: clé, custom: {bg, panel, accent}, vars: {..résolues..} }
+let myAppTheme = { mode: 'preset', preset: 'default', custom: { bg: '#08080a', panel: '#131316', accent: '#ff2d47' }, vars: null };
+
+function clampByte(n){ return Math.max(0, Math.min(255, Math.round(n))); }
+function hexToRgbApp(hex){
+  hex = (hex || '#000000').replace('#','');
+  if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+  const num = parseInt(hex, 16) || 0;
+  return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
+}
+function rgbToHexApp(r, g, b){ return '#' + [r, g, b].map(v => clampByte(v).toString(16).padStart(2, '0')).join(''); }
+function shadeHexApp(hex, percent){
+  const { r, g, b } = hexToRgbApp(hex);
+  if (percent >= 0) return rgbToHexApp(r + (255 - r) * percent / 100, g + (255 - g) * percent / 100, b + (255 - b) * percent / 100);
+  return rgbToHexApp(r * (1 + percent / 100), g * (1 + percent / 100), b * (1 + percent / 100));
+}
+function hexToRgbaApp(hex, alpha){ const { r, g, b } = hexToRgbApp(hex); return `rgba(${r}, ${g}, ${b}, ${alpha})`; }
+
+function buildCustomAppThemeVars(bgMain, bgPanel, accent){
+  const accent1 = shadeHexApp(accent, -25);
+  return {
+    '--bg-deepest': bgMain,
+    '--bg-panel': bgPanel,
+    '--bg-panel-2': shadeHexApp(bgPanel, 12),
+    '--bg-raised': shadeHexApp(bgPanel, 28),
+    '--border-soft': shadeHexApp(accent, -35),
+    '--accent-1': accent1,
+    '--accent-2': accent,
+    '--accent-solid': shadeHexApp(accent, -12),
+    '--accent-grad': `linear-gradient(135deg, ${accent1}, ${accent})`,
+    '--accent-ring': hexToRgbaApp(accent, 0.22),
+    '--accent-glow': hexToRgbaApp(accent, 0.35)
+  };
+}
+
+function loadAppTheme(){
+  try{
+    const raw = localStorage.getItem(APP_THEME_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s && (s.mode === 'preset' || s.mode === 'custom')){
+      myAppTheme = Object.assign({}, myAppTheme, s);
+    }
+  }catch(e){}
+}
+function currentAppThemeVars(){
+  if (myAppTheme.mode === 'custom') return buildCustomAppThemeVars(myAppTheme.custom.bg, myAppTheme.custom.panel, myAppTheme.custom.accent);
+  return (APP_THEME_PRESETS[myAppTheme.preset] || APP_THEME_PRESETS.default).vars;
+}
+function applyAppTheme(){
+  const vars = currentAppThemeVars();
+  APP_THEME_VAR_KEYS.forEach(k => document.documentElement.style.setProperty(k, vars[k]));
+  myAppTheme.vars = vars;
+  try{ localStorage.setItem(APP_THEME_KEY, JSON.stringify(myAppTheme)); }catch(e){}
+  renderAppThemePicker();
+}
+function setAppThemePreset(key){
+  myAppTheme = { mode: 'preset', preset: key, custom: myAppTheme.custom, vars: null };
+  applyAppTheme();
+}
+function switchAppThemeToCustom(){
+  myAppTheme = { mode: 'custom', preset: myAppTheme.preset, custom: myAppTheme.custom, vars: null };
+  applyAppTheme();
+}
+function setAppThemeCustomColor(part, value){
+  myAppTheme = { mode: 'custom', preset: myAppTheme.preset, custom: Object.assign({}, myAppTheme.custom, { [part]: value }), vars: null };
+  applyAppTheme();
+}
+function resetAppTheme(){
+  myAppTheme = { mode: 'preset', preset: 'default', custom: myAppTheme.custom, vars: null };
+  applyAppTheme();
+}
+function renderAppThemePicker(){
+  const grid = document.getElementById('appThemePresetGrid');
+  if (grid){
+    const presetChips = Object.entries(APP_THEME_PRESETS).map(([key, def]) => `
+      <button type="button" class="theme-preset-chip${myAppTheme.mode === 'preset' && myAppTheme.preset === key ? ' active' : ''}" style="background:${def.vars['--accent-grad']}" data-app-preset="${key}" title="${escapeHtml(def.label)}"></button>
+    `).join('');
+    const customChip = `
+      <button type="button" class="theme-preset-chip${myAppTheme.mode === 'custom' ? ' active' : ''}" style="background:linear-gradient(135deg, ${myAppTheme.custom.bg}, ${myAppTheme.custom.accent})" data-app-preset="__custom__" title="Personnalisé"></button>
+    `;
+    grid.innerHTML = presetChips + customChip;
+    grid.querySelectorAll('[data-app-preset]').forEach(el => {
+      el.onclick = () => {
+        const key = el.getAttribute('data-app-preset');
+        if (key === '__custom__') switchAppThemeToCustom();
+        else setAppThemePreset(key);
+      };
+    });
+  }
+  const bgInput = document.getElementById('appThemeBgInput');
+  const panelInput = document.getElementById('appThemePanelInput');
+  const accentInput = document.getElementById('appThemeAccentInput');
+  if (bgInput) bgInput.value = myAppTheme.custom.bg;
+  if (panelInput) panelInput.value = myAppTheme.custom.panel;
+  if (accentInput) accentInput.value = myAppTheme.custom.accent;
+}
+loadAppTheme();
+applyAppTheme();
 
 /* =========================================================
    ANIMATION SIGNATURE : "déchiffrement" visuel du texte
@@ -2938,6 +3118,7 @@ function openSettings(){
   document.getElementById('avatarRemoveRow').style.display = myAvatarDataUrl ? 'block' : 'none';
   renderNameStylePicker();
   renderProfileThemePicker();
+  renderAppThemePicker();
   document.getElementById('settingsOverlay').style.display = 'flex';
   populateAudioDeviceSelects();
   loadActiveSessions();
