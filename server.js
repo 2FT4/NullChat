@@ -62,6 +62,11 @@ if (process.env.TURN_URL) {
 // mettre ces valeurs en dur ici : ce fichier peut être partagé/déployé.
 const EMAIL_USER = process.env.EMAIL_USER || '';
 const EMAIL_PASS = process.env.EMAIL_PASS || '';
+// Adresse affichée comme expéditeur. Doit être soit EMAIL_USER lui-même,
+// soit un alias "Envoyer en tant que" vérifié dans les paramètres du compte
+// Gmail utilisé pour l'authentification — sinon Gmail rejette ou réécrit
+// automatiquement le "From" avec la vraie adresse du compte.
+const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
 
 let mailTransporter = null;
 if (EMAIL_USER && EMAIL_PASS) {
@@ -87,7 +92,7 @@ function generateTwoFactorCode() {
 async function sendTwoFactorEmail(toEmail, code) {
   if (!mailTransporter) throw new Error('Service mail non configuré.');
   const info = await mailTransporter.sendMail({
-    from: `"NullChat" <${EMAIL_USER}>`,
+    from: `"NullChat" <${EMAIL_FROM}>`,
     to: toEmail,
     subject: 'Ton code de vérification NullChat',
     text: `Ton code de vérification NullChat est : ${code}\nIl expire dans 10 minutes.\nSi tu n'es pas à l'origine de cette connexion, ignore cet e-mail.`,
@@ -138,21 +143,21 @@ function loadUserEmailsFromDisk() {
   }
 }
 
-let saveUserEmailsTimer = null;
+// Écriture immédiate et synchrone (pas de debounce) : contrairement à
+// ipAccounts qui peut être réécrit très souvent (beaucoup d'inscriptions
+// rapprochées), userEmails ne change qu'une fois par inscription et doit
+// absolument être persisté avant qu'un redémarrage éventuel ne survienne
+// juste après — un debounce ici a déjà causé des e-mails perdus au reload.
 function saveUserEmailsToDisk() {
-  if (saveUserEmailsTimer) return;
-  saveUserEmailsTimer = setTimeout(() => {
-    saveUserEmailsTimer = null;
-    try {
-      const dir = path.dirname(USER_EMAILS_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const obj = {};
-      for (const [u, email] of userEmails.entries()) obj[u] = email;
-      fs.writeFileSync(USER_EMAILS_FILE, JSON.stringify(obj), 'utf8');
-    } catch (e) {
-      logError('Erreur sauvegarde user_emails.json :', e);
-    }
-  }, 500);
+  try {
+    const dir = path.dirname(USER_EMAILS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const obj = {};
+    for (const [u, email] of userEmails.entries()) obj[u] = email;
+    fs.writeFileSync(USER_EMAILS_FILE, JSON.stringify(obj), 'utf8');
+  } catch (e) {
+    logError('Erreur sauvegarde user_emails.json :', e);
+  }
 }
 
 // ==========================================
@@ -917,6 +922,7 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
     // créés avant l'ajout de cette fonctionnalité (pas d'e-mail enregistré)
     // continuent de se connecter directement, pour ne rien casser.
     const userEmail = userEmails.get(usernameKey);
+    log('Login', usernameKey, '-> e-mail enregistré:', userEmail || '(aucun)', '| mailTransporter configuré:', !!mailTransporter);
     if (userEmail && mailTransporter) {
       const pendingId = generateRandomToken();
       const code = generateTwoFactorCode();
