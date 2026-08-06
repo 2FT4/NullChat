@@ -5442,6 +5442,23 @@ document.addEventListener('pointerdown', (e) => {
    RECONNEXION AUTOMATIQUE (session valable ~2 mois)
    ========================================================= */
 attemptAutoLogin();
+if (document.getElementById('authWrap').style.display !== 'none'){
+  loadAuthCaptcha();
+}
+// Le code de vérification expire après 5 minutes côté serveur (CAPTCHA_TTL_MS).
+// Sans ça, un utilisateur qui prend du temps à remplir le formulaire se
+// retrouve avec un code affiché mais déjà expiré côté serveur, d'où l'erreur
+// "Code de vérification incorrect ou expiré" alors qu'il a bien recopié ce
+// qu'il voit à l'écran. On rafraîchit donc automatiquement le code avant
+// qu'il n'expire, tant que l'écran de connexion est affiché et qu'on n'est
+// pas déjà en train de saisir un code 2FA.
+setInterval(() => {
+  const authVisible = document.getElementById('authWrap').style.display !== 'none';
+  const captchaVisible = document.getElementById('authCaptchaGroup').style.display !== 'none';
+  if (authVisible && captchaVisible && !pending2FAId){
+    loadAuthCaptcha();
+  }
+}, 4 * 60 * 1000);
 
 /* =========================================================
    DÉCOR DE L'ÉCRAN DE CONNEXION (rideau de caractères chiffrés)
