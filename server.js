@@ -35,6 +35,24 @@ function isAppOwner(candidateNullId) {
 if (OWNER_NULLIDS.size === 0) {
   console.warn('⚠️ OWNER_NULLIDS est vide : personne ne peut utiliser la modération globale de l’app.');
 }
+// Co-owners de l'app : même mécanisme que OWNER_NULLIDS (variable d'env,
+// seule source de vérité côté serveur). AVANT ce correctif, le client
+// affichait le panneau/bouton "bannir" à quiconque figurait dans la
+// constante COOWNER_NULLIDS codée en dur dans index.html, mais le serveur
+// ne vérifiait QUE OWNER_NULLIDS pour toutes les actions "app:*" : un
+// co-owner voyait donc le bouton, cliquait, et se prenait "Action non
+// autorisée" (le ban n'avait donc aucun effet) — d'où le bannissement qui
+// "ne marchait pas" pour tout compte qui n'était pas un owner "en dur".
+// ⚠️ Il faut définir la variable d'environnement COOWNER_NULLIDS avec
+// EXACTEMENT les mêmes NULLID que la constante COOWNER_NULLIDS du fichier
+// index.html, sinon le bouton affiché côté client ne correspondra à aucun
+// droit réel côté serveur.
+const COOWNER_NULLIDS = new Set(
+  (process.env.COOWNER_NULLIDS || '')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean)
+);
 // NB : l'ancienne route /api/upload + le dossier /uploads servi en statique
 // ont été retirés. Le client n'appelle jamais /api/upload (les médias
 // transitent uniquement chiffrés via les sockets dm:message/encrypted_message)
@@ -210,7 +228,11 @@ const appBannedDevices = new Map();
 // nullId -> { nullId, username, addedAt, addedBy }
 const appCoOwners = new Map();
 function isAppCoOwner(candidateNullId) {
-  return !!candidateNullId && appCoOwners.has(candidateNullId);
+  if (!candidateNullId) return false;
+  // Union de la liste fixée par variable d'env (COOWNER_NULLIDS) et de la
+  // Map dynamique (réservée à un futur handler "app:add_coowner" côté
+  // owner) — pour l'instant seule COOWNER_NULLIDS est réellement peuplée.
+  return COOWNER_NULLIDS.has(candidateNullId) || appCoOwners.has(candidateNullId);
 }
 function isAppOwnerOrCoOwner(candidateNullId) {
   return isAppOwner(candidateNullId) || isAppCoOwner(candidateNullId);
@@ -219,6 +241,10 @@ function appRoleOf(candidateNullId) {
   if (isAppOwner(candidateNullId)) return 'owner';
   if (isAppCoOwner(candidateNullId)) return 'coowner';
   return null;
+}
+// Libellé humain utilisé dans les messages envoyés au compte banni.
+function appRoleLabel(candidateNullId) {
+  return appRoleOf(candidateNullId) === 'coowner' ? 'Co-Owner' : 'Owner';
 }
 
 
@@ -2251,22 +2277,29 @@ io.on('connection', (socket) => {
   // On ne fait donc jamais confiance qu'au nullId issu du socket authentifié
   // et à OWNER_NULLIDS défini côté serveur (variable d'environnement).
   socket.on('app:ban_user', safeHandler(socket, (data = {}) => {
-    if (!isAppOwner(nullId)) {
+    // Owner ET Co-Owner ont les mêmes droits de modération globale (voir
+    // isAppOwnerOrCoOwner / COOWNER_NULLIDS plus haut) : c'est là qu'était
+    // le bug — cette vérification ne testait auparavant que isAppOwner(),
+    // donc un co-owner voyait le bouton côté client mais n'avait jamais le
+    // droit réel côté serveur, et son clic ne bannissait donc jamais rien.
+    if (!isAppOwnerOrCoOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
-    if (isAppOwner(targetNullId)) {
-      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner de l’app.' });
+    if (isAppOwnerOrCoOwner(targetNullId)) {
+      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner/co-owner de l’app.' });
     }
 
     const targetUsername = nullIdToUser.get(targetNullId) || null;
     const banReason = typeof data.reason === 'string' ? data.reason.slice(0, 300) : null;
+    const bannedByRole = appRoleLabel(nullId); // 'Owner' ou 'Co-Owner', affiché au banni
     appBannedUsers.set(targetNullId, {
       nullId: targetNullId,
       username: targetUsername,
       reason: banReason,
-      bannedAt: Date.now()
+      bannedAt: Date.now(),
+      bannedByRole
     });
     db.addAppBan(targetNullId, targetUsername, banReason);
 
@@ -2277,7 +2310,7 @@ io.on('connection', (socket) => {
       if (info.nullId !== targetNullId) continue;
       const targetSocket = io.sockets.sockets.get(sockId);
       if (!targetSocket) continue;
-      targetSocket.emit('app:user_banned', { reason: data.reason || null });
+      targetSocket.emit('app:user_banned', { reason: data.reason || null, bannedByRole });
       targetSocket.disconnect(true);
     }
     if (targetUsername) {
@@ -2285,22 +2318,22 @@ io.on('connection', (socket) => {
       if (tokens) for (const t of [...tokens]) revokeToken(t);
     }
 
-    log('Compte banni de l’app par', nullId, ':', targetNullId);
+    log('Compte banni de l’app par', appRoleOf(nullId), nullId, ':', targetNullId);
   }));
 
   socket.on('app:unban_user', safeHandler(socket, (data = {}) => {
-    if (!isAppOwner(nullId)) {
+    if (!isAppOwnerOrCoOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
     appBannedUsers.delete(targetNullId);
     db.removeAppBan(targetNullId);
-    log('Compte débanni de l’app par', nullId, ':', targetNullId);
+    log('Compte débanni de l’app par', appRoleOf(nullId), nullId, ':', targetNullId);
   }));
 
   socket.on('app:list_banned', safeHandler(socket, () => {
-    if (!isAppOwner(nullId)) {
+    if (!isAppOwnerOrCoOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     socket.emit('app:banned_users', { users: [...appBannedUsers.values()] });
