@@ -86,7 +86,7 @@ function generateTwoFactorCode() {
 
 async function sendTwoFactorEmail(toEmail, code) {
   if (!mailTransporter) throw new Error('Service mail non configuré.');
-  await mailTransporter.sendMail({
+  const info = await mailTransporter.sendMail({
     from: `"NullChat" <${EMAIL_USER}>`,
     to: toEmail,
     subject: 'Ton code de vérification NullChat',
@@ -98,6 +98,15 @@ async function sendTwoFactorEmail(toEmail, code) {
       <p style="margin:0;color:#999;font-size:13px;">Il expire dans 10 minutes. Si tu n'es pas à l'origine de cette connexion, ignore simplement cet e-mail.</p>
     </div>`
   });
+  // sendMail() peut se résoudre SANS lever d'erreur même si le serveur SMTP
+  // a refusé le destinataire (info.rejected) ou n'a accepté personne
+  // (info.accepted vide) — un piège classique qui fait croire à un envoi
+  // réussi côté app alors que rien n'est jamais parti. On le détecte ici.
+  if (!info.accepted || info.accepted.length === 0 || (info.rejected && info.rejected.length > 0)) {
+    logError('E-mail 2FA refusé par le serveur SMTP :', JSON.stringify(info));
+    throw new Error('E-mail refusé par le serveur SMTP (accepted vide ou rejected non vide).');
+  }
+  log('E-mail 2FA envoyé, messageId =', info.messageId, '| accepted =', info.accepted.join(','));
 }
 
 setInterval(() => {

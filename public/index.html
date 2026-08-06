@@ -2778,8 +2778,8 @@ function enterTwoFactorMode(pendingId, emailHint){
   setAuthError('');
   document.getElementById('authTitle').innerText = 'Vérification';
   document.getElementById('authSubtitle').innerText = emailHint
-    ? `Entre le code envoyé à ${emailHint}`
-    : 'Entre le code reçu par e-mail';
+    ? `Code envoyé à ${emailHint} (pense à vérifier tes spams)`
+    : 'Code envoyé par e-mail (pense à vérifier tes spams)';
   document.getElementById('authUsername').closest('.input-group').style.display = 'none';
   document.getElementById('authPassword').closest('.input-group').style.display = 'none';
   document.getElementById('authEmailGroup').style.display = 'none';
