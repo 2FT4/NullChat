@@ -7,6 +7,14 @@ const path = require('path');
 const crypto = require('crypto');
 const db = require('./db');
 
+// Chargement "souple" : si le paquet n'est pas encore installé (npm install
+// nodemailer twilio), le serveur démarre quand même, il retombe juste en
+// "mode dev" (le code est affiché dans les logs au lieu d'être envoyé).
+let nodemailer = null;
+try { nodemailer = require('nodemailer'); } catch (e) { /* pas installé */ }
+let TwilioLib = null;
+try { TwilioLib = require('twilio'); } catch (e) { /* pas installé */ }
+
 // ==========================================
 // CONFIGURATION
 // ==========================================
@@ -69,11 +77,83 @@ if (process.env.TURN_URL) {
   });
 }
 
+// ==========================================
+// SERVICE D'ENVOI DE CODES (vérification email + téléphone)
+// ==========================================
+// Email : SMTP générique via nodemailer (fonctionne avec Gmail, SendGrid,
+// Mailgun, OVH, Infomaniak, etc. — il suffit de renseigner les identifiants
+// SMTP du fournisseur choisi dans les variables d'environnement).
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
+
+let mailTransporter = null;
+if (nodemailer && SMTP_HOST && SMTP_USER && SMTP_PASS) {
+  mailTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+} else {
+  console.warn('⚠️ SMTP non configuré (SMTP_HOST/SMTP_USER/SMTP_PASS manquants ou nodemailer non installé) : les codes email seront seulement affichés dans les logs serveur (mode dev).');
+}
+
+// SMS : Twilio par défaut (le plus simple à brancher). Pour un autre
+// fournisseur (OVH SMS, Vonage, Brevo...), il suffit de remplacer le corps
+// de sendSmsCode() ci-dessous par l'appel à leur API.
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || '';
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || '';
+
+let twilioClient = null;
+if (TwilioLib && TWILIO_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER) {
+  twilioClient = TwilioLib(TWILIO_SID, TWILIO_AUTH_TOKEN);
+} else {
+  console.warn('⚠️ Twilio non configuré (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER manquants ou twilio non installé) : les codes SMS seront seulement affichés dans les logs serveur (mode dev).');
+}
+
+async function sendEmailCode(email, code) {
+  if (!mailTransporter) {
+    log(`[DEV][EMAIL] Code de vérification pour ${email} : ${code}`);
+    return;
+  }
+  await mailTransporter.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: 'Ton code de vérification NullChat',
+    text: `Ton code de vérification NullChat est : ${code}\nIl expire dans ${Math.round(LIMITS.verifyCodeTtlMs / 60000)} minutes.\nSi tu n'es pas à l'origine de cette demande, ignore ce message.`
+  });
+}
+
+async function sendSmsCode(phone, code) {
+  if (!twilioClient) {
+    log(`[DEV][SMS] Code de vérification pour ${phone} : ${code}`);
+    return;
+  }
+  await twilioClient.messages.create({
+    from: TWILIO_FROM_NUMBER,
+    to: phone,
+    body: `Ton code de vérification NullChat est : ${code}`
+  });
+}
+
 const LIMITS = {
   usernameMin: 3,
   usernameMax: 32,
   passwordMin: 8,
   passwordMax: 128,
+  emailRegex: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+  emailMax: 254,
+  phoneRegex: /^\+[1-9]\d{6,14}$/, // format international E.164, ex: +33612345678
+  verifyCodeLength: 6,
+  verifyCodeTtlMs: 10 * 60 * 1000, // le code envoyé est valable 10 minutes
+  verifyCodeResendCooldownMs: 45 * 1000, // anti-spam entre deux envois du même code
+  verifyCodeMaxAttempts: 5, // au-delà, il faut redemander un nouveau code
+  verifiedContactTtlMs: 20 * 60 * 1000, // temps laissé pour finir l'inscription après vérif
   messageMax: 4000,
   ciphertextMaxBytes: 20000,
   // ⚠️ 10 Go tel que demandé. Voir l'avertissement juste en dessous : à cette
@@ -188,6 +268,21 @@ const connectedSockets = new Map();
 const userSockets = new Map();    
 const dmOfflineQueue = new Map(); 
 
+// email normalisé -> username / téléphone normalisé (E.164) -> username
+const emailToUser = new Map();
+const phoneToUser = new Map();
+// clé "email:x@y.com" ou "phone:+336..." -> { code, expiresAt, attempts, lastSentAt }
+const pendingCodes = new Map();
+// même type de clé -> { expiresAt } : posé une fois le code validé, consommé par /api/register
+const verifiedContacts = new Map();
+
+// Nettoyage périodique des codes/vérifications expirés pour ne pas fuiter en mémoire.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, v] of pendingCodes.entries()) if (v.expiresAt < now) pendingCodes.delete(key);
+  for (const [key, v] of verifiedContacts.entries()) if (v.expiresAt < now) verifiedContacts.delete(key);
+}, 5 * 60 * 1000).unref();
+
 const friends = new Map();          
 const pendingRequests = new Map();  
 const blocked = new Map();          
@@ -262,6 +357,8 @@ function loadStateFromDb() {
       username: u.username,
       passwordHash: u.passwordHash,
       nullId: u.nullId,
+      email: u.email || null,
+      phone: u.phone || null,
       publicKey: u.publicKey,
       avatarDataUrl: u.avatarDataUrl || null,
       // ⚠️ Pas encore persistés en base (db.js n'a pas de colonnes dédiées) :
@@ -277,6 +374,8 @@ function loadStateFromDb() {
       bgValue: null
     });
     nullIdToUser.set(u.nullId, u.username);
+    if (u.email) emailToUser.set(normalizeEmail(u.email), u.username);
+    if (u.phone) phoneToUser.set(normalizePhone(u.phone), u.username);
     if (!friends.has(u.nullId)) friends.set(u.nullId, new Set());
   }
   for (const f of db.loadAllFriends()) {
@@ -462,6 +561,26 @@ function isValidPassword(password) {
   return Buffer.byteLength(password, 'utf8') <= 72;
 }
 
+function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+function normalizePhone(phone) {
+  return typeof phone === 'string' ? phone.trim().replace(/[\s.\-()]/g, '') : '';
+}
+function isValidEmail(email) {
+  return typeof email === 'string' && email.length > 0 && email.length <= LIMITS.emailMax && LIMITS.emailRegex.test(email);
+}
+function isValidPhone(phone) {
+  return typeof phone === 'string' && LIMITS.phoneRegex.test(phone);
+}
+function contactKey(channel, value) {
+  return `${channel}:${value}`;
+}
+function generateOtpCode() {
+  // crypto.randomInt évite le biais modulo et n'est pas prévisible comme Math.random().
+  return String(crypto.randomInt(0, 10 ** LIMITS.verifyCodeLength)).padStart(LIMITS.verifyCodeLength, '0');
+}
+
 function isValidNullId(nullId) {
   return typeof nullId === 'string' && LIMITS.nullIdRegex.test(nullId);
 }
@@ -578,9 +697,93 @@ function requireAuth(req, res, next) {
 // ROUTES HTTP (API AUTH & MEDIAS)
 // ==========================================
 
+// ------------------------------------------------------------------
+// Vérification d'un email ou d'un numéro de téléphone par code à 6
+// chiffres, utilisée avant/pendant l'inscription (voir /api/register).
+// ------------------------------------------------------------------
+app.post('/api/verify/send-code', authRateLimitMiddleware, async (req, res) => {
+  try {
+    const channel = req.body?.channel;
+    let value = req.body?.value;
+    if (channel !== 'email' && channel !== 'phone') {
+      return res.status(400).json({ error: 'Canal invalide (email ou phone).' });
+    }
+
+    if (channel === 'email') {
+      value = normalizeEmail(value);
+      if (!isValidEmail(value)) return res.status(400).json({ error: 'Email invalide.' });
+      if (emailToUser.has(value)) return res.status(409).json({ error: 'Cet email est déjà utilisé par un compte.' });
+    } else {
+      value = normalizePhone(value);
+      if (!isValidPhone(value)) {
+        return res.status(400).json({ error: 'Numéro invalide (format international requis, ex: +33612345678).' });
+      }
+      if (phoneToUser.has(value)) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un compte.' });
+    }
+
+    const key = contactKey(channel, value);
+    const existing = pendingCodes.get(key);
+    if (existing && Date.now() - existing.lastSentAt < LIMITS.verifyCodeResendCooldownMs) {
+      const waitMs = LIMITS.verifyCodeResendCooldownMs - (Date.now() - existing.lastSentAt);
+      return res.status(429).json({ error: `Attends ${Math.ceil(waitMs / 1000)}s avant de redemander un code.` });
+    }
+
+    const code = generateOtpCode();
+    pendingCodes.set(key, {
+      code,
+      expiresAt: Date.now() + LIMITS.verifyCodeTtlMs,
+      attempts: 0,
+      lastSentAt: Date.now()
+    });
+
+    if (channel === 'email') await sendEmailCode(value, code);
+    else await sendSmsCode(value, code);
+
+    return res.json({ success: true, message: 'Code envoyé.' });
+  } catch (err) {
+    logError('Erreur /api/verify/send-code :', err);
+    res.status(500).json({ error: "Erreur serveur lors de l'envoi du code." });
+  }
+});
+
+app.post('/api/verify/confirm-code', authRateLimitMiddleware, (req, res) => {
+  try {
+    const channel = req.body?.channel;
+    let value = req.body?.value;
+    const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+    if (channel !== 'email' && channel !== 'phone') {
+      return res.status(400).json({ error: 'Canal invalide.' });
+    }
+    value = channel === 'email' ? normalizeEmail(value) : normalizePhone(value);
+    const key = contactKey(channel, value);
+    const pending = pendingCodes.get(key);
+
+    if (!pending || pending.expiresAt < Date.now()) {
+      pendingCodes.delete(key);
+      return res.status(400).json({ error: 'Code expiré ou introuvable, redemande un code.' });
+    }
+    if (pending.attempts >= LIMITS.verifyCodeMaxAttempts) {
+      pendingCodes.delete(key);
+      return res.status(429).json({ error: 'Trop de tentatives, redemande un code.' });
+    }
+    pending.attempts++;
+    if (!code || code !== pending.code) {
+      return res.status(400).json({ error: 'Code incorrect.' });
+    }
+
+    pendingCodes.delete(key);
+    verifiedContacts.set(key, { expiresAt: Date.now() + LIMITS.verifiedContactTtlMs });
+
+    return res.json({ success: true, message: 'Vérifié.' });
+  } catch (err) {
+    logError('Erreur /api/verify/confirm-code :', err);
+    res.status(500).json({ error: 'Erreur serveur lors de la vérification.' });
+  }
+});
+
 app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
   try {
-    const { username, password, publicKey, customNullId } = req.body || {};
+    const { username, password, publicKey, customNullId, email: rawEmail, phone: rawPhone } = req.body || {};
     const cleanUsername = typeof username === 'string' ? username.trim() : '';
 
     if (!isValidUsername(cleanUsername)) {
@@ -621,12 +824,44 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
       nullId = generateNullId();
     }
 
+    // Email et/ou téléphone : optionnels dans l'absolu, mais s'ils sont
+    // fournis ils doivent avoir été vérifiés juste avant via
+    // /api/verify/send-code puis /api/verify/confirm-code (on ne fait
+    // jamais confiance à une valeur email/phone non prouvée par un code).
+    let cleanEmail = null;
+    let cleanPhone = null;
+    if (rawEmail) {
+      cleanEmail = normalizeEmail(rawEmail);
+      if (!isValidEmail(cleanEmail)) return res.status(400).json({ error: 'Email invalide.' });
+      if (emailToUser.has(cleanEmail)) return res.status(409).json({ error: 'Cet email est déjà utilisé par un compte.' });
+      const v = verifiedContacts.get(contactKey('email', cleanEmail));
+      if (!v || v.expiresAt < Date.now()) {
+        return res.status(400).json({ error: "Cet email n'a pas été vérifié (ou la vérification a expiré), redemande un code." });
+      }
+    }
+    if (rawPhone) {
+      cleanPhone = normalizePhone(rawPhone);
+      if (!isValidPhone(cleanPhone)) return res.status(400).json({ error: 'Numéro de téléphone invalide.' });
+      if (phoneToUser.has(cleanPhone)) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un compte.' });
+      const v = verifiedContacts.get(contactKey('phone', cleanPhone));
+      if (!v || v.expiresAt < Date.now()) {
+        return res.status(400).json({ error: "Ce numéro n'a pas été vérifié (ou la vérification a expiré), redemande un code." });
+      }
+    }
+    // On exige au moins un des deux (utile plus tard pour la récupération de
+    // compte). Retire ce bloc si tu veux que ça reste 100% facultatif.
+    if (!cleanEmail && !cleanPhone) {
+      return res.status(400).json({ error: 'Ajoute et vérifie un email ou un numéro de téléphone.' });
+    }
+
     const passwordHash = await bcrypt.hash(password, 12);
 
     const newUser = {
       username: cleanUsername,
       passwordHash,
       nullId,
+      email: cleanEmail,
+      phone: cleanPhone,
       publicKey: publicKey || null,
       avatarDataUrl: null,
       nameFont: 'none',
@@ -641,10 +876,20 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
     users.set(cleanUsername.toLowerCase(), newUser);
     nullIdToUser.set(nullId, cleanUsername);
     friends.set(nullId, new Set());
+    if (cleanEmail) {
+      emailToUser.set(cleanEmail, cleanUsername);
+      verifiedContacts.delete(contactKey('email', cleanEmail));
+    }
+    if (cleanPhone) {
+      phoneToUser.set(cleanPhone, cleanUsername);
+      verifiedContacts.delete(contactKey('phone', cleanPhone));
+    }
     db.createUser({
       username: newUser.username,
       passwordHash: newUser.passwordHash,
       nullId: newUser.nullId,
+      email: newUser.email,
+      phone: newUser.phone,
       publicKey: newUser.publicKey,
       avatarDataUrl: newUser.avatarDataUrl
     });

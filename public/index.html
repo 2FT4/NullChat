@@ -1225,6 +1225,30 @@ input:disabled{ opacity:.5; }
       <input type="text" id="authNullId" placeholder="ex: ZIUX ou AB12-9F3D" maxlength="16" style="text-transform:uppercase;">
     </div>
 
+    <div class="input-group" id="authContactGroup" style="display:none;">
+      <label for="authEmail">Email</label>
+      <div style="display:flex; gap:8px;">
+        <input type="email" id="authEmail" placeholder="toi@exemple.com" autocomplete="email" style="flex:1;">
+        <button type="button" class="btn-auth fx-btn" style="width:auto; padding:0 12px; white-space:nowrap;" id="sendEmailCodeBtn" onclick="sendVerifCode('email')">Envoyer code</button>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:6px;">
+        <input type="text" id="authEmailCode" placeholder="Code reçu par email" maxlength="6" inputmode="numeric" style="flex:1;">
+        <button type="button" class="btn-auth fx-btn" style="width:auto; padding:0 12px; white-space:nowrap;" id="confirmEmailCodeBtn" onclick="confirmVerifCode('email')">Valider</button>
+      </div>
+      <div class="error-text" id="emailVerifStatus"></div>
+
+      <label for="authPhone" style="margin-top:12px; display:block;">Téléphone (optionnel si email vérifié)</label>
+      <div style="display:flex; gap:8px;">
+        <input type="tel" id="authPhone" placeholder="+33612345678" autocomplete="tel" style="flex:1;">
+        <button type="button" class="btn-auth fx-btn" style="width:auto; padding:0 12px; white-space:nowrap;" id="sendPhoneCodeBtn" onclick="sendVerifCode('phone')">Envoyer code</button>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:6px;">
+        <input type="text" id="authPhoneCode" placeholder="Code reçu par SMS" maxlength="6" inputmode="numeric" style="flex:1;">
+        <button type="button" class="btn-auth fx-btn" style="width:auto; padding:0 12px; white-space:nowrap;" id="confirmPhoneCodeBtn" onclick="confirmVerifCode('phone')">Valider</button>
+      </div>
+      <div class="error-text" id="phoneVerifStatus"></div>
+    </div>
+
     <div class="error-text" id="authError"></div>
 
     <button class="btn-auth fx-btn" onclick="handleAuth()" id="authBtn">Se connecter</button>
@@ -2688,6 +2712,13 @@ function revealText(el, finalText, duration){
    ========================================================= */
 function setAuthError(msg){ document.getElementById('authError').textContent = msg || ''; }
 
+// Rempli avec la valeur (email ou téléphone normalisé) une fois qu'un code a
+// été validé côté serveur via /api/verify/confirm-code. Remis à null dès que
+// l'utilisateur retouche le champ correspondant, pour éviter d'envoyer au
+// serveur une valeur différente de celle réellement vérifiée.
+let verifiedEmail = null;
+let verifiedPhone = null;
+
 function toggleAuthMode(){
   isLoginMode = !isLoginMode;
   setAuthError('');
@@ -2696,7 +2727,75 @@ function toggleAuthMode(){
   document.getElementById('authBtn').innerText = isLoginMode ? 'Se connecter' : "S'inscrire";
   document.getElementById('toggleLink').innerText = isLoginMode ? "Besoin d'un compte ? S'inscrire" : 'Déjà un compte ? Se connecter';
   document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
+  document.getElementById('authContactGroup').style.display = isLoginMode ? 'none' : 'block';
 }
+
+async function sendVerifCode(channel){
+  const inputId = channel === 'email' ? 'authEmail' : 'authPhone';
+  const statusId = channel === 'email' ? 'emailVerifStatus' : 'phoneVerifStatus';
+  const btnId = channel === 'email' ? 'sendEmailCodeBtn' : 'sendPhoneCodeBtn';
+  const value = document.getElementById(inputId).value.trim();
+  const statusEl = document.getElementById(statusId);
+  const btn = document.getElementById(btnId);
+  statusEl.style.color = '';
+  statusEl.textContent = '';
+  if (channel === 'email') verifiedEmail = null; else verifiedPhone = null;
+
+  if (!value) { statusEl.textContent = 'Renseigne ce champ avant de demander un code.'; return; }
+
+  btn.disabled = true;
+  try{
+    const res = await fetch('/api/verify/send-code', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ channel, value })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok){ statusEl.textContent = data.error || "Erreur lors de l'envoi du code."; return; }
+    statusEl.style.color = '#4ade80';
+    statusEl.textContent = 'Code envoyé, vérifie ' + (channel === 'email' ? 'ta boîte mail (et les spams).' : 'tes SMS.');
+  } catch(e){
+    statusEl.textContent = 'Erreur réseau, réessaie.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function confirmVerifCode(channel){
+  const inputId = channel === 'email' ? 'authEmail' : 'authPhone';
+  const codeId = channel === 'email' ? 'authEmailCode' : 'authPhoneCode';
+  const statusId = channel === 'email' ? 'emailVerifStatus' : 'phoneVerifStatus';
+  const value = document.getElementById(inputId).value.trim();
+  const code = document.getElementById(codeId).value.trim();
+  const statusEl = document.getElementById(statusId);
+  statusEl.style.color = '';
+
+  if (!value){ statusEl.textContent = 'Renseigne ce champ.'; return; }
+  if (!code){ statusEl.textContent = 'Entre le code reçu.'; return; }
+
+  try{
+    const res = await fetch('/api/verify/confirm-code', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ channel, value, code })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok){
+      statusEl.textContent = data.error || 'Code invalide.';
+      if (channel === 'email') verifiedEmail = null; else verifiedPhone = null;
+      return;
+    }
+    statusEl.style.color = '#4ade80';
+    statusEl.textContent = (channel === 'email' ? 'Email' : 'Téléphone') + ' vérifié ✓';
+    if (channel === 'email') verifiedEmail = value; else verifiedPhone = value;
+  } catch(e){
+    statusEl.textContent = 'Erreur réseau, réessaie.';
+  }
+}
+
+// Si l'utilisateur modifie le champ après validation, on invalide la
+// vérification côté client (le serveur la revérifiera de toute façon, mais
+// ça évite d'envoyer une valeur périmée par erreur).
+document.getElementById('authEmail').addEventListener('input', () => { verifiedEmail = null; });
+document.getElementById('authPhone').addEventListener('input', () => { verifiedPhone = null; });
 
 function setAuthLoading(loading){
   const btn = document.getElementById('authBtn');
@@ -2741,19 +2840,27 @@ async function handleAuth(){
         setAuthLoading(false);
         return setAuthError('NULLID invalide (3 à 16 caractères, lettres/chiffres, tiret(s) au milieu autorisé(s)).');
       }
+      if (!verifiedEmail && !verifiedPhone){
+        setAuthLoading(false);
+        return setAuthError('Vérifie au moins un email ou un numéro de téléphone (bouton "Envoyer code" puis "Valider").');
+      }
 
       const res = await fetch('/api/register', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           username, password,
           publicKey: Array.from(new Uint8Array(rawPublicKey)),
-          customNullId: customNullId || undefined
+          customNullId: customNullId || undefined,
+          email: verifiedEmail || undefined,
+          phone: verifiedPhone || undefined
         })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) return setAuthError(data.error || 'Inscription impossible.');
 
       setAuthError('');
+      verifiedEmail = null;
+      verifiedPhone = null;
       try{ localStorage.setItem(NEW_ACCOUNT_FLAG_KEY, username.toLowerCase()); }catch(e){}
       document.getElementById('authUsername').value = username;
       toggleAuthMode();

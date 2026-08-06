@@ -107,9 +107,23 @@ if (!existingCols.has('null_id')) {
 if (!existingCols.has('avatar_data_url')) {
   db.exec(`ALTER TABLE users ADD COLUMN avatar_data_url TEXT`);
 }
+// Ajoutées pour l'inscription par email / téléphone (voir server.js,
+// /api/verify/send-code + /api/register). Nullable : un compte peut n'avoir
+// que l'un des deux, mais jamais aucun des deux (imposé côté serveur).
+if (!existingCols.has('email')) {
+  db.exec(`ALTER TABLE users ADD COLUMN email TEXT`);
+}
+if (!existingCols.has('phone')) {
+  db.exec(`ALTER TABLE users ADD COLUMN phone TEXT`);
+}
 // Index unique sur null_id (posé après coup car SQLite ne permet pas
 // d'ajouter une contrainte UNIQUE via ALTER TABLE directement).
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_null_id ON users(null_id)`);
+// Unique mais partiel : plusieurs lignes peuvent avoir email/phone NULL,
+// seules les valeurs non-NULL doivent être uniques (SQLite gère nativement
+// les index UNIQUE avec plusieurs NULL).
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
 
 // Backfill : toute ligne historique sans null_id (ex. comptes de test
 // laissés par un prototype précédent) reçoit un identifiant généré, pour
@@ -140,16 +154,18 @@ backfillNullIds();
 // du tout (elle n'est pas dans le CREATE TABLE plus haut), donc on l'omet.
 const hasLegacyKeyColumn = new Set(db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name)).has('encrypted_private_key');
 const insertUserSql = hasLegacyKeyColumn
-  ? `INSERT INTO users (username, password_hash, null_id, public_key, avatar_data_url, encrypted_private_key)
-     VALUES (@username, @passwordHash, @nullId, @publicKey, @avatarDataUrl, '')`
-  : `INSERT INTO users (username, password_hash, null_id, public_key, avatar_data_url)
-     VALUES (@username, @passwordHash, @nullId, @publicKey, @avatarDataUrl)`;
+  ? `INSERT INTO users (username, password_hash, null_id, email, phone, public_key, avatar_data_url, encrypted_private_key)
+     VALUES (@username, @passwordHash, @nullId, @email, @phone, @publicKey, @avatarDataUrl, '')`
+  : `INSERT INTO users (username, password_hash, null_id, email, phone, public_key, avatar_data_url)
+     VALUES (@username, @passwordHash, @nullId, @email, @phone, @publicKey, @avatarDataUrl)`;
 
 // ---- Requêtes préparées ----
 const stmts = {
   insertUser: db.prepare(insertUserSql),
   updateAvatar: db.prepare(`UPDATE users SET avatar_data_url = ? WHERE null_id = ?`),
-  allUsers: db.prepare(`SELECT username, password_hash AS passwordHash, null_id AS nullId, public_key AS publicKey, avatar_data_url AS avatarDataUrl FROM users`),
+  updateEmail: db.prepare(`UPDATE users SET email = ? WHERE null_id = ?`),
+  updatePhone: db.prepare(`UPDATE users SET phone = ? WHERE null_id = ?`),
+  allUsers: db.prepare(`SELECT username, password_hash AS passwordHash, null_id AS nullId, email, phone, public_key AS publicKey, avatar_data_url AS avatarDataUrl FROM users`),
   addFriend: db.prepare(`INSERT OR IGNORE INTO friends (user_null_id, friend_null_id) VALUES (?, ?)`),
   removeFriend: db.prepare(`DELETE FROM friends WHERE user_null_id = ? AND friend_null_id = ?`),
   allFriends: db.prepare(`SELECT user_null_id AS userNullId, friend_null_id AS friendNullId FROM friends`),
@@ -188,11 +204,13 @@ const stmts = {
 module.exports = {
   raw: db,
 
-  createUser({ username, passwordHash, nullId, publicKey, avatarDataUrl }) {
+  createUser({ username, passwordHash, nullId, email, phone, publicKey, avatarDataUrl }) {
     stmts.insertUser.run({
       username,
       passwordHash,
       nullId,
+      email: email || null,
+      phone: phone || null,
       publicKey: publicKey ? JSON.stringify(publicKey) : null,
       avatarDataUrl: avatarDataUrl || null
     });
@@ -200,6 +218,14 @@ module.exports = {
 
   updateAvatar(nullId, avatarDataUrl) {
     stmts.updateAvatar.run(avatarDataUrl || null, nullId);
+  },
+
+  updateEmail(nullId, email) {
+    stmts.updateEmail.run(email || null, nullId);
+  },
+
+  updatePhone(nullId, phone) {
+    stmts.updatePhone.run(phone || null, nullId);
   },
 
   loadAllUsers() {
