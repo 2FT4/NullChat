@@ -2778,27 +2778,18 @@ async function handleAuth(){
         setAuthLoading(false);
         return setAuthError('NULLID invalide (3 à 16 caractères, lettres/chiffres, tiret(s) au milieu autorisé(s)).');
       }
-      if (!verifiedEmail && !verifiedPhone){
-        setAuthLoading(false);
-        return setAuthError('Vérifie au moins un email ou un numéro de téléphone (bouton "Envoyer code" puis "Valider").');
-      }
-
       const res = await fetch('/api/register', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           username, password,
           publicKey: Array.from(new Uint8Array(rawPublicKey)),
-          customNullId: customNullId || undefined,
-          email: verifiedEmail || undefined,
-          phone: verifiedPhone || undefined
+          customNullId: customNullId || undefined
         })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) return setAuthError(data.error || 'Inscription impossible.');
 
       setAuthError('');
-      verifiedEmail = null;
-      verifiedPhone = null;
       try{ localStorage.setItem(NEW_ACCOUNT_FLAG_KEY, username.toLowerCase()); }catch(e){}
       document.getElementById('authUsername').value = username;
       toggleAuthMode();
@@ -3927,11 +3918,12 @@ function renderServerHistory(serverId){
   box.scrollTop = box.scrollHeight;
 }
 
-function appendServerBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, filename }, animate){
+function appendServerBubble(entry, animate){
+  const { author, text, isOwn, timestamp, kind, dataUrl, filename } = entry;
   if (animate === undefined) animate = true;
   const box = document.getElementById('serverChat');
   const wrapper = document.createElement('div');
-  wrapper.className = 'msg' + (isOwn ? ' own' : '');
+  wrapper.className = 'msg' + (isOwn ? ' own' : '') + (entry.deleted ? ' deleted' : '');
   const top = document.createElement('div');
   top.className = 'msg-top';
   const authorSpan = document.createElement('span');
@@ -3944,12 +3936,18 @@ function appendServerBubble({ author, text, isOwn, timestamp, kind, dataUrl, mim
   top.appendChild(authorSpan);
   top.appendChild(timeSpan);
   wrapper.appendChild(top);
+  prependReplyQuote(wrapper, entry);
 
-  if (kind === 'image' && isSafeAttachmentDataUrl(dataUrl, 'image')){
+  if (entry.deleted){
+    const textDiv = document.createElement('div');
+    textDiv.className = 'text';
+    textDiv.textContent = 'Message supprimé';
+    wrapper.appendChild(textDiv);
+  } else if (kind === 'image' && isSafeAttachmentDataUrl(dataUrl, 'image')){
     const img = document.createElement('img');
     img.src = dataUrl; img.alt = filename || 'image';
     img.style.cssText = 'max-width:280px;max-height:280px;border-radius:10px;display:block;margin-top:4px;cursor:pointer;';
-    img.onclick = () => window.open(dataUrl, '_blank');
+    img.onclick = (e) => { e.stopPropagation(); window.open(dataUrl, '_blank'); };
     wrapper.appendChild(img);
   } else if (kind === 'video' && isSafeAttachmentDataUrl(dataUrl, 'video')){
     const vid = document.createElement('video');
@@ -3972,13 +3970,20 @@ function appendServerBubble({ author, text, isOwn, timestamp, kind, dataUrl, mim
     if (isOwn || !animate) textDiv.textContent = text; else revealText(textDiv, text);
     wrapper.appendChild(textDiv);
   }
-  if (isOwn){
+  if (isOwn && !entry.deleted){
     const sentMarker = document.createElement('div');
     sentMarker.className = 'sent-marker';
     sentMarker.style.cssText = 'font-size:11px;color:var(--text-faint);text-align:right;margin-top:2px;';
     sentMarker.textContent = 'Envoyée';
     wrapper.appendChild(sentMarker);
   }
+  const rrow = document.createElement('div');
+  rrow.className = 'reactions-row';
+  wrapper.appendChild(rrow);
+
+  const ctx = { serverId: currentServerId, channelId: currentChannelByServer.get(currentServerId) || null };
+  renderReactionsInto(rrow, entry, 'server', ctx);
+  attachMessageInteractions(wrapper, entry, 'server', ctx);
 
   box.appendChild(wrapper);
   while (box.children.length > MAX_RENDERED_MESSAGES) box.removeChild(box.firstChild);
@@ -4015,7 +4020,8 @@ async function sendServerPayload(payload){
   const keys = serverKeys.get(currentServerId);
 
   const kind = payload.kind || 'text';
-  const rawString = kind === 'text' ? payload.text : payload.dataUrl;
+  const replyTo = (kind === 'text' && pendingReplyTo && pendingReplyTo.scope === 'server') ? pendingReplyTo : null;
+  const rawString = kind === 'text' ? packTextEnvelope(payload.text, replyTo) : payload.dataUrl;
   const encoded = new TextEncoder().encode(rawString);
   const targets = [];
   for (const [socketId, entry] of keys.entries()){
@@ -4025,19 +4031,25 @@ async function sendServerPayload(payload){
   }
 
   const timestamp = Date.now();
+  const messageId = genMessageId();
   socket.emit('server:message', {
-    serverId: currentServerId, targets, kind,
+    serverId: currentServerId, targets, kind, messageId,
+    channelId: currentChannelByServer.get(currentServerId) || null,
     mime: payload.mime || null, filename: payload.filename || null, timestamp
   });
 
   const entry = {
+    id: messageId,
     author: currentUser, isOwn:true, timestamp, kind,
     text: kind === 'text' ? payload.text : undefined,
     dataUrl: kind !== 'text' ? payload.dataUrl : undefined,
-    mime: payload.mime, filename: payload.filename
+    mime: payload.mime, filename: payload.filename,
+    replyTo: replyTo ? { author: replyTo.author, preview: replyTo.preview } : null,
+    reactions: {}
   };
   pushServerToHistory(currentServerId, entry);
   appendServerBubble(entry);
+  if (replyTo){ pendingReplyTo = null; renderReplyContextBar(); }
 
   if (targets.length === 0){
     addSystemServerMessage("Personne d'autre n'est en ligne dans ce serveur pour le moment : ce message ne restera visible que par toi.");
