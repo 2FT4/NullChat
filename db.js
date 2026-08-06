@@ -47,6 +47,52 @@ db.exec(`
     to_null_id TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
+
+  -- "chat_groups" stocke à la fois les serveurs (type='server', avec code
+  -- d'invitation + salons + admins) et les groupes (type='group', chat à
+  -- plusieurs sans code d'invitation, membres ajoutés directement).
+  CREATE TABLE IF NOT EXISTS chat_groups (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    invite_code TEXT UNIQUE,
+    owner_null_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS chat_group_members (
+    group_id TEXT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,
+    null_id TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
+    joined_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, null_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS chat_group_bans (
+    group_id TEXT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,
+    null_id TEXT NOT NULL,
+    reason TEXT,
+    banned_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, null_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS chat_channels (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'text',
+    position INTEGER NOT NULL DEFAULT 0
+  );
+
+  -- Bannissements globaux de l'app (owner/co-owner). Auparavant en mémoire
+  -- uniquement : disparaissaient au moindre redémarrage, comme les bans de
+  -- serveur avant ce correctif.
+  CREATE TABLE IF NOT EXISTS app_bans (
+    null_id TEXT PRIMARY KEY,
+    username TEXT,
+    reason TEXT,
+    banned_at INTEGER NOT NULL
+  );
 `);
 
 // Migration douce : la table `users` fournie n'a pas forcément les colonnes
@@ -113,6 +159,30 @@ const stmts = {
   addPendingRequest: db.prepare(`INSERT INTO pending_requests (id, from_null_id, to_null_id, created_at) VALUES (?, ?, ?, ?)`),
   removePendingRequest: db.prepare(`DELETE FROM pending_requests WHERE id = ?`),
   allPendingRequests: db.prepare(`SELECT id, from_null_id AS fromNullId, to_null_id AS toNullId, created_at AS createdAt FROM pending_requests`),
+
+  insertGroup: db.prepare(`INSERT INTO chat_groups (id, type, name, invite_code, owner_null_id, created_at) VALUES (@id, @type, @name, @inviteCode, @ownerNullId, @createdAt)`),
+  deleteGroup: db.prepare(`DELETE FROM chat_groups WHERE id = ?`),
+  renameGroup: db.prepare(`UPDATE chat_groups SET name = ? WHERE id = ?`),
+  transferGroupOwner: db.prepare(`UPDATE chat_groups SET owner_null_id = ? WHERE id = ?`),
+  allGroups: db.prepare(`SELECT id, type, name, invite_code AS inviteCode, owner_null_id AS ownerNullId, created_at AS createdAt FROM chat_groups`),
+
+  addGroupMember: db.prepare(`INSERT OR REPLACE INTO chat_group_members (group_id, null_id, role, joined_at) VALUES (?, ?, ?, ?)`),
+  removeGroupMember: db.prepare(`DELETE FROM chat_group_members WHERE group_id = ? AND null_id = ?`),
+  setGroupMemberRole: db.prepare(`UPDATE chat_group_members SET role = ? WHERE group_id = ? AND null_id = ?`),
+  allGroupMembers: db.prepare(`SELECT group_id AS groupId, null_id AS nullId, role FROM chat_group_members`),
+
+  addGroupBan: db.prepare(`INSERT OR REPLACE INTO chat_group_bans (group_id, null_id, reason, banned_at) VALUES (?, ?, ?, ?)`),
+  removeGroupBan: db.prepare(`DELETE FROM chat_group_bans WHERE group_id = ? AND null_id = ?`),
+  allGroupBans: db.prepare(`SELECT group_id AS groupId, null_id AS nullId, reason, banned_at AS bannedAt FROM chat_group_bans`),
+
+  insertChannel: db.prepare(`INSERT INTO chat_channels (id, group_id, name, type, position) VALUES (@id, @groupId, @name, @type, @position)`),
+  deleteChannel: db.prepare(`DELETE FROM chat_channels WHERE id = ?`),
+  renameChannel: db.prepare(`UPDATE chat_channels SET name = ? WHERE id = ?`),
+  allChannels: db.prepare(`SELECT id, group_id AS groupId, name, type, position FROM chat_channels ORDER BY position ASC`),
+
+  addAppBan: db.prepare(`INSERT OR REPLACE INTO app_bans (null_id, username, reason, banned_at) VALUES (?, ?, ?, ?)`),
+  removeAppBan: db.prepare(`DELETE FROM app_bans WHERE null_id = ?`),
+  allAppBans: db.prepare(`SELECT null_id AS nullId, username, reason, banned_at AS bannedAt FROM app_bans`),
 };
 
 module.exports = {
@@ -182,5 +252,68 @@ module.exports = {
 
   loadAllPendingRequests() {
     return stmts.allPendingRequests.all();
+  },
+
+  // ---- Serveurs & groupes (chat_groups sert les deux : type 'server'|'group') ----
+  createGroup({ id, type, name, inviteCode, ownerNullId, createdAt }) {
+    stmts.insertGroup.run({ id, type, name, inviteCode: inviteCode || null, ownerNullId, createdAt });
+  },
+  deleteGroup(id) {
+    stmts.deleteGroup.run(id);
+  },
+  renameGroup(id, name) {
+    stmts.renameGroup.run(name, id);
+  },
+  transferGroupOwner(id, newOwnerNullId) {
+    stmts.transferGroupOwner.run(newOwnerNullId, id);
+  },
+  loadAllGroups() {
+    return stmts.allGroups.all();
+  },
+
+  addGroupMember(groupId, nullId, role, joinedAt) {
+    stmts.addGroupMember.run(groupId, nullId, role || 'member', joinedAt || Date.now());
+  },
+  removeGroupMember(groupId, nullId) {
+    stmts.removeGroupMember.run(groupId, nullId);
+  },
+  setGroupMemberRole(groupId, nullId, role) {
+    stmts.setGroupMemberRole.run(role, groupId, nullId);
+  },
+  loadAllGroupMembers() {
+    return stmts.allGroupMembers.all();
+  },
+
+  addGroupBan(groupId, nullId, reason) {
+    stmts.addGroupBan.run(groupId, nullId, reason || null, Date.now());
+  },
+  removeGroupBan(groupId, nullId) {
+    stmts.removeGroupBan.run(groupId, nullId);
+  },
+  loadAllGroupBans() {
+    return stmts.allGroupBans.all();
+  },
+
+  createChannel({ id, groupId, name, type, position }) {
+    stmts.insertChannel.run({ id, groupId, name, type: type || 'text', position: position || 0 });
+  },
+  deleteChannel(id) {
+    stmts.deleteChannel.run(id);
+  },
+  renameChannel(id, name) {
+    stmts.renameChannel.run(name, id);
+  },
+  loadAllChannels() {
+    return stmts.allChannels.all();
+  },
+
+  addAppBan(nullId, username, reason) {
+    stmts.addAppBan.run(nullId, username || null, reason || null, Date.now());
+  },
+  removeAppBan(nullId) {
+    stmts.removeAppBan.run(nullId);
+  },
+  loadAllAppBans() {
+    return stmts.allAppBans.all();
   }
 };

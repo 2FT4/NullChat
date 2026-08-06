@@ -652,6 +652,76 @@ input:disabled{ opacity:.5; }
 
 .chat-input-box{ display:flex; gap:10px; padding: 14px 20px 18px 20px; }
 .chat-input-box input{ flex:1; }
+
+/* --- Salons (channels) dans un serveur --- */
+.channel-bar{
+  display:flex; align-items:center; gap:6px; padding: 8px 14px; overflow-x:auto;
+  border-bottom: 1px solid var(--border-soft); flex-shrink:0;
+}
+.channel-chip{
+  display:flex; align-items:center; gap:5px; padding: 6px 12px; border-radius: 999px;
+  background: var(--bg-panel-2); color: var(--text-muted); font-size:12.5px; font-weight:600;
+  cursor:pointer; white-space:nowrap; border:1px solid transparent; flex-shrink:0; user-select:none;
+}
+.channel-chip:hover{ background: var(--bg-raised); color: var(--text-primary); }
+.channel-chip.active{ background: var(--accent-ring); color: var(--text-primary); border-color: rgba(255,45,71,0.25); }
+.channel-chip.voice{ opacity:.85; }
+.channel-add-chip{
+  display:flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%;
+  background: var(--bg-panel-2); color: var(--text-muted); cursor:pointer; flex-shrink:0; font-size:15px; font-weight:700;
+}
+.channel-add-chip:hover{ background: var(--accent-1); color:white; }
+
+/* --- Réponse / citation --- */
+.reply-context-bar{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding: 8px 20px; background: var(--bg-panel-2); border-top:1px solid var(--border-soft);
+  font-size:12.5px; color: var(--text-muted);
+}
+.reply-context-bar .reply-ctx-text{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.reply-context-bar .reply-ctx-cancel{
+  background:none; border:none; color: var(--text-faint); cursor:pointer; font-size:16px; flex-shrink:0; line-height:1;
+}
+.reply-quote{
+  border-left: 3px solid var(--accent-2); padding: 3px 8px; margin-bottom:4px; border-radius: 4px;
+  background: rgba(255,255,255,0.04); font-size:12px; color: var(--text-muted); cursor:pointer;
+}
+.reply-quote .rq-author{ font-weight:700; color: var(--text-muted); }
+.msg.deleted .text{ color: var(--text-faint); font-style:italic; }
+
+/* --- Réactions --- */
+.reactions-row{ display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
+.reaction-pill{
+  display:flex; align-items:center; gap:4px; padding: 2px 8px; border-radius: 999px;
+  background: var(--bg-raised); border:1px solid transparent; font-size:12px; cursor:pointer;
+  color: var(--text-muted);
+}
+.reaction-pill:hover{ filter:brightness(1.15); }
+.reaction-pill.mine{ border-color: var(--accent-2); color: var(--text-primary); background: var(--accent-ring); }
+
+/* --- Menu contextuel message (réagir / répondre / transférer / supprimer) --- */
+.msg-actions-menu{
+  position:fixed; z-index:500; background: var(--bg-panel); border:1px solid var(--border-soft);
+  border-radius: var(--radius-md); box-shadow: 0 10px 30px rgba(0,0,0,.4); padding:6px; min-width:190px;
+}
+.emoji-quickbar{ display:flex; gap:2px; padding: 4px 4px 8px 4px; border-bottom:1px solid var(--border-soft); margin-bottom:4px; }
+.emoji-quickbar button{
+  background:none; border:none; font-size:19px; cursor:pointer; padding:4px; border-radius:6px; line-height:1;
+}
+.emoji-quickbar button:hover{ background: var(--bg-raised); }
+.msg-action-item{
+  display:block; width:100%; text-align:left; background:none; border:none; color: var(--text-primary);
+  font-size:13px; padding:8px 8px; border-radius:6px; cursor:pointer;
+}
+.msg-action-item:hover{ background: var(--bg-raised); }
+.msg-action-item.danger{ color: var(--danger); }
+
+/* --- Sélecteur d'amis (création de groupe) / cible de transfert --- */
+.friend-picker-row, .forward-target-row{
+  display:flex; align-items:center; gap:10px; padding: 8px; border-radius: var(--radius-md); cursor:pointer;
+}
+.friend-picker-row:hover, .forward-target-row:hover{ background: var(--bg-raised); }
+.friend-picker-row input[type="checkbox"]{ width:16px; height:16px; flex-shrink:0; }
 .btn-send{
   background: var(--accent-grad); color:#10111a; border:none; padding: 0 22px;
   border-radius: var(--radius-sm); cursor:pointer; font-weight:700; font-size:14px;
@@ -1187,6 +1257,10 @@ input:disabled{ opacity:.5; }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
       </div>
 
+      <div class="rail-btn fx-btn" id="navGroups" onclick="switchView('groups')" title="Groupes">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/><circle cx="18" cy="16" r="1.4" fill="currentColor" stroke="none"/></svg>
+      </div>
+
       <div class="rail-btn fx-btn tuto-help-btn" id="navHelp" onclick="openTutorial()" title="Comment ça marche ?">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>
       </div>
@@ -1253,6 +1327,22 @@ input:disabled{ opacity:.5; }
       <div class="list-scroll" id="serverListScroll"></div>
     </div>
 
+    <!-- Panneau latéral : Groupes -->
+    <div class="side-panel" id="groupsPanel" style="display:none;">
+      <div class="side-header">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+          <button class="back-btn fx-btn side-back-btn" onclick="switchView('general')" title="Retour">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          </button>
+          <h3 style="margin:0;">Groupes</h3>
+        </div>
+        <div class="hint-text" style="margin:0;">Un groupe rassemble 2 à 30 amis pour discuter à plusieurs, sans code d'invitation.</div>
+        <button class="btn-mini fx-btn" style="margin-top:10px; width:100%;" onclick="openCreateGroupModal()">+ Créer un groupe</button>
+        <div class="side-error" id="groupError"></div>
+      </div>
+      <div class="list-scroll" id="groupListScroll"></div>
+    </div>
+
     <!-- Zone principale -->
     <div class="main-area">
       <!-- Vue Salon général -->
@@ -1304,6 +1394,7 @@ input:disabled{ opacity:.5; }
           </button>
         </div>
         <div id="dmChat"></div>
+        <div class="reply-context-bar" id="dmReplyBar" style="display:none;"></div>
         <div class="chat-input-box">
           <button class="icon-btn fx-btn" id="dmAttachBtn" title="Envoyer une photo ou vidéo" onclick="document.getElementById('dmFileInput').click()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
@@ -1322,6 +1413,13 @@ input:disabled{ opacity:.5; }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
         <div class="lead">Tes serveurs</div>
         <div class="sub">Crée un serveur ou rejoins-en un avec un code d'invitation pour discuter chiffré à plusieurs, comme sur Discord. Clique sur un serveur dans la liste pour l'ouvrir.</div>
+      </div>
+
+      <!-- Vue Groupes (placeholder central) -->
+      <div class="friends-hero" id="viewGroupsHero" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <div class="lead">Tes groupes</div>
+        <div class="sub">Un groupe réunit entre 2 et 30 amis pour discuter à plusieurs, chiffré de bout en bout, sans code d'invitation à partager. Clique sur "+ Créer un groupe" pour commencer.</div>
       </div>
 
       <!-- Vue Conversation de serveur -->
@@ -1347,7 +1445,9 @@ input:disabled{ opacity:.5; }
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>
           </button>
         </div>
+        <div class="channel-bar" id="serverChannelBar"></div>
         <div id="serverChat"></div>
+        <div class="reply-context-bar" id="serverReplyBar" style="display:none;"></div>
         <div class="chat-input-box">
           <button class="icon-btn fx-btn" id="serverAttachBtn" title="Envoyer une photo ou vidéo" onclick="document.getElementById('serverFileInput').click()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
@@ -1358,6 +1458,34 @@ input:disabled{ opacity:.5; }
           </button>
           <input type="text" id="serverInput" placeholder="Message au serveur..." maxlength="2000">
           <button class="btn-send fx-btn" onclick="sendServerMessage()" id="serverSendBtn">Envoyer</button>
+        </div>
+      </div>
+
+      <!-- Vue Conversation de groupe -->
+      <div class="main-area" id="viewGroupChat" style="display:none;">
+        <div class="chat-header">
+          <button class="back-btn fx-btn" onclick="closeGroup()" title="Retour">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+          </button>
+          <span class="title" style="flex-direction:column; align-items:flex-start; line-height:1.2;">
+            <span style="display:flex; align-items:center; gap:8px;">
+              <span class="avatar" id="groupAvatar" style="width:26px;height:26px;font-size:11px;"></span>
+              <span id="groupPeerName">—</span>
+            </span>
+            <span id="groupMemberStatus" style="font-size:11px; color:var(--text-faint); font-weight:400;"></span>
+          </span>
+          <button class="dm-call-btn fx-btn" id="groupMembersBtn" title="Membres" onclick="openGroupMembersModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </button>
+          <button class="dm-call-btn fx-btn" id="groupLeaveBtn" title="Quitter le groupe" onclick="currentGroupId && leaveGroupAction(currentGroupId)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>
+          </button>
+        </div>
+        <div id="groupChat"></div>
+        <div class="reply-context-bar" id="groupReplyBar" style="display:none;"></div>
+        <div class="chat-input-box">
+          <input type="text" id="groupInput" placeholder="Message au groupe..." maxlength="2000">
+          <button class="btn-send fx-btn" onclick="sendGroupMessage()" id="groupSendBtn">Envoyer</button>
         </div>
       </div>
     </div>
@@ -1604,7 +1732,70 @@ input:disabled{ opacity:.5; }
       Le propriétaire du serveur peut nommer des admins. Les admins peuvent exclure ou bannir des membres (mais pas le propriétaire, ni un autre admin).
     </div>
     <div id="serverMembersList"></div>
+    <div id="serverBannedSection" style="display:none; margin-top:16px; padding-top:14px; border-top:1px solid var(--border-soft);">
+      <div class="label-small" style="color:var(--danger);">Membres bannis</div>
+      <div id="serverBannedList" style="margin-top:8px;"></div>
+    </div>
   </div>
+</div>
+
+<!-- Modale Membres du groupe -->
+<div class="settings-overlay" id="groupMembersOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
+  <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(440px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+      <div style="font-family:var(--font-display); font-weight:700; font-size:18px;" id="groupMembersTitle">Membres</div>
+      <button class="icon-btn fx-btn" onclick="closeGroupMembersModal()" title="Fermer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:0 0 14px 0;">
+      Seul le créateur du groupe peut ajouter ou retirer des membres (uniquement parmi tes amis).
+    </div>
+    <div id="groupMembersAddRow" class="add-friend-row" style="display:none; margin-bottom:12px;"></div>
+    <div id="groupMembersList"></div>
+  </div>
+</div>
+
+<!-- Modale Création de groupe (nom + sélection d'amis) -->
+<div class="settings-overlay" id="createGroupOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
+  <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(440px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+      <div style="font-family:var(--font-display); font-weight:700; font-size:18px;">Créer un groupe</div>
+      <button class="icon-btn fx-btn" onclick="closeCreateGroupModal()" title="Fermer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="input-group">
+      <label for="newGroupNameInput">Nom du groupe</label>
+      <input type="text" id="newGroupNameInput" placeholder="Ex : Vacances 2026" maxlength="40">
+    </div>
+    <div class="label-small" style="margin-top:12px;">Amis à ajouter (2 à 30 membres au total, toi inclus)</div>
+    <div id="groupFriendPicker" style="max-height:260px; overflow-y:auto; margin-top:8px; border:1px solid var(--border-soft); border-radius:var(--radius-md); padding:4px;"></div>
+    <div class="side-error" id="createGroupError" style="margin-top:8px;"></div>
+    <button class="btn-mini fx-btn" style="width:100%; margin-top:14px; height:36px;" onclick="submitCreateGroup()">Créer le groupe</button>
+  </div>
+</div>
+
+<!-- Modale Transférer un message -->
+<div class="settings-overlay" id="forwardMessageOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:210; align-items:center; justify-content:center;">
+  <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(400px, 92vw); max-height:80vh; overflow-y:auto; padding:20px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+      <div style="font-family:var(--font-display); font-weight:700; font-size:16px;">Transférer</div>
+      <button class="icon-btn fx-btn" onclick="closeForwardModal()" title="Fermer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:0 0 10px 0;">Choisis une conversation : le message sera pré-rempli, il ne te reste qu'à confirmer l'envoi.</div>
+    <div id="forwardTargetList"></div>
+  </div>
+</div>
+
+<!-- Menu contextuel flottant sur un message (réagir / répondre / transférer / supprimer) -->
+<div class="msg-actions-menu" id="msgActionMenu" style="display:none;">
+  <div class="emoji-quickbar" id="msgActionEmojis"></div>
+  <button class="msg-action-item" id="msgActionReply" onclick="msgActionMenuReply()">↩️ Répondre</button>
+  <button class="msg-action-item" id="msgActionForward" onclick="msgActionMenuForward()">➡️ Transférer</button>
+  <button class="msg-action-item danger" id="msgActionDelete" onclick="msgActionMenuDelete()">🗑️ Supprimer</button>
 </div>
 
 <!-- Toasts (demandes d'amis, erreurs) -->
@@ -1694,6 +1885,63 @@ const serverHistory = new Map();
 const unreadServer = new Map();
 // Serveur actuellement ouvert
 let currentServerId = null;
+// Salon actuellement ouvert dans le serveur courant : serverId -> channelId
+const currentChannelByServer = new Map();
+
+// ---- Groupes (chat à plusieurs, 2 à 30 membres, sans code d'invitation) ----
+// Mes groupes : groupId -> { id, name, ownerNullId, members: [...] }
+const myGroups = new Map();
+// Clés partagées par groupe et par socket de membre : groupId -> Map(socketId -> { sharedKey, nullId })
+const groupKeys = new Map();
+// Historique des messages par groupe, indexé par groupId
+const groupHistory = new Map();
+// Messages non lus par groupe, indexé par groupId
+const unreadGroup = new Map();
+// Groupe actuellement ouvert
+let currentGroupId = null;
+
+// ---- Réactions / réponses / suppression de message (DM, serveur, groupe) ----
+// Message auquel on est en train de répondre : { scope, messageId, author, preview, ctx } | null
+let pendingReplyTo = null;
+// Émoji utilisés récemment pour la palette d'appui long (persistés localement)
+const RECENT_EMOJIS_KEY = 'nullchat_recent_emojis_v1';
+const DEFAULT_EMOJI_PALETTE = ['❤️','😂','😮','😢','👍','🔥','🎉','😡'];
+// Registre des bulles actuellement affichées à l'écran, indexé par messageId,
+// pour pouvoir retrouver/mettre à jour une bulle précise (réaction/suppression)
+// sans devoir re-render tout l'historique. Vidé/reconstruit à chaque render.
+const renderedMessageEls = new Map();
+// Message actuellement ciblé par le menu contextuel (appui long / clic droit)
+let msgActionMenuTarget = null; // { entry, scope, ctx }
+// Message actuellement ciblé par la modale "Transférer"
+let forwardMessageTarget = null; // entry
+// Timer d'appui long en cours (pour distinguer tap simple / double-tap / appui long)
+let longPressTimer = null;
+let lastTapInfo = { id: null, time: 0 };
+
+function genMessageId(){
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  return 'm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+// Encapsule un texte clair avant chiffrement, en y attachant éventuellement une
+// référence de réponse. Reste rétro-compatible : un ancien message texte "brut"
+// (sans enveloppe JSON) est traité comme { body: <texte>, reply: null } à la lecture.
+function packTextEnvelope(body, replyTo){
+  if (!replyTo) return body;
+  return JSON.stringify({ __nc: 1, body, reply: { author: replyTo.author, preview: replyTo.preview } });
+}
+function unpackTextEnvelope(raw){
+  if (typeof raw !== 'string') return { body: '', reply: null };
+  if (raw.length > 0 && raw[0] === '{'){
+    try{
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.__nc === 1 && typeof parsed.body === 'string'){
+        return { body: parsed.body, reply: parsed.reply || null };
+      }
+    }catch(e){ /* pas une enveloppe JSON, on retombe sur le texte brut */ }
+  }
+  return { body: raw, reply: null };
+}
 
 // ---- Owner de l'application (modération globale, PAS le "owner" d'un serveur créé) ----
 // Remplace la valeur ci-dessous par TON NULLID (visible dans Paramètres) pour débloquer
@@ -2578,24 +2826,30 @@ function checkFirstLoginTutorial(username){
    ========================================================= */
 function switchView(view){
   currentView = view;
+  closeMsgActionMenu();
   document.getElementById('navGeneral').classList.toggle('active', view === 'general');
   document.getElementById('navFriends').classList.toggle('active', view === 'friends' || view === 'dm');
   document.getElementById('navServers').classList.toggle('active', view === 'servers' || view === 'server');
+  document.getElementById('navGroups').classList.toggle('active', view === 'groups' || view === 'group');
   document.getElementById('friendsPanel').style.display = view === 'friends' ? 'flex' : 'none';
   document.getElementById('serversPanel').style.display = view === 'servers' ? 'flex' : 'none';
+  document.getElementById('groupsPanel').style.display = view === 'groups' ? 'flex' : 'none';
   document.getElementById('viewGeneral').style.display = view === 'general' ? 'flex' : 'none';
   document.getElementById('viewFriendsHero').style.display = view === 'friends' ? 'flex' : 'none';
   document.getElementById('viewServersHero').style.display = view === 'servers' ? 'flex' : 'none';
+  document.getElementById('viewGroupsHero').style.display = view === 'groups' ? 'flex' : 'none';
   document.getElementById('viewDM').style.display = view === 'dm' ? 'flex' : 'none';
   document.getElementById('viewServerChat').style.display = view === 'server' ? 'flex' : 'none';
+  document.getElementById('viewGroupChat').style.display = view === 'group' ? 'flex' : 'none';
   if (view === 'friends') renderFriendList();
   if (view === 'servers') renderServerList();
+  if (view === 'groups') renderGroupList();
   playViewTransition(view);
 }
 
 // Petite animation de fondu/glissement pour que la navigation entre vues soit fluide.
 function playViewTransition(view){
-  const map = { general: 'viewGeneral', friends: 'friendsPanel', dm: 'viewDM', servers: 'serversPanel', server: 'viewServerChat' };
+  const map = { general: 'viewGeneral', friends: 'friendsPanel', dm: 'viewDM', servers: 'serversPanel', server: 'viewServerChat', groups: 'groupsPanel', group: 'viewGroupChat' };
   const id = map[view];
   if (!id) return;
   const el = document.getElementById(id);
@@ -2914,15 +3168,18 @@ async function handleIncomingDm(data, opts){
     const decryptedBuffer = await window.crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, ciphertext);
     const clearContent = new TextDecoder().decode(decryptedBuffer);
     const kind = data.kind || 'text';
+    const unpacked = kind === 'text' ? unpackTextEnvelope(clearContent) : { body: clearContent, reply: null };
     const entry = {
+      id: data.messageId || null,
       author: data.author, isOwn:false, timestamp: data.timestamp, kind,
-      text: kind === 'text' ? clearContent : undefined,
+      text: kind === 'text' ? unpacked.body : undefined,
       dataUrl: kind !== 'text' ? clearContent : undefined,
-      mime: data.mime, filename: data.filename
+      mime: data.mime, filename: data.filename,
+      replyTo: unpacked.reply, reactions: {}
     };
     pushDmToHistory(data.senderNullId, entry);
 
-    const preview = kind === 'text' ? clearContent.slice(0, 60)
+    const preview = kind === 'text' ? unpacked.body.slice(0, 60)
       : kind === 'image' ? '📷 Photo' : kind === 'video' ? '🎥 Vidéo' : '🎤 Message vocal';
 
     const isViewingThisConvo = currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.senderNullId;
@@ -2988,11 +3245,256 @@ function renderDmHistory(nullId){
   box.scrollTop = box.scrollHeight;
 }
 
-function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, filename }, animate){
+/* =========================================================
+   RÉACTIONS / RÉPONSE / TRANSFERT / SUPPRESSION — logique
+   partagée entre DM, serveurs et groupes.
+   ========================================================= */
+
+// Construit la ligne de pastilles de réactions (agrégées par émoji) à
+// l'intérieur du conteneur donné, à partir de entry.reactions = { emoji: [nullId,...] }.
+function renderReactionsInto(container, entry, scope, ctx){
+  container.innerHTML = '';
+  const reactions = entry.reactions;
+  if (!reactions) return;
+  Object.keys(reactions).forEach(emoji => {
+    const ids = reactions[emoji];
+    if (!ids || ids.length === 0) return;
+    const pill = document.createElement('button');
+    pill.className = 'reaction-pill' + (ids.includes(myNullId) ? ' mine' : '');
+    pill.type = 'button';
+    pill.innerHTML = `<span>${emoji}</span><span>${ids.length}</span>`;
+    pill.onclick = (e) => {
+      e.stopPropagation();
+      sendReaction(entry, scope, ctx, emoji, ids.includes(myNullId) ? 'remove' : 'add');
+    };
+    container.appendChild(pill);
+  });
+}
+
+function reactionScopePayload(scope, ctx, extra){
+  const p = Object.assign({ scope }, extra);
+  if (scope === 'dm') p.targetNullId = ctx.targetNullId;
+  else if (scope === 'server'){ p.serverId = ctx.serverId; p.channelId = ctx.channelId; }
+  else if (scope === 'group') p.groupId = ctx.groupId;
+  return p;
+}
+
+function persistHistoryFor(scope, ctx){
+  if (scope === 'dm') saveDmHistory(ctx.targetNullId);
+  else if (scope === 'server') saveServerHistory(ctx.serverId);
+  else if (scope === 'group') saveGroupHistory(ctx.groupId);
+}
+
+// Applique une réaction localement (soi-même ou un autre membre) : met à jour
+// l'entrée d'historique, persiste, et rafraîchit la bulle si elle est affichée.
+function applyReactionLocally(entry, scope, ctx, emoji, action, fromNullId){
+  if (!entry.reactions) entry.reactions = {};
+  const arr = entry.reactions[emoji] || (entry.reactions[emoji] = []);
+  const idx = arr.indexOf(fromNullId);
+  if (action === 'add'){ if (idx === -1) arr.push(fromNullId); }
+  else if (idx !== -1) arr.splice(idx, 1);
+  if (arr.length === 0) delete entry.reactions[emoji];
+  persistHistoryFor(scope, ctx);
+  const rec = entry.id ? renderedMessageEls.get(entry.id) : null;
+  if (rec && rec.entry === entry){
+    const rrow = rec.el.querySelector('.reactions-row');
+    if (rrow) renderReactionsInto(rrow, entry, scope, ctx);
+  }
+}
+
+function sendReaction(entry, scope, ctx, emoji, action){
+  if (!entry.id || entry.deleted) return;
+  socket.emit('message:react', reactionScopePayload(scope, ctx, { messageId: entry.id, emoji, action }));
+  applyReactionLocally(entry, scope, ctx, emoji, action, myNullId);
+}
+
+function toggleHeartReaction(entry, scope, ctx){
+  const mine = entry.reactions && entry.reactions['❤️'] && entry.reactions['❤️'].includes(myNullId);
+  sendReaction(entry, scope, ctx, '❤️', mine ? 'remove' : 'add');
+}
+
+function recentEmojis(){
+  try{ return JSON.parse(localStorage.getItem(RECENT_EMOJIS_KEY) || '[]'); }catch(e){ return []; }
+}
+function pushRecentEmoji(emoji){
+  try{
+    const list = recentEmojis().filter(e => e !== emoji);
+    list.unshift(emoji);
+    localStorage.setItem(RECENT_EMOJIS_KEY, JSON.stringify(list.slice(0, 8)));
+  }catch(e){ /* ignore */ }
+}
+
+function markEntryDeleted(entry, scope, ctx){
+  entry.deleted = true;
+  persistHistoryFor(scope, ctx);
+  const rec = entry.id ? renderedMessageEls.get(entry.id) : null;
+  if (rec && rec.entry === entry){
+    rec.el.classList.add('deleted');
+    const textEl = rec.el.querySelector('.text');
+    if (textEl) textEl.textContent = 'Message supprimé';
+    const media = rec.el.querySelector('img, video, audio');
+    if (media) media.remove();
+    const rrow = rec.el.querySelector('.reactions-row');
+    if (rrow) rrow.innerHTML = '';
+  }
+}
+
+function deleteMessageAction(entry, scope, ctx){
+  if (!entry.id || entry.deleted) return;
+  if (!confirm('Supprimer ce message ?')) return;
+  socket.emit('message:delete', reactionScopePayload(scope, ctx, { messageId: entry.id }));
+  markEntryDeleted(entry, scope, ctx);
+}
+
+function startReply(entry, scope, ctx){
+  if (entry.deleted) return;
+  const preview = entry.kind === 'text' ? (entry.text || '').slice(0, 80)
+    : entry.kind === 'image' ? '📷 Photo' : entry.kind === 'video' ? '🎥 Vidéo' : '🎤 Message vocal';
+  pendingReplyTo = { scope, messageId: entry.id, author: entry.author, preview, ctx };
+  renderReplyContextBar();
+}
+function renderReplyContextBar(){
+  const barIds = { dm: 'dmReplyBar', server: 'serverReplyBar', group: 'groupReplyBar' };
+  Object.values(barIds).forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
+  if (!pendingReplyTo) return;
+  const bar = document.getElementById(barIds[pendingReplyTo.scope]);
+  if (!bar) return;
+  bar.style.display = 'flex';
+  bar.innerHTML = `<span class="reply-ctx-text">↩️ Réponse à <strong>${escapeHtml(pendingReplyTo.author)}</strong> — ${escapeHtml(pendingReplyTo.preview)}</span>`;
+  const cancel = document.createElement('button');
+  cancel.className = 'reply-ctx-cancel';
+  cancel.textContent = '✕';
+  cancel.onclick = () => { pendingReplyTo = null; renderReplyContextBar(); };
+  bar.appendChild(cancel);
+}
+function cancelReply(){ pendingReplyTo = null; renderReplyContextBar(); }
+
+/* --- Menu contextuel (double-tap = ❤️ rapide, appui long / clic droit = menu) --- */
+function openMsgActionMenu(x, y, entry, scope, ctx){
+  if (!entry.id) return;
+  closeMsgActionMenu();
+  msgActionMenuTarget = { entry, scope, ctx };
+  const menu = document.getElementById('msgActionMenu');
+  const emojiBar = document.getElementById('msgActionEmojis');
+  const palette = [...new Set([...recentEmojis(), ...DEFAULT_EMOJI_PALETTE])].slice(0, 8);
+  emojiBar.innerHTML = '';
+  palette.forEach(emoji => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = emoji;
+    btn.onclick = () => {
+      const mine = entry.reactions && entry.reactions[emoji] && entry.reactions[emoji].includes(myNullId);
+      sendReaction(entry, scope, ctx, emoji, mine ? 'remove' : 'add');
+      pushRecentEmoji(emoji);
+      closeMsgActionMenu();
+    };
+    emojiBar.appendChild(btn);
+  });
+  const isOwn = entry.author === currentUser && !!entry.isOwn;
+  let canDelete = isOwn;
+  if (!canDelete && scope === 'server' && ctx && ctx.serverId){
+    const srv = myServers.get(ctx.serverId);
+    if (srv && canModerateServer(srv)) canDelete = true;
+  }
+  document.getElementById('msgActionDelete').style.display = (!entry.deleted && canDelete) ? 'block' : 'none';
+  document.getElementById('msgActionReply').style.display = entry.deleted ? 'none' : 'block';
+  document.getElementById('msgActionForward').style.display = (entry.deleted || entry.kind !== 'text') ? 'none' : 'block';
+
+  menu.style.display = 'block';
+  const menuW = menu.offsetWidth || 200, menuH = menu.offsetHeight || 160;
+  let left = Math.min(x, window.innerWidth - menuW - 10);
+  let top = Math.min(y, window.innerHeight - menuH - 10);
+  menu.style.left = Math.max(8, left) + 'px';
+  menu.style.top = Math.max(8, top) + 'px';
+}
+function closeMsgActionMenu(){
+  msgActionMenuTarget = null;
+  const menu = document.getElementById('msgActionMenu');
+  if (menu) menu.style.display = 'none';
+}
+function msgActionMenuReply(){
+  if (!msgActionMenuTarget) return;
+  const { entry, scope, ctx } = msgActionMenuTarget;
+  closeMsgActionMenu();
+  startReply(entry, scope, ctx);
+}
+function msgActionMenuDelete(){
+  if (!msgActionMenuTarget) return;
+  const { entry, scope, ctx } = msgActionMenuTarget;
+  closeMsgActionMenu();
+  deleteMessageAction(entry, scope, ctx);
+}
+function msgActionMenuForward(){
+  if (!msgActionMenuTarget) return;
+  const { entry } = msgActionMenuTarget;
+  closeMsgActionMenu();
+  openForwardModal(entry);
+}
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('msgActionMenu');
+  if (menu && menu.style.display !== 'none' && !menu.contains(e.target)) closeMsgActionMenu();
+});
+
+// Attache : double-clic/double-tap = ❤️ rapide ; clic droit / appui long = menu contextuel.
+function attachMessageInteractions(wrapper, entry, scope, ctx){
+  if (!entry.id) return; // messages système ou historique legacy sans id : pas d'actions
+  wrapper.dataset.mid = entry.id;
+  renderedMessageEls.set(entry.id, { el: wrapper, entry, scope, ctx });
+  wrapper.style.cursor = 'pointer';
+
+  wrapper.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    openMsgActionMenu(e.clientX, e.clientY, entry, scope, ctx);
+  });
+  wrapper.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    if (!entry.deleted) toggleHeartReaction(entry, scope, ctx);
+  });
+
+  let touchStartX = 0, touchStartY = 0, moved = false;
+  wrapper.addEventListener('touchstart', (e) => {
+    if (!e.touches || !e.touches[0]) return;
+    moved = false;
+    touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY;
+    clearTimeout(longPressTimer);
+    longPressTimer = setTimeout(() => {
+      if (!moved) openMsgActionMenu(touchStartX, touchStartY, entry, scope, ctx);
+    }, 500);
+  }, { passive:true });
+  wrapper.addEventListener('touchmove', (e) => {
+    if (!e.touches || !e.touches[0]) return;
+    if (Math.abs(e.touches[0].clientX - touchStartX) > 10 || Math.abs(e.touches[0].clientY - touchStartY) > 10){
+      moved = true; clearTimeout(longPressTimer);
+    }
+  }, { passive:true });
+  wrapper.addEventListener('touchend', () => {
+    clearTimeout(longPressTimer);
+    if (moved) return;
+    const now = Date.now();
+    if (lastTapInfo.id === entry.id && (now - lastTapInfo.time) < 320){
+      lastTapInfo = { id:null, time:0 };
+      if (!entry.deleted) toggleHeartReaction(entry, scope, ctx);
+    } else {
+      lastTapInfo = { id: entry.id, time: now };
+    }
+  });
+}
+
+// Insère la citation "réponse à" au-dessus du contenu d'une bulle, si présente.
+function prependReplyQuote(wrapper, entry){
+  if (!entry.replyTo) return;
+  const quote = document.createElement('div');
+  quote.className = 'reply-quote';
+  quote.innerHTML = `<span class="rq-author">${escapeHtml(entry.replyTo.author || '')}</span> — ${escapeHtml(entry.replyTo.preview || '')}`;
+  wrapper.appendChild(quote);
+}
+
+function appendDmBubble(entry, animate){
+  const { author, text, isOwn, timestamp, kind, dataUrl, filename } = entry;
   if (animate === undefined) animate = true;
   const box = document.getElementById('dmChat');
   const wrapper = document.createElement('div');
-  wrapper.className = 'msg' + (isOwn ? ' own' : '');
+  wrapper.className = 'msg' + (isOwn ? ' own' : '') + (entry.deleted ? ' deleted' : '');
   const top = document.createElement('div');
   top.className = 'msg-top';
   const authorSpan = document.createElement('span');
@@ -3005,13 +3507,19 @@ function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, f
   top.appendChild(authorSpan);
   top.appendChild(timeSpan);
   wrapper.appendChild(top);
+  prependReplyQuote(wrapper, entry);
 
-  if (kind === 'image' && isSafeAttachmentDataUrl(dataUrl, 'image')){
+  if (entry.deleted){
+    const textDiv = document.createElement('div');
+    textDiv.className = 'text';
+    textDiv.textContent = 'Message supprimé';
+    wrapper.appendChild(textDiv);
+  } else if (kind === 'image' && isSafeAttachmentDataUrl(dataUrl, 'image')){
     const img = document.createElement('img');
     img.src = dataUrl;
     img.alt = filename || 'image';
     img.style.cssText = 'max-width:280px;max-height:280px;border-radius:10px;display:block;margin-top:4px;cursor:pointer;';
-    img.onclick = () => window.open(dataUrl, '_blank');
+    img.onclick = (e) => { e.stopPropagation(); window.open(dataUrl, '_blank'); };
     wrapper.appendChild(img);
   } else if (kind === 'video' && isSafeAttachmentDataUrl(dataUrl, 'video')){
     const vid = document.createElement('video');
@@ -3036,13 +3544,20 @@ function appendDmBubble({ author, text, isOwn, timestamp, kind, dataUrl, mime, f
     if (isOwn || !animate) textDiv.textContent = text; else revealText(textDiv, text);
     wrapper.appendChild(textDiv);
   }
-  if (isOwn){
+  if (isOwn && !entry.deleted){
     const sentMarker = document.createElement('div');
     sentMarker.className = 'sent-marker';
     sentMarker.style.cssText = 'font-size:11px;color:var(--text-faint);text-align:right;margin-top:2px;';
     sentMarker.textContent = 'Envoyée';
     wrapper.appendChild(sentMarker);
   }
+  const rrow = document.createElement('div');
+  rrow.className = 'reactions-row';
+  wrapper.appendChild(rrow);
+
+  const ctx = { targetNullId: currentDmPeer ? currentDmPeer.nullId : null };
+  renderReactionsInto(rrow, entry, 'dm', ctx);
+  attachMessageInteractions(wrapper, entry, 'dm', ctx);
 
   box.appendChild(wrapper);
   while (box.children.length > MAX_RENDERED_MESSAGES) box.removeChild(box.firstChild);
@@ -3252,6 +3767,27 @@ function renderServerMembersModal(){
   list.querySelectorAll('[data-kick]').forEach(b => b.onclick = () => kickServerMember(b.getAttribute('data-kick')));
   list.querySelectorAll('[data-serverban]').forEach(b => b.onclick = () => banServerMember(b.getAttribute('data-serverban')));
   list.querySelectorAll('[data-appban]').forEach(b => b.onclick = () => banUserFromApp(b.getAttribute('data-appban'), b.getAttribute('data-username')));
+
+  const bannedSection = document.getElementById('serverBannedSection');
+  const bannedList = document.getElementById('serverBannedList');
+  if (bannedSection && bannedList){
+    if (!iCanModerate || !srv.bannedNullIds || srv.bannedNullIds.length === 0){
+      bannedSection.style.display = 'none';
+    } else {
+      bannedSection.style.display = 'block';
+      bannedList.innerHTML = srv.bannedNullIds.map(id => `
+        <div class="friend-row" style="cursor:default; padding:6px 10px;">
+          <div class="friend-meta">
+            <div class="friend-sub" style="font-family:var(--font-mono);">${escapeHtml(id)}</div>
+          </div>
+          <div class="friend-actions">
+            <button class="icon-btn fx-btn" title="Débannir" data-unban="${escapeHtml(id)}">Débannir</button>
+          </div>
+        </div>
+      `).join('');
+      bannedList.querySelectorAll('[data-unban]').forEach(b => b.onclick = () => unbanServerMember(currentServerId, b.getAttribute('data-unban')));
+    }
+  }
 }
 function promoteServerAdmin(nullId){
   if (!currentServerId) return;
@@ -3744,7 +4280,8 @@ async function sendDmPayload(payload){
   }
 
   const kind = payload.kind || 'text';
-  const rawString = kind === 'text' ? payload.text : payload.dataUrl;
+  const replyTo = (kind === 'text' && pendingReplyTo && pendingReplyTo.scope === 'dm') ? pendingReplyTo : null;
+  const rawString = kind === 'text' ? packTextEnvelope(payload.text, replyTo) : payload.dataUrl;
   const encoded = new TextEncoder().encode(rawString);
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
   const encryptedBuffer = await window.crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, encoded);
@@ -3753,6 +4290,7 @@ async function sendDmPayload(payload){
   socket.emit('dm:typing', { targetNullId: currentDmPeer.nullId, isTyping: false });
 
   const timestamp = Date.now();
+  const messageId = genMessageId();
   socket.emit('dm:message', {
     targetNullId: currentDmPeer.nullId,
     targetSocketId: currentDmPeer.socketId,
@@ -3761,17 +4299,22 @@ async function sendDmPayload(payload){
     kind,
     mime: payload.mime || null,
     filename: payload.filename || null,
-    timestamp
+    timestamp,
+    messageId
   });
 
   const entry = {
+    id: messageId,
     author: currentUser, isOwn:true, timestamp, kind,
     text: kind === 'text' ? payload.text : undefined,
     dataUrl: kind !== 'text' ? payload.dataUrl : undefined,
-    mime: payload.mime, filename: payload.filename
+    mime: payload.mime, filename: payload.filename,
+    replyTo: replyTo ? { author: replyTo.author, preview: replyTo.preview } : null,
+    reactions: {}
   };
   pushDmToHistory(currentDmPeer.nullId, entry);
   appendDmBubble(entry);
+  if (replyTo){ pendingReplyTo = null; renderReplyContextBar(); }
 }
 
 function readFileAsDataURL(file){
@@ -4397,6 +4940,12 @@ async function startApp(){
     const srv = myServers.get(data.serverId);
     if (!srv) return;
     srv.members = data.members || [];
+    // Bug corrigé : ces deux champs étaient auparavant ignorés ici, donc la liste des
+    // admins/bannis restait figée sur l'état au moment de la création/adhésion du
+    // serveur — un bannissement ultérieur n'était donc jamais reflété côté client
+    // (impossible de le voir dans la modale, impossible de débannir).
+    if (Array.isArray(data.admins)) srv.admins = data.admins;
+    if (Array.isArray(data.bannedNullIds)) srv.bannedNullIds = data.bannedNullIds;
     normalizeServer(srv);
     if (currentServerId === data.serverId){
       const onlineCount = srv.members.filter(m => m.online).length;

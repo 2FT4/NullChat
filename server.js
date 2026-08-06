@@ -79,6 +79,17 @@ const LIMITS = {
   serverMaxMembers: 100,
   serverMaxOwnedPerUser: 20,
   serverMaxJoinedPerUser: 50,
+  channelNameMin: 1,
+  channelNameMax: 40,
+  channelMax: 25,
+  channelTypes: new Set(['text', 'voice']),
+  groupNameMin: 2,
+  groupNameMax: 40,
+  groupMinMembers: 2,
+  groupMaxMembers: 30,
+  groupMaxOwnedPerUser: 20,
+  groupMaxJoinedPerUser: 60,
+  reactionEmojiMax: 32,
   nameFonts: new Set([
     'none', 'upperCase', 'lowerCase', 'bold', 'italic', 'boldItalic', 'script',
     'boldScript', 'gothic', 'boldFraktur', 'double', 'mono', 'sans', 'sansBold',
@@ -163,13 +174,20 @@ const friends = new Map();
 const pendingRequests = new Map();  
 const blocked = new Map();          
 
-// Serveurs (groupes chiffrés créés par les utilisateurs) — en mémoire
-// uniquement pour l'instant (ne survit pas à un redémarrage), même limitation
-// que connectedSockets/userSockets/dmOfflineQueue. Si une persistance est
-// souhaitée plus tard, il suffit d'ajouter les méthodes correspondantes dans
-// db.js sur le même modèle que createUser/addFriendPair etc.
-const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId>, admins: Set<nullId>, bannedNullIds: Set<nullId> }
+// Serveurs (groupes chiffrés créés par les utilisateurs) — désormais
+// persistés en base SQLite (voir loadStateFromDb ci-dessous et les appels
+// db.* dans chaque handler server:*). C'est ce qui manquait pour que les
+// serveurs, leurs salons et surtout leurs bannissements survivent à un
+// redémarrage (Render efface le process/la mémoire à chaque redéploiement
+// ou "spin down" — voir aussi la persistance du fichier SQLite lui-même,
+// qui nécessite un Persistent Disk côté Render).
+const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId>, admins: Set<nullId>, bannedNullIds: Set<nullId>, channels: [{id,name,type,position}] }
 const inviteCodeToServerId = new Map(); // inviteCode -> serverId
+
+// Groupes (chat à plusieurs, 2 à 30 membres, sans code d'invitation — les
+// membres sont ajoutés directement par le créateur parmi ses amis). Même
+// persistance que les serveurs, table chat_groups avec type='group'.
+const chatGroups = new Map();        // groupId -> { id, name, ownerNullId, members: Set<nullId> }
 
 // Bannissements globaux de l'app (owner de l'app uniquement), en mémoire
 // uniquement pour l'instant — même limitation que chatServers : ne survit
@@ -246,7 +264,54 @@ function loadStateFromDb() {
   for (const r of db.loadAllPendingRequests()) {
     pendingRequests.set(r.id, { id: r.id, fromNullId: r.fromNullId, toNullId: r.toNullId, createdAt: r.createdAt });
   }
-  log(`Base chargée : ${users.size} compte(s), ${db.loadAllFriends().length} lien(s) d'amitié, ${pendingRequests.size} demande(s) en attente.`);
+
+  // Serveurs + groupes (table commune chat_groups, distingués par .type)
+  for (const g of db.loadAllGroups()) {
+    if (g.type === 'server') {
+      chatServers.set(g.id, {
+        id: g.id, name: g.name, inviteCode: g.inviteCode, ownerNullId: g.ownerNullId,
+        members: new Set(), admins: new Set(), bannedNullIds: new Set(), channels: []
+      });
+      if (g.inviteCode) inviteCodeToServerId.set(g.inviteCode, g.id);
+    } else if (g.type === 'group') {
+      chatGroups.set(g.id, { id: g.id, name: g.name, ownerNullId: g.ownerNullId, members: new Set() });
+    }
+  }
+  for (const m of db.loadAllGroupMembers()) {
+    const srv = chatServers.get(m.groupId);
+    if (srv) {
+      srv.members.add(m.nullId);
+      if (m.role === 'admin') srv.admins.add(m.nullId);
+      continue;
+    }
+    const grp = chatGroups.get(m.groupId);
+    if (grp) grp.members.add(m.nullId);
+  }
+  for (const b of db.loadAllGroupBans()) {
+    const srv = chatServers.get(b.groupId);
+    if (srv) srv.bannedNullIds.add(b.nullId);
+  }
+  for (const c of db.loadAllChannels()) {
+    const srv = chatServers.get(c.groupId);
+    if (srv) srv.channels.push({ id: c.id, name: c.name, type: c.type, position: c.position });
+  }
+  // Tout serveur historique sans salon (ancien format) reçoit un salon par
+  // défaut pour rester utilisable.
+  for (const srv of chatServers.values()) {
+    if (srv.channels.length === 0) {
+      const chId = crypto.randomUUID();
+      srv.channels.push({ id: chId, name: 'Général', type: 'text', position: 0 });
+      db.createChannel({ id: chId, groupId: srv.id, name: 'Général', type: 'text', position: 0 });
+    } else {
+      srv.channels.sort((a, b) => a.position - b.position);
+    }
+  }
+
+  for (const b of db.loadAllAppBans()) {
+    appBannedUsers.set(b.nullId, { nullId: b.nullId, username: b.username, reason: b.reason, bannedAt: b.bannedAt });
+  }
+
+  log(`Base chargée : ${users.size} compte(s), ${db.loadAllFriends().length} lien(s) d'amitié, ${pendingRequests.size} demande(s) en attente, ${chatServers.size} serveur(s), ${chatGroups.size} groupe(s), ${appBannedUsers.size} bannissement(s) global(aux).`);
 }
 loadStateFromDb();
 
@@ -903,6 +968,101 @@ function isValidServerName(name) {
   return typeof name === 'string' && name.trim().length >= LIMITS.serverNameMin && name.trim().length <= LIMITS.serverNameMax;
 }
 
+function isValidChannelName(name) {
+  return typeof name === 'string' && name.trim().length >= LIMITS.channelNameMin && name.trim().length <= LIMITS.channelNameMax;
+}
+
+function findChannel(srv, channelId) {
+  return srv.channels.find(c => c.id === channelId) || null;
+}
+
+function isValidGroupName(name) {
+  return typeof name === 'string' && name.trim().length >= LIMITS.groupNameMin && name.trim().length <= LIMITS.groupNameMax;
+}
+
+function groupRoom(groupId) {
+  return `group:${groupId}`;
+}
+
+function isMemberOfGroup(nullId, groupId) {
+  const grp = chatGroups.get(groupId);
+  return !!grp && !!nullId && grp.members.has(nullId);
+}
+
+function isGroupOwnerOf(grp, nullId) {
+  return !!grp && !!nullId && grp.ownerNullId === nullId;
+}
+
+function ownedGroupCount(nullId) {
+  let count = 0;
+  for (const grp of chatGroups.values()) if (grp.ownerNullId === nullId) count++;
+  return count;
+}
+
+function joinedGroupCount(nullId) {
+  let count = 0;
+  for (const grp of chatGroups.values()) if (grp.members.has(nullId)) count++;
+  return count;
+}
+
+function getGroupMembersInfo(groupId) {
+  const grp = chatGroups.get(groupId);
+  if (!grp) return [];
+  const list = [];
+  for (const memberNullId of grp.members) {
+    const memberUsername = nullIdToUser.get(memberNullId);
+    if (!memberUsername) continue;
+    const isOnline = userSockets.has(memberNullId);
+    const memberUser = getUserByNullId(memberNullId);
+    list.push({
+      nullId: memberNullId,
+      username: memberUsername,
+      online: isOnline,
+      socketId: isOnline ? userSockets.get(memberNullId) : null,
+      avatarDataUrl: memberUser?.avatarDataUrl || null
+    });
+  }
+  return list;
+}
+
+function serializeGroup(groupId) {
+  const grp = chatGroups.get(groupId);
+  if (!grp) return null;
+  return {
+    id: grp.id,
+    name: grp.name,
+    ownerNullId: grp.ownerNullId,
+    members: getGroupMembersInfo(groupId)
+  };
+}
+
+function sendGroupListAndJoinRooms(socket, nullId) {
+  const mine = [];
+  for (const grp of chatGroups.values()) {
+    if (grp.members.has(nullId)) {
+      socket.join(groupRoom(grp.id));
+      mine.push(serializeGroup(grp.id));
+    }
+  }
+  if (mine.length) socket.emit('group:list', { groups: mine });
+}
+
+function broadcastGroupMembers(groupId) {
+  const grp = chatGroups.get(groupId);
+  if (!grp) return;
+  io.to(groupRoom(groupId)).emit('group:members', { groupId, members: getGroupMembersInfo(groupId) });
+}
+
+function notifyGroupsMemberStatus(nullId, online) {
+  for (const grp of chatGroups.values()) {
+    if (grp.members.has(nullId)) {
+      io.to(groupRoom(grp.id)).emit('group:member_status', {
+        groupId: grp.id, nullId, online, socketId: online ? userSockets.get(nullId) || null : null
+      });
+    }
+  }
+}
+
 function isMemberOfServer(nullId, serverId) {
   const srv = chatServers.get(serverId);
   return !!srv && !!nullId && srv.members.has(nullId);
@@ -962,7 +1122,8 @@ function serializeServer(serverId) {
     ownerNullId: srv.ownerNullId,
     members: getServerMembersInfo(serverId),
     admins: [...srv.admins],
-    bannedNullIds: [...srv.bannedNullIds]
+    bannedNullIds: [...srv.bannedNullIds],
+    channels: [...srv.channels].sort((a, b) => a.position - b.position)
   };
 }
 
@@ -1028,6 +1189,8 @@ io.on('connection', (socket) => {
     flushOfflineDms(socket, nullId);
     sendServerListAndJoinRooms(socket, nullId);
     notifyServersMemberStatus(nullId, true);
+    sendGroupListAndJoinRooms(socket, nullId);
+    notifyGroupsMemberStatus(nullId, true);
   }
 
   socket.broadcast.emit('user_joined', { username });
@@ -1443,14 +1606,25 @@ io.on('connection', (socket) => {
 
     const id = crypto.randomUUID();
     const inviteCode = generateInviteCode();
+    const generalChannelId = crypto.randomUUID();
+    const voiceChannelId = crypto.randomUUID();
     const srv = {
       id, name, inviteCode, ownerNullId: nullId,
       members: new Set([nullId]),
       admins: new Set(),       // ne contient jamais le owner (déjà géré via ownerNullId)
-      bannedNullIds: new Set()
+      bannedNullIds: new Set(),
+      channels: [
+        { id: generalChannelId, name: 'Général', type: 'text', position: 0 },
+        { id: voiceChannelId, name: 'Vocal', type: 'voice', position: 1 }
+      ]
     };
     chatServers.set(id, srv);
     inviteCodeToServerId.set(inviteCode, id);
+
+    db.createGroup({ id, type: 'server', name, inviteCode, ownerNullId: nullId, createdAt: Date.now() });
+    db.addGroupMember(id, nullId, 'owner');
+    db.createChannel({ id: generalChannelId, groupId: id, name: 'Général', type: 'text', position: 0 });
+    db.createChannel({ id: voiceChannelId, groupId: id, name: 'Vocal', type: 'voice', position: 1 });
 
     socket.join(serverRoom(id));
     socket.emit('server:created', serializeServer(id));
@@ -1482,6 +1656,7 @@ io.on('connection', (socket) => {
     }
 
     srv.members.add(nullId);
+    db.addGroupMember(srv.id, nullId, 'member');
     socket.join(serverRoom(srv.id));
     socket.emit('server:joined', serializeServer(srv.id));
 
@@ -1498,15 +1673,19 @@ io.on('connection', (socket) => {
 
     srv.members.delete(nullId);
     srv.admins.delete(nullId);
+    db.removeGroupMember(srv.id, nullId);
     socket.leave(serverRoom(srv.id));
 
     if (srv.members.size === 0) {
       chatServers.delete(srv.id);
       inviteCodeToServerId.delete(srv.inviteCode);
+      db.deleteGroup(srv.id);
     } else {
       if (srv.ownerNullId === nullId) {
         srv.ownerNullId = srv.members.values().next().value; // transfert au membre le plus ancien restant
         srv.admins.delete(srv.ownerNullId); // le nouveau owner n'est plus listé comme "admin"
+        db.transferGroupOwner(srv.id, srv.ownerNullId);
+        db.setGroupMemberRole(srv.id, srv.ownerNullId, 'owner');
       }
       broadcastServerMembers(srv.id);
     }
@@ -1553,6 +1732,14 @@ io.on('connection', (socket) => {
     if (!Array.isArray(data.targets)) return;
     if (!isValidMeta(data.mime, LIMITS.mimeMax) || !isValidMeta(data.filename, LIMITS.filenameMax)) return;
 
+    // channelId requis ; on retombe sur le premier salon texte pour les
+    // anciens clients qui n'envoient pas encore ce champ.
+    const fallbackChannel = srv.channels.find(c => c.type === 'text');
+    const channel = data.channelId ? findChannel(srv, data.channelId) : fallbackChannel;
+    if (!channel || channel.type !== 'text') {
+      return socket.emit('server:error', { message: 'Salon introuvable ou non textuel.' });
+    }
+
     const messageId = crypto.randomUUID();
     data.targets.slice(0, LIMITS.serverMaxMembers).forEach(t => {
       if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
@@ -1563,6 +1750,7 @@ io.on('connection', (socket) => {
 
       io.to(t.targetId).emit('server:message', {
         serverId: srv.id,
+        channelId: channel.id,
         messageId,
         senderSocketId: socket.id,
         senderNullId: nullId,
@@ -1575,6 +1763,78 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
     });
+  }));
+
+  // ==========================================
+  // SALONS (channels) DANS UN SERVEUR
+  // ==========================================
+  socket.on('server:channel_create', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!isValidChannelName(name)) {
+      return socket.emit('server:error', { message: `Nom de salon invalide (${LIMITS.channelNameMin} à ${LIMITS.channelNameMax} caractères).` });
+    }
+    const type = LIMITS.channelTypes.has(data.type) ? data.type : 'text';
+    if (srv.channels.length >= LIMITS.channelMax) {
+      return socket.emit('server:error', { message: 'Nombre maximal de salons atteint pour ce serveur.' });
+    }
+
+    const channelId = crypto.randomUUID();
+    const position = srv.channels.length;
+    srv.channels.push({ id: channelId, name, type, position });
+    db.createChannel({ id: channelId, groupId: srv.id, name, type, position });
+
+    io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
+  }));
+
+  socket.on('server:channel_rename', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    const channel = findChannel(srv, data.channelId);
+    if (!channel) return socket.emit('server:error', { message: 'Salon introuvable.' });
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!isValidChannelName(name)) {
+      return socket.emit('server:error', { message: `Nom de salon invalide (${LIMITS.channelNameMin} à ${LIMITS.channelNameMax} caractères).` });
+    }
+    channel.name = name;
+    db.renameChannel(channel.id, name);
+    io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
+  }));
+
+  socket.on('server:channel_delete', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    const channel = findChannel(srv, data.channelId);
+    if (!channel) return socket.emit('server:error', { message: 'Salon introuvable.' });
+    const remainingTextChannels = srv.channels.filter(c => c.type === 'text' && c.id !== channel.id);
+    if (channel.type === 'text' && remainingTextChannels.length === 0) {
+      return socket.emit('server:error', { message: 'Impossible de supprimer le dernier salon textuel.' });
+    }
+    srv.channels = srv.channels.filter(c => c.id !== channel.id);
+    db.deleteChannel(channel.id);
+    io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
   }));
 
   // ==========================================
@@ -1600,6 +1860,7 @@ io.on('connection', (socket) => {
     if (targetNullId === srv.ownerNullId) return; // déjà "au-dessus" d'admin, no-op silencieux
 
     srv.admins.add(targetNullId);
+    db.setGroupMemberRole(srv.id, targetNullId, 'admin');
     io.to(serverRoom(srv.id)).emit('server:role_changed', { serverId: srv.id, nullId: targetNullId, role: 'admin' });
   }));
 
@@ -1617,6 +1878,7 @@ io.on('connection', (socket) => {
     if (!isValidNullId(targetNullId) || !srv.admins.has(targetNullId)) return;
 
     srv.admins.delete(targetNullId);
+    db.setGroupMemberRole(srv.id, targetNullId, 'member');
     io.to(serverRoom(srv.id)).emit('server:role_changed', { serverId: srv.id, nullId: targetNullId, role: 'member' });
   }));
 
@@ -1644,6 +1906,7 @@ io.on('connection', (socket) => {
 
     srv.members.delete(targetNullId);
     srv.admins.delete(targetNullId);
+    db.removeGroupMember(srv.id, targetNullId);
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -1677,6 +1940,8 @@ io.on('connection', (socket) => {
     srv.members.delete(targetNullId);
     srv.admins.delete(targetNullId);
     srv.bannedNullIds.add(targetNullId);
+    db.removeGroupMember(srv.id, targetNullId);
+    db.addGroupBan(srv.id, targetNullId, typeof data.reason === 'string' ? data.reason.slice(0, 300) : null);
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -1699,7 +1964,282 @@ io.on('connection', (socket) => {
     const targetNullId = data.targetNullId;
     if (!isValidNullId(targetNullId)) return;
     srv.bannedNullIds.delete(targetNullId);
+    db.removeGroupBan(srv.id, targetNullId);
     broadcastServerMembers(srv.id);
+  }));
+
+  // ==========================================
+  // GROUPES (chat à plusieurs, 2 à 30 membres, sans code d'invitation)
+  // ==========================================
+  socket.on('group:create', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('group:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('group:error', { message: 'Trop d’actions, réessaie dans une minute.' });
+    }
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!isValidGroupName(name)) {
+      return socket.emit('group:error', { message: `Nom de groupe invalide (${LIMITS.groupNameMin} à ${LIMITS.groupNameMax} caractères).` });
+    }
+    if (ownedGroupCount(nullId) >= LIMITS.groupMaxOwnedPerUser) {
+      return socket.emit('group:error', { message: 'Tu as atteint la limite de groupes possédés.' });
+    }
+    const requested = Array.isArray(data.memberNullIds) ? [...new Set(data.memberNullIds)] : [];
+    const memberNullIds = requested.filter(id => isValidNullId(id) && id !== nullId && areFriends(nullId, id) && !isBlocked(nullId, id));
+    const totalMembers = memberNullIds.length + 1; // + le créateur
+    if (totalMembers < LIMITS.groupMinMembers || totalMembers > LIMITS.groupMaxMembers) {
+      return socket.emit('group:error', { message: `Un groupe doit avoir entre ${LIMITS.groupMinMembers} et ${LIMITS.groupMaxMembers} membres (amis uniquement).` });
+    }
+
+    const id = crypto.randomUUID();
+    const grp = { id, name, ownerNullId: nullId, members: new Set([nullId, ...memberNullIds]) };
+    chatGroups.set(id, grp);
+    db.createGroup({ id, type: 'group', name, inviteCode: null, ownerNullId: nullId, createdAt: Date.now() });
+    db.addGroupMember(id, nullId, 'owner');
+    for (const m of memberNullIds) db.addGroupMember(id, m, 'member');
+
+    socket.join(groupRoom(id));
+    socket.emit('group:created', serializeGroup(id));
+    for (const m of memberNullIds) {
+      const memberSocketId = userSockets.get(m);
+      if (memberSocketId) {
+        io.sockets.sockets.get(memberSocketId)?.join(groupRoom(id));
+        io.to(memberSocketId).emit('group:created', serializeGroup(id));
+      }
+    }
+  }));
+
+  socket.on('group:add_member', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('group:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('group:error', { message: 'Trop d’actions, réessaie dans une minute.' });
+    }
+    const grp = chatGroups.get(data.groupId);
+    if (!grp) return socket.emit('group:error', { message: 'Groupe introuvable.' });
+    if (!isGroupOwnerOf(grp, nullId)) {
+      return socket.emit('group:error', { message: 'Seul le créateur du groupe peut ajouter des membres.' });
+    }
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId) || !areFriends(nullId, targetNullId) || isBlocked(nullId, targetNullId)) {
+      return socket.emit('group:error', { message: 'Tu ne peux ajouter qu’un(e) ami(e).' });
+    }
+    if (grp.members.has(targetNullId)) return;
+    if (grp.members.size >= LIMITS.groupMaxMembers) {
+      return socket.emit('group:error', { message: `Un groupe ne peut pas dépasser ${LIMITS.groupMaxMembers} membres.` });
+    }
+
+    grp.members.add(targetNullId);
+    db.addGroupMember(grp.id, targetNullId, 'member');
+
+    const targetSocketId = userSockets.get(targetNullId);
+    if (targetSocketId) {
+      io.sockets.sockets.get(targetSocketId)?.join(groupRoom(grp.id));
+      io.to(targetSocketId).emit('group:created', serializeGroup(grp.id));
+    }
+    broadcastGroupMembers(grp.id);
+  }));
+
+  socket.on('group:remove_member', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('group:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('group:error', { message: 'Trop d’actions, réessaie dans une minute.' });
+    }
+    const grp = chatGroups.get(data.groupId);
+    if (!grp) return socket.emit('group:error', { message: 'Groupe introuvable.' });
+    if (!isGroupOwnerOf(grp, nullId)) {
+      return socket.emit('group:error', { message: 'Seul le créateur du groupe peut retirer un membre.' });
+    }
+    const targetNullId = data.targetNullId;
+    if (!isValidNullId(targetNullId) || targetNullId === grp.ownerNullId || !grp.members.has(targetNullId)) return;
+
+    grp.members.delete(targetNullId);
+    db.removeGroupMember(grp.id, targetNullId);
+    const targetSocketId = userSockets.get(targetNullId);
+    if (targetSocketId) {
+      io.sockets.sockets.get(targetSocketId)?.leave(groupRoom(grp.id));
+      io.to(targetSocketId).emit('group:removed', { groupId: grp.id });
+    }
+    broadcastGroupMembers(grp.id);
+  }));
+
+  socket.on('group:rename', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('group:error', { message: 'Vous devez être connecté.' });
+    const grp = chatGroups.get(data.groupId);
+    if (!grp) return socket.emit('group:error', { message: 'Groupe introuvable.' });
+    if (!isGroupOwnerOf(grp, nullId)) {
+      return socket.emit('group:error', { message: 'Seul le créateur du groupe peut le renommer.' });
+    }
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!isValidGroupName(name)) {
+      return socket.emit('group:error', { message: `Nom de groupe invalide (${LIMITS.groupNameMin} à ${LIMITS.groupNameMax} caractères).` });
+    }
+    grp.name = name;
+    db.renameGroup(grp.id, name);
+    io.to(groupRoom(grp.id)).emit('group:renamed', { groupId: grp.id, name });
+  }));
+
+  socket.on('group:leave', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const grp = chatGroups.get(data.groupId);
+    if (!grp || !grp.members.has(nullId)) return;
+
+    grp.members.delete(nullId);
+    db.removeGroupMember(grp.id, nullId);
+    socket.leave(groupRoom(grp.id));
+
+    if (grp.members.size === 0) {
+      chatGroups.delete(grp.id);
+      db.deleteGroup(grp.id);
+    } else {
+      if (grp.ownerNullId === nullId) {
+        grp.ownerNullId = grp.members.values().next().value;
+        db.transferGroupOwner(grp.id, grp.ownerNullId);
+        db.setGroupMemberRole(grp.id, grp.ownerNullId, 'owner');
+      }
+      broadcastGroupMembers(grp.id);
+    }
+    socket.emit('group:left', { groupId: grp.id });
+  }));
+
+  socket.on('group:key_exchange', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    if (!isValidPublicKey(data.publicKey)) return;
+    const grp = chatGroups.get(data.groupId);
+    if (!grp || !isMemberOfGroup(nullId, grp.id)) return;
+
+    const payload = {
+      groupId: grp.id,
+      senderSocketId: socket.id,
+      senderNullId: nullId,
+      publicKey: data.publicKey,
+      isNewMember: !!data.isNewMember
+    };
+
+    if (data.targetSocketId) {
+      const target = connectedSockets.get(data.targetSocketId);
+      if (!target?.nullId || !isMemberOfGroup(target.nullId, grp.id)) return;
+      io.to(data.targetSocketId).emit('group:key_exchange', payload);
+    } else {
+      socket.to(groupRoom(grp.id)).emit('group:key_exchange', payload);
+    }
+  }));
+
+  socket.on('group:message', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const kind = data.kind || 'text';
+    if (!isValidKind(kind)) return;
+    const isAttachment = kind !== 'text';
+
+    if (!messageRateLimit(socket.id)) {
+      return socket.emit('group:error', { message: 'Tu envoies des messages trop vite, ralentis un peu.' });
+    }
+    if (isAttachment && !attachmentRateLimit(socket.id)) {
+      return socket.emit('group:error', { message: 'Trop de pièces jointes envoyées d’un coup, ralentis un peu.' });
+    }
+    const grp = chatGroups.get(data.groupId);
+    if (!grp || !isMemberOfGroup(nullId, grp.id)) return;
+    if (!Array.isArray(data.targets)) return;
+    if (!isValidMeta(data.mime, LIMITS.mimeMax) || !isValidMeta(data.filename, LIMITS.filenameMax)) return;
+
+    const messageId = crypto.randomUUID();
+    data.targets.slice(0, LIMITS.groupMaxMembers).forEach(t => {
+      if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
+      const target = connectedSockets.get(t.targetId);
+      if (!target?.nullId || !isMemberOfGroup(target.nullId, grp.id)) return;
+      if (!isValidByteArray(t.ciphertext, ciphertextLimitFor(kind))) return;
+      if (!isValidByteArray(t.iv, LIMITS.ivBytes)) return;
+
+      io.to(t.targetId).emit('group:message', {
+        groupId: grp.id,
+        messageId,
+        senderSocketId: socket.id,
+        senderNullId: nullId,
+        author: username,
+        ciphertext: t.ciphertext,
+        iv: t.iv,
+        kind,
+        mime: data.mime || null,
+        filename: data.filename || null,
+        timestamp: Date.now()
+      });
+    });
+  }));
+
+  // ==========================================
+  // RÉACTIONS / SUPPRESSION DE MESSAGE (DM, serveur, groupe)
+  // ==========================================
+  // Réponse ("répondre") et transfert ("transférer") ne nécessitent aucun
+  // évènement dédié : ce sont de simples messages normaux (dm:message /
+  // server:message / group:message) dont le texte en clair, une fois
+  // déchiffré côté client, contient une référence au message d'origine —
+  // cohérent avec le modèle E2E existant où le serveur ne voit jamais le
+  // contenu. Seules réactions et suppressions ont besoin d'un évènement
+  // dédié car ce sont des méta-données, pas du contenu chiffré à transporter.
+  socket.on('message:react', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const scope = data.scope;
+    const messageId = data.messageId;
+    const emoji = typeof data.emoji === 'string' ? data.emoji.slice(0, LIMITS.reactionEmojiMax) : '';
+    const action = data.action === 'remove' ? 'remove' : 'add';
+    if (!isNonEmptyString(messageId, 100) || !emoji) return;
+
+    if (scope === 'dm') {
+      const targetNullId = data.targetNullId;
+      if (!isValidNullId(targetNullId) || !areFriends(nullId, targetNullId) || isBlocked(nullId, targetNullId)) return;
+      const targetSocketId = userSockets.get(targetNullId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('message:reaction', { scope, messageId, emoji, action, fromNullId: nullId });
+      }
+    } else if (scope === 'server') {
+      const srv = chatServers.get(data.serverId);
+      if (!srv || !isMemberOfServer(nullId, srv.id)) return;
+      socket.to(serverRoom(srv.id)).emit('message:reaction', {
+        scope, serverId: srv.id, channelId: data.channelId || null, messageId, emoji, action, fromNullId: nullId
+      });
+      socket.emit('message:reaction', { scope, serverId: srv.id, channelId: data.channelId || null, messageId, emoji, action, fromNullId: nullId });
+    } else if (scope === 'group') {
+      const grp = chatGroups.get(data.groupId);
+      if (!grp || !isMemberOfGroup(nullId, grp.id)) return;
+      socket.to(groupRoom(grp.id)).emit('message:reaction', { scope, groupId: grp.id, messageId, emoji, action, fromNullId: nullId });
+      socket.emit('message:reaction', { scope, groupId: grp.id, messageId, emoji, action, fromNullId: nullId });
+    }
+  }));
+
+  socket.on('message:delete', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const scope = data.scope;
+    const messageId = data.messageId;
+    if (!isNonEmptyString(messageId, 100)) return;
+
+    if (scope === 'dm') {
+      const targetNullId = data.targetNullId;
+      if (!isValidNullId(targetNullId) || !areFriends(nullId, targetNullId) || isBlocked(nullId, targetNullId)) return;
+      // Si le message était encore en file d'attente hors-ligne, on l'enlève
+      // pour qu'il ne soit jamais délivré une fois le destinataire reconnecté.
+      const queue = dmOfflineQueue.get(targetNullId);
+      if (queue) {
+        const filtered = queue.filter(e => e.payload.messageId !== messageId);
+        if (filtered.length) dmOfflineQueue.set(targetNullId, filtered);
+        else dmOfflineQueue.delete(targetNullId);
+      }
+      const targetSocketId = userSockets.get(targetNullId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('message:deleted', { scope, messageId, fromNullId: nullId });
+      }
+    } else if (scope === 'server') {
+      const srv = chatServers.get(data.serverId);
+      if (!srv || !isMemberOfServer(nullId, srv.id)) return;
+      // Auteur du message : n'importe quel membre le sait déjà côté client
+      // (il a l'historique déchiffré) ; le serveur ne stockant jamais le
+      // texte en clair, il ne peut pas vérifier l'auteur lui-même — c'est le
+      // client de chaque destinataire qui n'affichera la suppression comme
+      // effective que si elle vient de l'auteur du message ou d'un modérateur
+      // (canModerateServer côté client, sur la base des rôles déjà connus).
+      socket.to(serverRoom(srv.id)).emit('message:deleted', { scope, serverId: srv.id, channelId: data.channelId || null, messageId, fromNullId: nullId });
+    } else if (scope === 'group') {
+      const grp = chatGroups.get(data.groupId);
+      if (!grp || !isMemberOfGroup(nullId, grp.id)) return;
+      socket.to(groupRoom(grp.id)).emit('message:deleted', { scope, groupId: grp.id, messageId, fromNullId: nullId });
+    }
   }));
 
   // ==========================================
@@ -1721,12 +2261,14 @@ io.on('connection', (socket) => {
     }
 
     const targetUsername = nullIdToUser.get(targetNullId) || null;
+    const banReason = typeof data.reason === 'string' ? data.reason.slice(0, 300) : null;
     appBannedUsers.set(targetNullId, {
       nullId: targetNullId,
       username: targetUsername,
-      reason: typeof data.reason === 'string' ? data.reason.slice(0, 300) : null,
+      reason: banReason,
       bannedAt: Date.now()
     });
+    db.addAppBan(targetNullId, targetUsername, banReason);
 
     // Déconnecte TOUTES les sockets actives de ce nullId (pas seulement la
     // dernière connue via userSockets, au cas où plusieurs onglets/sessions
@@ -1753,6 +2295,7 @@ io.on('connection', (socket) => {
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
     appBannedUsers.delete(targetNullId);
+    db.removeAppBan(targetNullId);
     log('Compte débanni de l’app par', nullId, ':', targetNullId);
   }));
 
@@ -1769,6 +2312,7 @@ io.on('connection', (socket) => {
       userSockets.delete(nullId);
       notifyFriendsStatus(nullId, false);
       notifyServersMemberStatus(nullId, false);
+      notifyGroupsMemberStatus(nullId, false);
     }
     socket.broadcast.emit('user_left', { username, senderId: socket.id });
   });
