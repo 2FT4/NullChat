@@ -5,15 +5,8 @@ const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 const db = require('./db');
-
-// Chargement "souple" : si le paquet n'est pas encore installé (npm install
-// nodemailer twilio), le serveur démarre quand même, il retombe juste en
-// "mode dev" (le code est affiché dans les logs au lieu d'être envoyé).
-let nodemailer = null;
-try { nodemailer = require('nodemailer'); } catch (e) { /* pas installé */ }
-let TwilioLib = null;
-try { TwilioLib = require('twilio'); } catch (e) { /* pas installé */ }
 
 // ==========================================
 // CONFIGURATION
@@ -43,24 +36,6 @@ function isAppOwner(candidateNullId) {
 if (OWNER_NULLIDS.size === 0) {
   console.warn('⚠️ OWNER_NULLIDS est vide : personne ne peut utiliser la modération globale de l’app.');
 }
-// Co-owners de l'app : même mécanisme que OWNER_NULLIDS (variable d'env,
-// seule source de vérité côté serveur). AVANT ce correctif, le client
-// affichait le panneau/bouton "bannir" à quiconque figurait dans la
-// constante COOWNER_NULLIDS codée en dur dans index.html, mais le serveur
-// ne vérifiait QUE OWNER_NULLIDS pour toutes les actions "app:*" : un
-// co-owner voyait donc le bouton, cliquait, et se prenait "Action non
-// autorisée" (le ban n'avait donc aucun effet) — d'où le bannissement qui
-// "ne marchait pas" pour tout compte qui n'était pas un owner "en dur".
-// ⚠️ Il faut définir la variable d'environnement COOWNER_NULLIDS avec
-// EXACTEMENT les mêmes NULLID que la constante COOWNER_NULLIDS du fichier
-// index.html, sinon le bouton affiché côté client ne correspondra à aucun
-// droit réel côté serveur.
-const COOWNER_NULLIDS = new Set(
-  (process.env.COOWNER_NULLIDS || '')
-    .split(',')
-    .map(s => s.trim().toUpperCase())
-    .filter(Boolean)
-);
 // NB : l'ancienne route /api/upload + le dossier /uploads servi en statique
 // ont été retirés. Le client n'appelle jamais /api/upload (les médias
 // transitent uniquement chiffrés via les sockets dm:message/encrypted_message)
@@ -78,82 +53,52 @@ if (process.env.TURN_URL) {
 }
 
 // ==========================================
-// SERVICE D'ENVOI DE CODES (vérification email + téléphone)
+// VÉRIFICATION D'E-MAIL (inscription)
 // ==========================================
-// Email : SMTP générique via nodemailer (fonctionne avec Gmail, SendGrid,
-// Mailgun, OVH, Infomaniak, etc. — il suffit de renseigner les identifiants
-// SMTP du fournisseur choisi dans les variables d'environnement).
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
-const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
+// ⚠️ Idéalement ces deux valeurs devraient vivre UNIQUEMENT dans des variables
+// d'environnement (EMAIL_USER / EMAIL_PASS), jamais commitées en clair dans le
+// code source — surtout si ce dépôt est/devient public. Ici on les met en
+// valeur par défaut comme demandé, mais process.env garde la priorité si défini,
+// pour permettre de changer/révoquer ce mot de passe d'application sans toucher au code.
+const EMAIL_USER = process.env.EMAIL_USER || 'ethaneachour@gmail.com';
+const EMAIL_PASS = process.env.EMAIL_PASS || 'kjmjwpjybblcserc';
+const mailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+});
+mailTransporter.verify((err) => {
+  if (err) console.warn('⚠️ Envoi d\u2019e-mails indisponible (SMTP) :', err.message);
+  else log('✅ SMTP prêt pour l\u2019envoi des codes de vérification.');
+});
 
-let mailTransporter = null;
-if (nodemailer && SMTP_HOST && SMTP_USER && SMTP_PASS) {
-  mailTransporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
-  });
-} else {
-  console.warn('⚠️ SMTP non configuré (SMTP_HOST/SMTP_USER/SMTP_PASS manquants ou nodemailer non installé) : les codes email seront seulement affichés dans les logs serveur (mode dev).');
-}
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;       // un code envoyé est valable 10 min
+const EMAIL_CODE_RESEND_COOLDOWN_MS = 45 * 1000; // 45s avant de pouvoir renvoyer un code au même e-mail
+const EMAIL_CODE_MAX_ATTEMPTS = 5;               // 5 essais de code avant qu'il faille en redemander un
+const VERIFIED_TOKEN_TTL_MS = 15 * 60 * 1000;    // 15 min pour finaliser l'inscription après vérification
 
-// SMS : Twilio par défaut (le plus simple à brancher). Pour un autre
-// fournisseur (OVH SMS, Vonage, Brevo...), il suffit de remplacer le corps
-// de sendSmsCode() ci-dessous par l'appel à leur API.
-const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || '';
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || '';
+// email (en minuscules) -> { code, expiresAt, attempts, lastSentAt }
+const pendingEmailVerifications = new Map();
+// token -> { email, expiresAt } — preuve qu'un e-mail vient d'être vérifié, à
+// présenter à /api/register (courte durée de vie, usage unique).
+const verifiedEmailTokens = new Map();
+// email (en minuscules) -> username, pour empêcher deux comptes sur le même e-mail
+const emailToUser = new Map();
 
-let twilioClient = null;
-if (TwilioLib && TWILIO_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER) {
-  twilioClient = TwilioLib(TWILIO_SID, TWILIO_AUTH_TOKEN);
-} else {
-  console.warn('⚠️ Twilio non configuré (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER manquants ou twilio non installé) : les codes SMS seront seulement affichés dans les logs serveur (mode dev).');
-}
-
-async function sendEmailCode(email, code) {
-  if (!mailTransporter) {
-    log(`[DEV][EMAIL] Code de vérification pour ${email} : ${code}`);
-    return;
+setInterval(() => {
+  const now = Date.now();
+  for (const [email, entry] of pendingEmailVerifications.entries()) {
+    if (entry.expiresAt <= now) pendingEmailVerifications.delete(email);
   }
-  await mailTransporter.sendMail({
-    from: SMTP_FROM,
-    to: email,
-    subject: 'Ton code de vérification NullChat',
-    text: `Ton code de vérification NullChat est : ${code}\nIl expire dans ${Math.round(LIMITS.verifyCodeTtlMs / 60000)} minutes.\nSi tu n'es pas à l'origine de cette demande, ignore ce message.`
-  });
-}
-
-async function sendSmsCode(phone, code) {
-  if (!twilioClient) {
-    log(`[DEV][SMS] Code de vérification pour ${phone} : ${code}`);
-    return;
+  for (const [token, entry] of verifiedEmailTokens.entries()) {
+    if (entry.expiresAt <= now) verifiedEmailTokens.delete(token);
   }
-  await twilioClient.messages.create({
-    from: TWILIO_FROM_NUMBER,
-    to: phone,
-    body: `Ton code de vérification NullChat est : ${code}`
-  });
-}
+}, 60 * 1000).unref();
 
 const LIMITS = {
   usernameMin: 3,
   usernameMax: 32,
   passwordMin: 8,
   passwordMax: 128,
-  emailRegex: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
-  emailMax: 254,
-  phoneRegex: /^\+[1-9]\d{6,14}$/, // format international E.164, ex: +33612345678
-  verifyCodeLength: 6,
-  verifyCodeTtlMs: 10 * 60 * 1000, // le code envoyé est valable 10 minutes
-  verifyCodeResendCooldownMs: 45 * 1000, // anti-spam entre deux envois du même code
-  verifyCodeMaxAttempts: 5, // au-delà, il faut redemander un nouveau code
-  verifiedContactTtlMs: 20 * 60 * 1000, // temps laissé pour finir l'inscription après vérif
   messageMax: 4000,
   ciphertextMaxBytes: 20000,
   // ⚠️ 10 Go tel que demandé. Voir l'avertissement juste en dessous : à cette
@@ -202,6 +147,8 @@ const LIMITS = {
   hexColorRegex: /^#[0-9a-fA-F]{6}$/,
   profilePresets: new Set(['crimson', 'sunset', 'ocean', 'purple', 'forest', 'candy', 'midnight', 'gold']),
   bannerMaxDataUrlLength: 400 * 1024,
+  emailMax: 254,
+  verificationCodeLength: 6,
 };
 
 const app = express();
@@ -268,21 +215,6 @@ const connectedSockets = new Map();
 const userSockets = new Map();    
 const dmOfflineQueue = new Map(); 
 
-// email normalisé -> username / téléphone normalisé (E.164) -> username
-const emailToUser = new Map();
-const phoneToUser = new Map();
-// clé "email:x@y.com" ou "phone:+336..." -> { code, expiresAt, attempts, lastSentAt }
-const pendingCodes = new Map();
-// même type de clé -> { expiresAt } : posé une fois le code validé, consommé par /api/register
-const verifiedContacts = new Map();
-
-// Nettoyage périodique des codes/vérifications expirés pour ne pas fuiter en mémoire.
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, v] of pendingCodes.entries()) if (v.expiresAt < now) pendingCodes.delete(key);
-  for (const [key, v] of verifiedContacts.entries()) if (v.expiresAt < now) verifiedContacts.delete(key);
-}, 5 * 60 * 1000).unref();
-
 const friends = new Map();          
 const pendingRequests = new Map();  
 const blocked = new Map();          
@@ -323,11 +255,7 @@ const appBannedDevices = new Map();
 // nullId -> { nullId, username, addedAt, addedBy }
 const appCoOwners = new Map();
 function isAppCoOwner(candidateNullId) {
-  if (!candidateNullId) return false;
-  // Union de la liste fixée par variable d'env (COOWNER_NULLIDS) et de la
-  // Map dynamique (réservée à un futur handler "app:add_coowner" côté
-  // owner) — pour l'instant seule COOWNER_NULLIDS est réellement peuplée.
-  return COOWNER_NULLIDS.has(candidateNullId) || appCoOwners.has(candidateNullId);
+  return !!candidateNullId && appCoOwners.has(candidateNullId);
 }
 function isAppOwnerOrCoOwner(candidateNullId) {
   return isAppOwner(candidateNullId) || isAppCoOwner(candidateNullId);
@@ -336,10 +264,6 @@ function appRoleOf(candidateNullId) {
   if (isAppOwner(candidateNullId)) return 'owner';
   if (isAppCoOwner(candidateNullId)) return 'coowner';
   return null;
-}
-// Libellé humain utilisé dans les messages envoyés au compte banni.
-function appRoleLabel(candidateNullId) {
-  return appRoleOf(candidateNullId) === 'coowner' ? 'Co-Owner' : 'Owner';
 }
 
 
@@ -357,8 +281,6 @@ function loadStateFromDb() {
       username: u.username,
       passwordHash: u.passwordHash,
       nullId: u.nullId,
-      email: u.email || null,
-      phone: u.phone || null,
       publicKey: u.publicKey,
       avatarDataUrl: u.avatarDataUrl || null,
       // ⚠️ Pas encore persistés en base (db.js n'a pas de colonnes dédiées) :
@@ -374,8 +296,6 @@ function loadStateFromDb() {
       bgValue: null
     });
     nullIdToUser.set(u.nullId, u.username);
-    if (u.email) emailToUser.set(normalizeEmail(u.email), u.username);
-    if (u.phone) phoneToUser.set(normalizePhone(u.phone), u.username);
     if (!friends.has(u.nullId)) friends.set(u.nullId, new Set());
   }
   for (const f of db.loadAllFriends()) {
@@ -550,6 +470,20 @@ function isValidUsername(username) {
   );
 }
 
+// Validation volontairement simple (format général), la vérification réelle
+// de l'adresse se fait en lui envoyant un code à 6 chiffres qu'il faut saisir.
+function isValidEmail(email) {
+  return (
+    typeof email === 'string' &&
+    email.length > 0 &&
+    email.length <= LIMITS.emailMax &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
 function isValidPassword(password) {
   if (
     typeof password !== 'string' ||
@@ -559,26 +493,6 @@ function isValidPassword(password) {
     return false;
   }
   return Buffer.byteLength(password, 'utf8') <= 72;
-}
-
-function normalizeEmail(email) {
-  return typeof email === 'string' ? email.trim().toLowerCase() : '';
-}
-function normalizePhone(phone) {
-  return typeof phone === 'string' ? phone.trim().replace(/[\s.\-()]/g, '') : '';
-}
-function isValidEmail(email) {
-  return typeof email === 'string' && email.length > 0 && email.length <= LIMITS.emailMax && LIMITS.emailRegex.test(email);
-}
-function isValidPhone(phone) {
-  return typeof phone === 'string' && LIMITS.phoneRegex.test(phone);
-}
-function contactKey(channel, value) {
-  return `${channel}:${value}`;
-}
-function generateOtpCode() {
-  // crypto.randomInt évite le biais modulo et n'est pas prévisible comme Math.random().
-  return String(crypto.randomInt(0, 10 ** LIMITS.verifyCodeLength)).padStart(LIMITS.verifyCodeLength, '0');
 }
 
 function isValidNullId(nullId) {
@@ -697,93 +611,9 @@ function requireAuth(req, res, next) {
 // ROUTES HTTP (API AUTH & MEDIAS)
 // ==========================================
 
-// ------------------------------------------------------------------
-// Vérification d'un email ou d'un numéro de téléphone par code à 6
-// chiffres, utilisée avant/pendant l'inscription (voir /api/register).
-// ------------------------------------------------------------------
-app.post('/api/verify/send-code', authRateLimitMiddleware, async (req, res) => {
-  try {
-    const channel = req.body?.channel;
-    let value = req.body?.value;
-    if (channel !== 'email' && channel !== 'phone') {
-      return res.status(400).json({ error: 'Canal invalide (email ou phone).' });
-    }
-
-    if (channel === 'email') {
-      value = normalizeEmail(value);
-      if (!isValidEmail(value)) return res.status(400).json({ error: 'Email invalide.' });
-      if (emailToUser.has(value)) return res.status(409).json({ error: 'Cet email est déjà utilisé par un compte.' });
-    } else {
-      value = normalizePhone(value);
-      if (!isValidPhone(value)) {
-        return res.status(400).json({ error: 'Numéro invalide (format international requis, ex: +33612345678).' });
-      }
-      if (phoneToUser.has(value)) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un compte.' });
-    }
-
-    const key = contactKey(channel, value);
-    const existing = pendingCodes.get(key);
-    if (existing && Date.now() - existing.lastSentAt < LIMITS.verifyCodeResendCooldownMs) {
-      const waitMs = LIMITS.verifyCodeResendCooldownMs - (Date.now() - existing.lastSentAt);
-      return res.status(429).json({ error: `Attends ${Math.ceil(waitMs / 1000)}s avant de redemander un code.` });
-    }
-
-    const code = generateOtpCode();
-    pendingCodes.set(key, {
-      code,
-      expiresAt: Date.now() + LIMITS.verifyCodeTtlMs,
-      attempts: 0,
-      lastSentAt: Date.now()
-    });
-
-    if (channel === 'email') await sendEmailCode(value, code);
-    else await sendSmsCode(value, code);
-
-    return res.json({ success: true, message: 'Code envoyé.' });
-  } catch (err) {
-    logError('Erreur /api/verify/send-code :', err);
-    res.status(500).json({ error: "Erreur serveur lors de l'envoi du code." });
-  }
-});
-
-app.post('/api/verify/confirm-code', authRateLimitMiddleware, (req, res) => {
-  try {
-    const channel = req.body?.channel;
-    let value = req.body?.value;
-    const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
-    if (channel !== 'email' && channel !== 'phone') {
-      return res.status(400).json({ error: 'Canal invalide.' });
-    }
-    value = channel === 'email' ? normalizeEmail(value) : normalizePhone(value);
-    const key = contactKey(channel, value);
-    const pending = pendingCodes.get(key);
-
-    if (!pending || pending.expiresAt < Date.now()) {
-      pendingCodes.delete(key);
-      return res.status(400).json({ error: 'Code expiré ou introuvable, redemande un code.' });
-    }
-    if (pending.attempts >= LIMITS.verifyCodeMaxAttempts) {
-      pendingCodes.delete(key);
-      return res.status(429).json({ error: 'Trop de tentatives, redemande un code.' });
-    }
-    pending.attempts++;
-    if (!code || code !== pending.code) {
-      return res.status(400).json({ error: 'Code incorrect.' });
-    }
-
-    pendingCodes.delete(key);
-    verifiedContacts.set(key, { expiresAt: Date.now() + LIMITS.verifiedContactTtlMs });
-
-    return res.json({ success: true, message: 'Vérifié.' });
-  } catch (err) {
-    logError('Erreur /api/verify/confirm-code :', err);
-    res.status(500).json({ error: 'Erreur serveur lors de la vérification.' });
-  }
-});
-
 app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
   try {
-    const { username, password, publicKey, customNullId, email: rawEmail, phone: rawPhone } = req.body || {};
+    const { username, password, publicKey, customNullId } = req.body || {};
     const cleanUsername = typeof username === 'string' ? username.trim() : '';
 
     if (!isValidUsername(cleanUsername)) {
@@ -824,44 +654,12 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
       nullId = generateNullId();
     }
 
-    // Email et/ou téléphone : optionnels dans l'absolu, mais s'ils sont
-    // fournis ils doivent avoir été vérifiés juste avant via
-    // /api/verify/send-code puis /api/verify/confirm-code (on ne fait
-    // jamais confiance à une valeur email/phone non prouvée par un code).
-    let cleanEmail = null;
-    let cleanPhone = null;
-    if (rawEmail) {
-      cleanEmail = normalizeEmail(rawEmail);
-      if (!isValidEmail(cleanEmail)) return res.status(400).json({ error: 'Email invalide.' });
-      if (emailToUser.has(cleanEmail)) return res.status(409).json({ error: 'Cet email est déjà utilisé par un compte.' });
-      const v = verifiedContacts.get(contactKey('email', cleanEmail));
-      if (!v || v.expiresAt < Date.now()) {
-        return res.status(400).json({ error: "Cet email n'a pas été vérifié (ou la vérification a expiré), redemande un code." });
-      }
-    }
-    if (rawPhone) {
-      cleanPhone = normalizePhone(rawPhone);
-      if (!isValidPhone(cleanPhone)) return res.status(400).json({ error: 'Numéro de téléphone invalide.' });
-      if (phoneToUser.has(cleanPhone)) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un compte.' });
-      const v = verifiedContacts.get(contactKey('phone', cleanPhone));
-      if (!v || v.expiresAt < Date.now()) {
-        return res.status(400).json({ error: "Ce numéro n'a pas été vérifié (ou la vérification a expiré), redemande un code." });
-      }
-    }
-    // On exige au moins un des deux (utile plus tard pour la récupération de
-    // compte). Retire ce bloc si tu veux que ça reste 100% facultatif.
-    if (!cleanEmail && !cleanPhone) {
-      return res.status(400).json({ error: 'Ajoute et vérifie un email ou un numéro de téléphone.' });
-    }
-
     const passwordHash = await bcrypt.hash(password, 12);
 
     const newUser = {
       username: cleanUsername,
       passwordHash,
       nullId,
-      email: cleanEmail,
-      phone: cleanPhone,
       publicKey: publicKey || null,
       avatarDataUrl: null,
       nameFont: 'none',
@@ -876,20 +674,10 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
     users.set(cleanUsername.toLowerCase(), newUser);
     nullIdToUser.set(nullId, cleanUsername);
     friends.set(nullId, new Set());
-    if (cleanEmail) {
-      emailToUser.set(cleanEmail, cleanUsername);
-      verifiedContacts.delete(contactKey('email', cleanEmail));
-    }
-    if (cleanPhone) {
-      phoneToUser.set(cleanPhone, cleanUsername);
-      verifiedContacts.delete(contactKey('phone', cleanPhone));
-    }
     db.createUser({
       username: newUser.username,
       passwordHash: newUser.passwordHash,
       nullId: newUser.nullId,
-      email: newUser.email,
-      phone: newUser.phone,
       publicKey: newUser.publicKey,
       avatarDataUrl: newUser.avatarDataUrl
     });
@@ -1781,7 +1569,10 @@ io.on('connection', (socket) => {
     if (!isValidMeta(data.mime, LIMITS.mimeMax) || !isValidMeta(data.filename, LIMITS.filenameMax)) return;
     if (!areFriends(nullId, targetNullId) || isBlocked(nullId, targetNullId)) return;
 
-    const messageId = crypto.randomUUID();
+    // Le client génère son propre id de message (pour pouvoir ensuite réagir/
+    // répondre/supprimer SON PROPRE message, puisqu'il ne reçoit jamais d'écho
+    // de son propre envoi). On valide juste le format, jamais son contenu.
+    const messageId = isNonEmptyString(data.messageId, 100) ? data.messageId : crypto.randomUUID();
     const payload = {
       messageId,
       senderNullId: nullId,
@@ -2011,7 +1802,7 @@ io.on('connection', (socket) => {
       return socket.emit('server:error', { message: 'Salon introuvable ou non textuel.' });
     }
 
-    const messageId = crypto.randomUUID();
+    const messageId = isNonEmptyString(data.messageId, 100) ? data.messageId : crypto.randomUUID();
     data.targets.slice(0, LIMITS.serverMaxMembers).forEach(t => {
       if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
       const target = connectedSockets.get(t.targetId);
@@ -2411,7 +2202,7 @@ io.on('connection', (socket) => {
     if (!Array.isArray(data.targets)) return;
     if (!isValidMeta(data.mime, LIMITS.mimeMax) || !isValidMeta(data.filename, LIMITS.filenameMax)) return;
 
-    const messageId = crypto.randomUUID();
+    const messageId = isNonEmptyString(data.messageId, 100) ? data.messageId : crypto.randomUUID();
     data.targets.slice(0, LIMITS.groupMaxMembers).forEach(t => {
       if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
       const target = connectedSockets.get(t.targetId);
@@ -2522,29 +2313,22 @@ io.on('connection', (socket) => {
   // On ne fait donc jamais confiance qu'au nullId issu du socket authentifié
   // et à OWNER_NULLIDS défini côté serveur (variable d'environnement).
   socket.on('app:ban_user', safeHandler(socket, (data = {}) => {
-    // Owner ET Co-Owner ont les mêmes droits de modération globale (voir
-    // isAppOwnerOrCoOwner / COOWNER_NULLIDS plus haut) : c'est là qu'était
-    // le bug — cette vérification ne testait auparavant que isAppOwner(),
-    // donc un co-owner voyait le bouton côté client mais n'avait jamais le
-    // droit réel côté serveur, et son clic ne bannissait donc jamais rien.
-    if (!isAppOwnerOrCoOwner(nullId)) {
+    if (!isAppOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
-    if (isAppOwnerOrCoOwner(targetNullId)) {
-      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner/co-owner de l’app.' });
+    if (isAppOwner(targetNullId)) {
+      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner de l’app.' });
     }
 
     const targetUsername = nullIdToUser.get(targetNullId) || null;
     const banReason = typeof data.reason === 'string' ? data.reason.slice(0, 300) : null;
-    const bannedByRole = appRoleLabel(nullId); // 'Owner' ou 'Co-Owner', affiché au banni
     appBannedUsers.set(targetNullId, {
       nullId: targetNullId,
       username: targetUsername,
       reason: banReason,
-      bannedAt: Date.now(),
-      bannedByRole
+      bannedAt: Date.now()
     });
     db.addAppBan(targetNullId, targetUsername, banReason);
 
@@ -2555,7 +2339,7 @@ io.on('connection', (socket) => {
       if (info.nullId !== targetNullId) continue;
       const targetSocket = io.sockets.sockets.get(sockId);
       if (!targetSocket) continue;
-      targetSocket.emit('app:user_banned', { reason: data.reason || null, bannedByRole });
+      targetSocket.emit('app:user_banned', { reason: data.reason || null });
       targetSocket.disconnect(true);
     }
     if (targetUsername) {
@@ -2563,22 +2347,22 @@ io.on('connection', (socket) => {
       if (tokens) for (const t of [...tokens]) revokeToken(t);
     }
 
-    log('Compte banni de l’app par', appRoleOf(nullId), nullId, ':', targetNullId);
+    log('Compte banni de l’app par', nullId, ':', targetNullId);
   }));
 
   socket.on('app:unban_user', safeHandler(socket, (data = {}) => {
-    if (!isAppOwnerOrCoOwner(nullId)) {
+    if (!isAppOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
     appBannedUsers.delete(targetNullId);
     db.removeAppBan(targetNullId);
-    log('Compte débanni de l’app par', appRoleOf(nullId), nullId, ':', targetNullId);
+    log('Compte débanni de l’app par', nullId, ':', targetNullId);
   }));
 
   socket.on('app:list_banned', safeHandler(socket, () => {
-    if (!isAppOwnerOrCoOwner(nullId)) {
+    if (!isAppOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     socket.emit('app:banned_users', { users: [...appBannedUsers.values()] });
