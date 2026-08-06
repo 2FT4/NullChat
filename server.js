@@ -5,7 +5,6 @@ const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 const db = require('./db');
 
 // ==========================================
@@ -53,46 +52,87 @@ if (process.env.TURN_URL) {
 }
 
 // ==========================================
-// VÉRIFICATION D'E-MAIL (inscription)
+// ANTI-BOT (code à recopier) + LIMITE DE COMPTES PAR IP
 // ==========================================
-// ⚠️ Idéalement ces deux valeurs devraient vivre UNIQUEMENT dans des variables
-// d'environnement (EMAIL_USER / EMAIL_PASS), jamais commitées en clair dans le
-// code source — surtout si ce dépôt est/devient public. Ici on les met en
-// valeur par défaut comme demandé, mais process.env garde la priorité si défini,
-// pour permettre de changer/révoquer ce mot de passe d'application sans toucher au code.
-const EMAIL_USER = process.env.EMAIL_USER || 'ethaneachour@gmail.com';
-const EMAIL_PASS = process.env.EMAIL_PASS || 'kjmjwpjybblcserc';
-const mailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: { user: EMAIL_USER, pass: EMAIL_PASS }
-});
-mailTransporter.verify((err) => {
-  if (err) console.warn('⚠️ Envoi d\u2019e-mails indisponible (SMTP) :', err.message);
-  else log('✅ SMTP prêt pour l\u2019envoi des codes de vérification.');
-});
+// Remplace l'ancienne vérification par e-mail/SMS (jamais branchée côté
+// serveur, formulaire mort côté client) par deux protections plus simples
+// et réellement actives :
+//   1. Un petit code affiché à l'écran que l'utilisateur doit recopier
+//      avant de pouvoir se connecter/s'inscrire (freine les scripts basiques
+//      qui appellent /api/login ou /api/register directement sans jamais
+//      charger la page).
+//   2. Une limite du nombre de comptes qui peuvent être créés depuis une
+//      même adresse IP (anti multi-comptes).
+const MAX_ACCOUNTS_PER_IP = Number(process.env.MAX_ACCOUNTS_PER_IP || 2);
+const CAPTCHA_TTL_MS = 5 * 60 * 1000;     // un code affiché est valable 5 min
+const CAPTCHA_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sans caractères ambigus (0/O, 1/I...)
+const CAPTCHA_LENGTH = 5;
 
-const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;       // un code envoyé est valable 10 min
-const EMAIL_CODE_RESEND_COOLDOWN_MS = 45 * 1000; // 45s avant de pouvoir renvoyer un code au même e-mail
-const EMAIL_CODE_MAX_ATTEMPTS = 5;               // 5 essais de code avant qu'il faille en redemander un
-const VERIFIED_TOKEN_TTL_MS = 15 * 60 * 1000;    // 15 min pour finaliser l'inscription après vérification
+// captchaId -> { code, expiresAt }
+const authCaptchas = new Map();
 
-// email (en minuscules) -> { code, expiresAt, attempts, lastSentAt }
-const pendingEmailVerifications = new Map();
-// token -> { email, expiresAt } — preuve qu'un e-mail vient d'être vérifié, à
-// présenter à /api/register (courte durée de vie, usage unique).
-const verifiedEmailTokens = new Map();
-// email (en minuscules) -> username, pour empêcher deux comptes sur le même e-mail
-const emailToUser = new Map();
+function generateCaptchaCode() {
+  let out = '';
+  for (let i = 0; i < CAPTCHA_LENGTH; i++) {
+    out += CAPTCHA_CHARS[crypto.randomInt(CAPTCHA_CHARS.length)];
+  }
+  return out;
+}
+
+function checkAndConsumeCaptcha(captchaId, userInput) {
+  if (!captchaId || typeof captchaId !== 'string') return false;
+  const entry = authCaptchas.get(captchaId);
+  // Toujours retirer l'entrée : un code ne sert qu'une seule fois, qu'il
+  // soit correct ou non (évite le brute-force sur un même captchaId).
+  authCaptchas.delete(captchaId);
+  if (!entry || entry.expiresAt <= Date.now()) return false;
+  const clean = typeof userInput === 'string' ? userInput.trim().toUpperCase() : '';
+  return clean === entry.code;
+}
 
 setInterval(() => {
   const now = Date.now();
-  for (const [email, entry] of pendingEmailVerifications.entries()) {
-    if (entry.expiresAt <= now) pendingEmailVerifications.delete(email);
-  }
-  for (const [token, entry] of verifiedEmailTokens.entries()) {
-    if (entry.expiresAt <= now) verifiedEmailTokens.delete(token);
+  for (const [id, entry] of authCaptchas.entries()) {
+    if (entry.expiresAt <= now) authCaptchas.delete(id);
   }
 }, 60 * 1000).unref();
+
+// ip -> Set<username en minuscules> — comptes déjà créés depuis cette IP.
+const ipAccounts = new Map();
+const IP_ACCOUNTS_FILE = path.join(__dirname, 'data', 'ip_accounts.json');
+
+function loadIpAccountsFromDisk() {
+  try {
+    if (!fs.existsSync(IP_ACCOUNTS_FILE)) return;
+    const raw = fs.readFileSync(IP_ACCOUNTS_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object') return;
+    for (const [ip, usernames] of Object.entries(obj)) {
+      if (Array.isArray(usernames)) ipAccounts.set(ip, new Set(usernames));
+    }
+    log(`Comptes par IP rechargés depuis le disque : ${ipAccounts.size} IP(s) connue(s).`);
+  } catch (e) {
+    logError('Erreur chargement ip_accounts.json :', e);
+  }
+}
+loadIpAccountsFromDisk();
+
+let saveIpAccountsTimer = null;
+function saveIpAccountsToDisk() {
+  if (saveIpAccountsTimer) return;
+  saveIpAccountsTimer = setTimeout(() => {
+    saveIpAccountsTimer = null;
+    try {
+      const dir = path.dirname(IP_ACCOUNTS_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const obj = {};
+      for (const [ip, usernames] of ipAccounts.entries()) obj[ip] = [...usernames];
+      fs.writeFileSync(IP_ACCOUNTS_FILE, JSON.stringify(obj), 'utf8');
+    } catch (e) {
+      logError('Erreur sauvegarde ip_accounts.json :', e);
+    }
+  }, 500);
+}
 
 const LIMITS = {
   usernameMin: 3,
@@ -147,8 +187,6 @@ const LIMITS = {
   hexColorRegex: /^#[0-9a-fA-F]{6}$/,
   profilePresets: new Set(['crimson', 'sunset', 'ocean', 'purple', 'forest', 'candy', 'midnight', 'gold']),
   bannerMaxDataUrlLength: 400 * 1024,
-  emailMax: 254,
-  verificationCodeLength: 6,
 };
 
 const app = express();
@@ -470,20 +508,6 @@ function isValidUsername(username) {
   );
 }
 
-// Validation volontairement simple (format général), la vérification réelle
-// de l'adresse se fait en lui envoyant un code à 6 chiffres qu'il faut saisir.
-function isValidEmail(email) {
-  return (
-    typeof email === 'string' &&
-    email.length > 0 &&
-    email.length <= LIMITS.emailMax &&
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-  );
-}
-function normalizeEmail(email) {
-  return typeof email === 'string' ? email.trim().toLowerCase() : '';
-}
-
 function isValidPassword(password) {
   if (
     typeof password !== 'string' ||
@@ -611,9 +635,32 @@ function requireAuth(req, res, next) {
 // ROUTES HTTP (API AUTH & MEDIAS)
 // ==========================================
 
+// Génère un petit code à afficher côté client, que l'utilisateur doit
+// recopier avant de pouvoir se connecter ou s'inscrire. Appelée au
+// chargement de l'écran de connexion et à chaque échec/bascule de mode.
+app.get('/api/auth/captcha', (req, res) => {
+  const captchaId = generateRandomToken();
+  const code = generateCaptchaCode();
+  authCaptchas.set(captchaId, { code, expiresAt: Date.now() + CAPTCHA_TTL_MS });
+  res.json({ captchaId, code });
+});
+
 app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
   try {
-    const { username, password, publicKey, customNullId } = req.body || {};
+    const { username, password, publicKey, customNullId, captchaId, captchaInput } = req.body || {};
+
+    if (!checkAndConsumeCaptcha(captchaId, captchaInput)) {
+      return res.status(400).json({ error: 'Code de vérification incorrect ou expiré.' });
+    }
+
+    const ip = clientIp(req);
+    const existingForIp = ipAccounts.get(ip);
+    if (existingForIp && existingForIp.size >= MAX_ACCOUNTS_PER_IP) {
+      return res.status(403).json({
+        error: `Limite de ${MAX_ACCOUNTS_PER_IP} comptes atteinte pour cette adresse IP.`
+      });
+    }
+
     const cleanUsername = typeof username === 'string' ? username.trim() : '';
 
     if (!isValidUsername(cleanUsername)) {
@@ -697,7 +744,11 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
     usernameToTokens.get(usernameKey).add(token);
     saveSessionsToDisk();
 
-    log('Nouveau compte créé :', cleanUsername, nullId);
+    if (!ipAccounts.has(ip)) ipAccounts.set(ip, new Set());
+    ipAccounts.get(ip).add(usernameKey);
+    saveIpAccountsToDisk();
+
+    log('Nouveau compte créé :', cleanUsername, nullId, '(IP:', ip + ')');
     return res.status(201).json({
       success: true,
       message: 'Compte créé avec succès !',
@@ -713,7 +764,12 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
 
 app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
   try {
-    const { username, password } = req.body || {};
+    const { username, password, captchaId, captchaInput } = req.body || {};
+
+    if (!checkAndConsumeCaptcha(captchaId, captchaInput)) {
+      return res.status(400).json({ error: 'Code de vérification incorrect ou expiré.' });
+    }
+
     if (!isNonEmptyString(username, LIMITS.usernameMax) || !isNonEmptyString(password, LIMITS.passwordMax)) {
       return res.status(400).json({ error: 'Identifiants invalides.' });
     }
