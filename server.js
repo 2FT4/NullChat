@@ -1,3 +1,5 @@
+try { require('dotenv').config(); } catch (e) { /* dotenv optionnel : si absent, on utilise les vraies variables d'env */ }
+
 const express = require('express');
 const http = require('http');
 const fs = require('fs');
@@ -5,6 +7,7 @@ const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 const db = require('./db');
 
 // ==========================================
@@ -49,6 +52,98 @@ if (process.env.TURN_URL) {
     username: process.env.TURN_USERNAME || undefined,
     credential: process.env.TURN_CREDENTIAL || undefined
   });
+}
+
+// ==========================================
+// 2FA PAR E-MAIL (code à 6 chiffres à la connexion)
+// ==========================================
+// Identifiants du compte Gmail utilisé pour ENVOYER les codes, lus depuis
+// des variables d'environnement (fichier .env, jamais commité). Ne jamais
+// mettre ces valeurs en dur ici : ce fichier peut être partagé/déployé.
+const EMAIL_USER = process.env.EMAIL_USER || '';
+const EMAIL_PASS = process.env.EMAIL_PASS || '';
+
+let mailTransporter = null;
+if (EMAIL_USER && EMAIL_PASS) {
+  mailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+  });
+} else {
+  console.warn('⚠️ EMAIL_USER/EMAIL_PASS non définis (.env manquant ?) : la vérification par e-mail (2FA) est désactivée, les connexions se feront sans code.');
+}
+
+const TWOFA_TTL_MS = 10 * 60 * 1000;     // un code envoyé par mail est valable 10 min
+const TWOFA_CODE_LENGTH = 6;
+const TWOFA_MAX_ATTEMPTS = 5;            // tentatives de saisie max avant expiration forcée
+
+// pendingId -> { usernameKey, code, expiresAt, attempts, userAgent }
+const pending2FALogins = new Map();
+
+function generateTwoFactorCode() {
+  return String(crypto.randomInt(0, 1000000)).padStart(TWOFA_CODE_LENGTH, '0');
+}
+
+async function sendTwoFactorEmail(toEmail, code) {
+  if (!mailTransporter) throw new Error('Service mail non configuré.');
+  await mailTransporter.sendMail({
+    from: `"NullChat" <${EMAIL_USER}>`,
+    to: toEmail,
+    subject: 'Ton code de vérification NullChat',
+    text: `Ton code de vérification NullChat est : ${code}\nIl expire dans 10 minutes.\nSi tu n'es pas à l'origine de cette connexion, ignore cet e-mail.`,
+    html: `<div style="font-family:sans-serif;background:#0c0c0f;color:#f2f2f2;padding:24px;border-radius:12px;">
+      <h2 style="margin:0 0 12px;">NullChat</h2>
+      <p style="margin:0 0 16px;">Voici ton code de vérification :</p>
+      <p style="font-size:32px;font-weight:800;letter-spacing:8px;margin:0 0 16px;">${code}</p>
+      <p style="margin:0;color:#999;font-size:13px;">Il expire dans 10 minutes. Si tu n'es pas à l'origine de cette connexion, ignore simplement cet e-mail.</p>
+    </div>`
+  });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of pending2FALogins.entries()) {
+    if (entry.expiresAt <= now) pending2FALogins.delete(id);
+  }
+}, 60 * 1000).unref();
+
+function isValidEmail(email) {
+  return typeof email === 'string' && email.trim().length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+// usernameKey (minuscules) -> email. Stocké séparément de `users`/db.js
+// (dont je n'ai pas le schéma) et persisté sur disque comme ipAccounts.
+const userEmails = new Map();
+const USER_EMAILS_FILE = path.join(__dirname, 'data', 'user_emails.json');
+
+function loadUserEmailsFromDisk() {
+  try {
+    if (!fs.existsSync(USER_EMAILS_FILE)) return;
+    const raw = fs.readFileSync(USER_EMAILS_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object') return;
+    for (const [u, email] of Object.entries(obj)) userEmails.set(u, email);
+    log(`E-mails utilisateurs rechargés depuis le disque : ${userEmails.size} compte(s).`);
+  } catch (e) {
+    logError('Erreur chargement user_emails.json :', e);
+  }
+}
+
+let saveUserEmailsTimer = null;
+function saveUserEmailsToDisk() {
+  if (saveUserEmailsTimer) return;
+  saveUserEmailsTimer = setTimeout(() => {
+    saveUserEmailsTimer = null;
+    try {
+      const dir = path.dirname(USER_EMAILS_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const obj = {};
+      for (const [u, email] of userEmails.entries()) obj[u] = email;
+      fs.writeFileSync(USER_EMAILS_FILE, JSON.stringify(obj), 'utf8');
+    } catch (e) {
+      logError('Erreur sauvegarde user_emails.json :', e);
+    }
+  }, 500);
 }
 
 // ==========================================
@@ -116,6 +211,7 @@ function loadIpAccountsFromDisk() {
   }
 }
 loadIpAccountsFromDisk();
+loadUserEmailsFromDisk();
 
 let saveIpAccountsTimer = null;
 function saveIpAccountsToDisk() {
@@ -647,10 +743,20 @@ app.get('/api/auth/captcha', (req, res) => {
 
 app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
   try {
-    const { username, password, publicKey, customNullId, captchaId, captchaInput } = req.body || {};
+    const { username, password, email, publicKey, customNullId, captchaId, captchaInput } = req.body || {};
 
     if (!checkAndConsumeCaptcha(captchaId, captchaInput)) {
       return res.status(400).json({ error: 'Code de vérification incorrect ou expiré.' });
+    }
+
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({ error: 'Adresse e-mail invalide.' });
+    }
+    for (const existingEmail of userEmails.values()) {
+      if (existingEmail === cleanEmail) {
+        return res.status(409).json({ error: 'Cette adresse e-mail est déjà utilisée.' });
+      }
     }
 
     const ip = clientIp(req);
@@ -719,6 +825,8 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
     };
 
     users.set(cleanUsername.toLowerCase(), newUser);
+    userEmails.set(cleanUsername.toLowerCase(), cleanEmail);
+    saveUserEmailsToDisk();
     nullIdToUser.set(nullId, cleanUsername);
     friends.set(nullId, new Set());
     db.createUser({
@@ -794,6 +902,34 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
       return res.status(401).json({ error: 'Identifiants invalides.' });
     }
 
+    // 2FA par e-mail : si le compte a un e-mail enregistré et que le service
+    // mail est configuré, on n'ouvre PAS de session tout de suite. On envoie
+    // un code à 6 chiffres et on attend /api/login/verify-2fa. Les comptes
+    // créés avant l'ajout de cette fonctionnalité (pas d'e-mail enregistré)
+    // continuent de se connecter directement, pour ne rien casser.
+    const userEmail = userEmails.get(usernameKey);
+    if (userEmail && mailTransporter) {
+      const pendingId = generateRandomToken();
+      const code = generateTwoFactorCode();
+      pending2FALogins.set(pendingId, {
+        usernameKey,
+        code,
+        expiresAt: Date.now() + TWOFA_TTL_MS,
+        attempts: 0,
+        userAgent: (req.headers['user-agent'] || '').slice(0, 200)
+      });
+      try {
+        await sendTwoFactorEmail(userEmail, code);
+      } catch (e) {
+        pending2FALogins.delete(pendingId);
+        logError('Erreur envoi e-mail 2FA :', e);
+        return res.status(502).json({ error: "Impossible d'envoyer le code de vérification, réessaie." });
+      }
+      const emailHint = userEmail.replace(/^(.{1,2}).*(@.+)$/, (m, a, b) => a + '***' + b);
+      log('Code 2FA envoyé à', usernameKey, '(' + emailHint + ')');
+      return res.json({ twoFactorRequired: true, pendingId, emailHint });
+    }
+
     const token = generateRandomToken();
     activeTokens.set(token, {
       username: user.username,
@@ -826,6 +962,82 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
   } catch (err) {
     logError('Erreur /api/login :', err);
     res.status(500).json({ error: 'Erreur serveur lors de la connexion.' });
+  }
+});
+
+// Deuxième étape de la connexion : vérifie le code reçu par e-mail et,
+// seulement à ce moment-là, ouvre réellement la session (même format de
+// réponse que /api/login pour que le client n'ait rien à distinguer).
+const twoFactorVerifyRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30 });
+
+app.post('/api/login/verify-2fa', async (req, res) => {
+  try {
+    if (!twoFactorVerifyRateLimit(clientIp(req))) {
+      return res.status(429).json({ error: 'Trop de tentatives, réessaie dans quelques minutes.' });
+    }
+
+    const { pendingId, code } = req.body || {};
+    if (!isNonEmptyString(pendingId, 200) || !isNonEmptyString(code, 10)) {
+      return res.status(400).json({ error: 'Requête invalide.' });
+    }
+
+    const entry = pending2FALogins.get(pendingId);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      pending2FALogins.delete(pendingId);
+      return res.status(400).json({ error: 'Code expiré, reconnecte-toi.' });
+    }
+
+    entry.attempts++;
+    if (entry.attempts > TWOFA_MAX_ATTEMPTS) {
+      pending2FALogins.delete(pendingId);
+      return res.status(429).json({ error: 'Trop de tentatives, reconnecte-toi.' });
+    }
+
+    if (String(code).trim() !== entry.code) {
+      return res.status(400).json({ error: 'Code incorrect.' });
+    }
+
+    pending2FALogins.delete(pendingId);
+
+    const usernameKey = entry.usernameKey;
+    const user = users.get(usernameKey);
+    if (!user) return res.status(401).json({ error: 'Compte introuvable.' });
+    if (appBannedUsers.has(user.nullId)) {
+      return res.status(403).json({ error: 'Ce compte est banni de NullChat.' });
+    }
+
+    const token = generateRandomToken();
+    activeTokens.set(token, {
+      username: user.username,
+      nullId: user.nullId,
+      expiresAt: Date.now() + TOKEN_TTL_MS,
+      createdAt: Date.now(),
+      userAgent: entry.userAgent
+    });
+    if (!usernameToTokens.has(usernameKey)) usernameToTokens.set(usernameKey, new Set());
+    usernameToTokens.get(usernameKey).add(token);
+
+    const tokensForUser = usernameToTokens.get(usernameKey);
+    if (tokensForUser.size > MAX_SESSIONS_PER_USER) {
+      const oldestFirst = [...tokensForUser]
+        .map(t => ({ t, createdAt: activeTokens.get(t)?.createdAt || 0 }))
+        .sort((a, b) => a.createdAt - b.createdAt);
+      oldestFirst
+        .slice(0, tokensForUser.size - MAX_SESSIONS_PER_USER)
+        .forEach(({ t }) => revokeToken(t));
+    }
+    saveSessionsToDisk();
+
+    return res.json({
+      success: true,
+      token,
+      nullId: user.nullId,
+      username: user.username,
+      avatarDataUrl: user.avatarDataUrl || null
+    });
+  } catch (err) {
+    logError('Erreur /api/login/verify-2fa :', err);
+    res.status(500).json({ error: 'Erreur serveur lors de la vérification.' });
   }
 });
 

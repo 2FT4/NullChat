@@ -47,6 +47,14 @@
   --- Identité ---
   - /api/login et /api/register doivent renvoyer un champ `nullId`
     (identifiant unique et stable de l'utilisateur, ex: "A3F9-72CD").
+  - [NOUVEAU] 2FA par e-mail : /api/register prend désormais un champ `email`
+    obligatoire. /api/login, si un e-mail est enregistré pour le compte, ne
+    renvoie plus directement `token` : il renvoie
+    { twoFactorRequired: true, pendingId, emailHint } après avoir envoyé un
+    code à 6 chiffres par e-mail. Le client doit alors appeler
+    POST /api/login/verify-2fa avec { pendingId, code } pour recevoir enfin
+    { token, nullId, username, avatarDataUrl } (même forme que l'ancien
+    /api/login réussi).
 
   --- Émis par le client, à écouter côté serveur ---
   - "friend:request"      { targetNullId }
@@ -1220,9 +1228,20 @@ input:disabled{ opacity:.5; }
       <label for="authPassword">Mot de passe</label>
       <input type="password" id="authPassword" placeholder="••••••••" autocomplete="current-password">
     </div>
+    <div class="input-group" id="authEmailGroup" style="display:none;">
+      <label for="authEmail">Adresse e-mail</label>
+      <input type="email" id="authEmail" placeholder="ton@email.com" maxlength="254" autocomplete="email">
+      <div style="font-size:12px; opacity:.6; margin-top:4px;">Un code de vérification y sera envoyé à chaque connexion.</div>
+    </div>
+
     <div class="input-group" id="authNullIdGroup" style="display:none;">
       <label for="authNullId">NULLID personnalisé (optionnel)</label>
       <input type="text" id="authNullId" placeholder="ex: ZIUX ou AB12-9F3D" maxlength="16" style="text-transform:uppercase;">
+    </div>
+
+    <div class="input-group" id="auth2FAGroup" style="display:none;">
+      <label for="auth2FACode">Code reçu par e-mail</label>
+      <input type="text" id="auth2FACode" placeholder="123456" maxlength="6" inputmode="numeric" autocomplete="one-time-code" style="letter-spacing:6px; text-align:center; font-weight:700; font-size:18px;">
     </div>
 
     <div class="input-group" id="authCaptchaGroup">
@@ -1237,8 +1256,9 @@ input:disabled{ opacity:.5; }
 
     <div class="error-text" id="authError"></div>
 
-    <button class="btn-auth fx-btn" onclick="handleAuth()" id="authBtn">Se connecter</button>
+    <button class="btn-auth fx-btn" onclick="handleAuthOrVerify()" id="authBtn">Se connecter</button>
     <span class="switch-link" onclick="toggleAuthMode()" id="toggleLink">Besoin d'un compte ? S'inscrire</span>
+    <span class="switch-link" onclick="exitTwoFactorMode()" id="back2FALink" style="display:none;">← Retour</span>
   </div>
 </div>
 
@@ -2724,6 +2744,10 @@ async function loadAuthCaptcha(){
   }
 }
 
+// Identifiant de la vérification 2FA en attente (renvoyé par /api/login
+// quand le compte a un e-mail enregistré). null = pas de 2FA en cours.
+let pending2FAId = null;
+
 function toggleAuthMode(){
   isLoginMode = !isLoginMode;
   setAuthError('');
@@ -2732,13 +2756,91 @@ function toggleAuthMode(){
   document.getElementById('authBtn').innerText = isLoginMode ? 'Se connecter' : "S'inscrire";
   document.getElementById('toggleLink').innerText = isLoginMode ? "Besoin d'un compte ? S'inscrire" : 'Déjà un compte ? Se connecter';
   document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
+  document.getElementById('authEmailGroup').style.display = isLoginMode ? 'none' : 'block';
   loadAuthCaptcha();
 }
 
 function setAuthLoading(loading){
   const btn = document.getElementById('authBtn');
   btn.disabled = loading;
-  btn.innerText = loading ? '...' : (isLoginMode ? 'Se connecter' : "S'inscrire");
+  if (loading){ btn.innerText = '...'; return; }
+  btn.innerText = pending2FAId ? 'Vérifier' : (isLoginMode ? 'Se connecter' : "S'inscrire");
+}
+
+// Appelée par le bouton principal : redirige vers la vérification du code
+// si une 2FA est en attente, sinon vers le login/inscription classique.
+function handleAuthOrVerify(){
+  return pending2FAId ? verifyTwoFactor() : handleAuth();
+}
+
+function enterTwoFactorMode(pendingId, emailHint){
+  pending2FAId = pendingId;
+  setAuthError('');
+  document.getElementById('authTitle').innerText = 'Vérification';
+  document.getElementById('authSubtitle').innerText = emailHint
+    ? `Entre le code envoyé à ${emailHint}`
+    : 'Entre le code reçu par e-mail';
+  document.getElementById('authUsername').closest('.input-group').style.display = 'none';
+  document.getElementById('authPassword').closest('.input-group').style.display = 'none';
+  document.getElementById('authEmailGroup').style.display = 'none';
+  document.getElementById('authNullIdGroup').style.display = 'none';
+  document.getElementById('authCaptchaGroup').style.display = 'none';
+  document.getElementById('auth2FAGroup').style.display = 'block';
+  document.getElementById('toggleLink').style.display = 'none';
+  document.getElementById('back2FALink').style.display = 'inline';
+  document.getElementById('auth2FACode').value = '';
+  setAuthLoading(false);
+  document.getElementById('auth2FACode').focus();
+}
+
+function exitTwoFactorMode(){
+  pending2FAId = null;
+  setAuthError('');
+  document.getElementById('auth2FAGroup').style.display = 'none';
+  document.getElementById('authUsername').closest('.input-group').style.display = 'block';
+  document.getElementById('authPassword').closest('.input-group').style.display = 'block';
+  document.getElementById('authEmailGroup').style.display = isLoginMode ? 'none' : 'block';
+  document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
+  document.getElementById('authCaptchaGroup').style.display = 'block';
+  document.getElementById('toggleLink').style.display = 'inline';
+  document.getElementById('back2FALink').style.display = 'none';
+  document.getElementById('authTitle').innerText = isLoginMode ? 'Bienvenue !' : 'Créer un compte';
+  document.getElementById('authSubtitle').innerText = isLoginMode ? 'Nous sommes ravis de vous revoir !' : 'Rejoins NullChat dès maintenant.';
+  setAuthLoading(false);
+  loadAuthCaptcha();
+}
+
+async function verifyTwoFactor(){
+  const code = document.getElementById('auth2FACode').value.trim();
+  setAuthError('');
+  if (!code) return setAuthError('Entre le code reçu par e-mail.');
+
+  setAuthLoading(true);
+  try{
+    const res = await fetch('/api/login/verify-2fa', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ pendingId: pending2FAId, code })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return setAuthError(data.error || 'Code incorrect.');
+
+    const username = document.getElementById('authUsername').value.trim();
+    currentUser = username;
+    myNullId = data.nullId || null;
+    myAvatarDataUrl = data.avatarDataUrl || null;
+    if (myNullId) saveOwnAvatarLocally(myAvatarDataUrl);
+    loadBlockedIds();
+    authToken = data.token || null;
+    saveSession();
+    checkFirstLoginTutorial(username);
+    pending2FAId = null;
+    startApp();
+  } catch(err){
+    console.error(err);
+    setAuthError('Erreur réseau, réessaie.');
+  } finally {
+    setAuthLoading(false);
+  }
 }
 
 async function handleAuth(){
@@ -2751,13 +2853,26 @@ async function handleAuth(){
 
   setAuthLoading(true);
   try{
+    const captchaInput = document.getElementById('authCaptchaInput').value.trim().toUpperCase();
+    if (!captchaInput){
+      setAuthLoading(false);
+      return setAuthError('Recopie le code de vérification.');
+    }
+
     if (isLoginMode){
       const res = await fetch('/api/login', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username, password, captchaId: currentCaptchaId, captchaInput })
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) return setAuthError(data.error || 'Connexion impossible.');
+      if (!res.ok){
+        loadAuthCaptcha();
+        return setAuthError(data.error || 'Connexion impossible.');
+      }
+
+      if (data.twoFactorRequired){
+        return enterTwoFactorMode(data.pendingId, data.emailHint);
+      }
 
       currentUser = username;
       myNullId = data.nullId || null;
@@ -2778,16 +2893,26 @@ async function handleAuth(){
         setAuthLoading(false);
         return setAuthError('NULLID invalide (3 à 16 caractères, lettres/chiffres, tiret(s) au milieu autorisé(s)).');
       }
+      const email = document.getElementById('authEmail').value.trim();
+      if (!email){
+        setAuthLoading(false);
+        return setAuthError('Adresse e-mail requise (utilisée pour le code de vérification à la connexion).');
+      }
       const res = await fetch('/api/register', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
-          username, password,
+          username, password, email,
           publicKey: Array.from(new Uint8Array(rawPublicKey)),
-          customNullId: customNullId || undefined
+          customNullId: customNullId || undefined,
+          captchaId: currentCaptchaId,
+          captchaInput
         })
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) return setAuthError(data.error || 'Inscription impossible.');
+      if (!res.ok){
+        loadAuthCaptcha();
+        return setAuthError(data.error || 'Inscription impossible.');
+      }
 
       setAuthError('');
       try{ localStorage.setItem(NEW_ACCOUNT_FLAG_KEY, username.toLowerCase()); }catch(e){}
@@ -2803,7 +2928,8 @@ async function handleAuth(){
   }
 }
 
-document.getElementById('authPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleAuth(); });
+document.getElementById('authPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleAuthOrVerify(); });
+document.getElementById('auth2FACode').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleAuthOrVerify(); });
 
 /* =========================================================
    SESSION PERSISTANTE (connexion valable ~2 mois)
