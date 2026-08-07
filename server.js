@@ -63,26 +63,46 @@ if (process.env.TURN_URL) {
 // ==========================================
 // 2FA PAR E-MAIL (code à 6 chiffres à la connexion)
 // ==========================================
-// Identifiants du compte Gmail utilisé pour ENVOYER les codes, lus depuis
-// des variables d'environnement (fichier .env, jamais commité). Ne jamais
-// mettre ces valeurs en dur ici : ce fichier peut être partagé/déployé.
+// Deux façons d'envoyer le code, choisies automatiquement selon ce qui est
+// configuré :
+//
+// 1) RESEND_API_KEY (recommandé, surtout sur Render) : l'envoi passe par
+//    une requête HTTPS classique (port 443, jamais bloqué par les
+//    hébergeurs), au lieu d'une connexion SMTP brute. Render (offre
+//    gratuite) bloque les connexions SMTP sortantes vers Gmail (465/587) —
+//    la connexion reste bloquée jusqu'au timeout (ETIMEDOUT/ENETUNREACH),
+//    quelle que soit la config réseau côté nodemailer. Resend contourne ça
+//    entièrement puisque ce n'est qu'un appel HTTP normal.
+// 2) EMAIL_USER/EMAIL_PASS (Gmail SMTP, ancien système) : gardé en repli
+//    pour un déploiement sur un hébergeur qui n'a pas ce problème de port.
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const RESEND_FROM = process.env.RESEND_FROM || 'NullChat <onboarding@resend.dev>';
+
 const EMAIL_USER = process.env.EMAIL_USER || '';
 const EMAIL_PASS = process.env.EMAIL_PASS || '';
-// Adresse affichée comme expéditeur. Doit être soit EMAIL_USER lui-même,
-// soit un alias "Envoyer en tant que" vérifié dans les paramètres du compte
-// Gmail utilisé pour l'authentification — sinon Gmail rejette ou réécrit
-// automatiquement le "From" avec la vraie adresse du compte.
 const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
 
 let mailTransporter = null;
 if (EMAIL_USER && EMAIL_PASS) {
   mailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+    family: 4,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 10000
   });
-  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — service mail configuré pour l'expéditeur ${EMAIL_FROM}.`);
+}
+
+const emailServiceConfigured = !!RESEND_API_KEY || !!mailTransporter;
+if (RESEND_API_KEY) {
+  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — envoi des codes 2FA via Resend (${RESEND_FROM}).`);
+} else if (mailTransporter) {
+  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — envoi des codes 2FA via SMTP Gmail (${EMAIL_FROM}). Sur Render, préfère RESEND_API_KEY si le SMTP reste bloqué.`);
 } else {
-  console.warn('⚠️ EMAIL_USER/EMAIL_PASS non définis (.env manquant ?) : la vérification par e-mail (2FA) est désactivée, les connexions se feront sans code.');
+  console.warn('⚠️ Ni RESEND_API_KEY ni EMAIL_USER/EMAIL_PASS définis (.env manquant ?) : la vérification par e-mail (2FA) est désactivée, les connexions se feront sans code.');
 }
 
 const TWOFA_TTL_MS = 10 * 60 * 1000;     // un code envoyé par mail est valable 10 min
@@ -118,19 +138,59 @@ function isTrustedDeviceFor(usernameKey, deviceToken) {
   return true;
 }
 
-async function sendTwoFactorEmail(toEmail, code) {
-  if (!mailTransporter) throw new Error('Service mail non configuré.');
+function twoFactorEmailHtml(code) {
+  return `<div style="font-family:sans-serif;background:#0c0c0f;color:#f2f2f2;padding:24px;border-radius:12px;">
+      <h2 style="margin:0 0 12px;">NullChat</h2>
+      <p style="margin:0 0 16px;">Voici ton code de vérification :</p>
+      <p style="font-size:32px;font-weight:800;letter-spacing:8px;margin:0 0 16px;">${code}</p>
+      <p style="margin:0;color:#999;font-size:13px;">Il expire dans 10 minutes. Si tu n'es pas à l'origine de cette connexion, ignore simplement cet e-mail.</p>
+    </div>`;
+}
+
+async function sendViaResend(toEmail, code) {
+  // Timeout manuel : fetch n'a pas de timeout par défaut, on ne veut pas
+  // reproduire le même problème de requête qui pend indéfiniment.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  let response;
+  try {
+    response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: RESEND_FROM,
+        to: [toEmail],
+        subject: 'Ton code de vérification NullChat',
+        text: `Ton code de vérification NullChat est : ${code}\nIl expire dans 10 minutes.\nSi tu n'es pas à l'origine de cette connexion, ignore cet e-mail.`,
+        html: twoFactorEmailHtml(code)
+      }),
+      signal: controller.signal
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Resend : délai dépassé (10s).');
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    throw new Error(`Resend a refusé l'envoi (HTTP ${response.status}) : ${errBody.slice(0, 300)}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  log('E-mail 2FA envoyé via Resend, id =', data.id || '(inconnu)');
+}
+
+async function sendViaGmailSmtp(toEmail, code) {
   const info = await mailTransporter.sendMail({
     from: `"NullChat" <${EMAIL_FROM}>`,
     to: toEmail,
     subject: 'Ton code de vérification NullChat',
     text: `Ton code de vérification NullChat est : ${code}\nIl expire dans 10 minutes.\nSi tu n'es pas à l'origine de cette connexion, ignore cet e-mail.`,
-    html: `<div style="font-family:sans-serif;background:#0c0c0f;color:#f2f2f2;padding:24px;border-radius:12px;">
-      <h2 style="margin:0 0 12px;">NullChat</h2>
-      <p style="margin:0 0 16px;">Voici ton code de vérification :</p>
-      <p style="font-size:32px;font-weight:800;letter-spacing:8px;margin:0 0 16px;">${code}</p>
-      <p style="margin:0;color:#999;font-size:13px;">Il expire dans 10 minutes. Si tu n'es pas à l'origine de cette connexion, ignore simplement cet e-mail.</p>
-    </div>`
+    html: twoFactorEmailHtml(code)
   });
   // sendMail() peut se résoudre SANS lever d'erreur même si le serveur SMTP
   // a refusé le destinataire (info.rejected) ou n'a accepté personne
@@ -140,7 +200,13 @@ async function sendTwoFactorEmail(toEmail, code) {
     logError('E-mail 2FA refusé par le serveur SMTP :', JSON.stringify(info));
     throw new Error('E-mail refusé par le serveur SMTP (accepted vide ou rejected non vide).');
   }
-  log('E-mail 2FA envoyé, messageId =', info.messageId, '| accepted =', info.accepted.join(','));
+  log('E-mail 2FA envoyé via SMTP Gmail, messageId =', info.messageId, '| accepted =', info.accepted.join(','));
+}
+
+async function sendTwoFactorEmail(toEmail, code) {
+  if (RESEND_API_KEY) return sendViaResend(toEmail, code);
+  if (mailTransporter) return sendViaGmailSmtp(toEmail, code);
+  throw new Error('Service mail non configuré.');
 }
 
 setInterval(() => {
@@ -958,8 +1024,8 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
     // ne sert alors qu'une fois par appareil, pas à chaque connexion.
     const userEmail = userEmails.get(usernameKey);
     const deviceIsTrusted = isTrustedDeviceFor(usernameKey, deviceToken);
-    log('Login', usernameKey, '-> e-mail enregistré:', userEmail || '(aucun)', '| mailTransporter configuré:', !!mailTransporter, '| appareil de confiance:', deviceIsTrusted);
-    if (userEmail && mailTransporter && !deviceIsTrusted) {
+    log('Login', usernameKey, '-> e-mail enregistré:', userEmail || '(aucun)', '| service mail configuré:', emailServiceConfigured, '| appareil de confiance:', deviceIsTrusted);
+    if (userEmail && emailServiceConfigured && !deviceIsTrusted) {
       const pendingId = generateRandomToken();
       const code = generateTwoFactorCode();
       pending2FALogins.set(pendingId, {
