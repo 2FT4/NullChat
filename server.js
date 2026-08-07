@@ -66,17 +66,19 @@ if (process.env.TURN_URL) {
 // Deux façons d'envoyer le code, choisies automatiquement selon ce qui est
 // configuré :
 //
-// 1) RESEND_API_KEY (recommandé, surtout sur Render) : l'envoi passe par
+// 1) BREVO_API_KEY (recommandé, surtout sur Render) : l'envoi passe par
 //    une requête HTTPS classique (port 443, jamais bloqué par les
 //    hébergeurs), au lieu d'une connexion SMTP brute. Render (offre
 //    gratuite) bloque les connexions SMTP sortantes vers Gmail (465/587) —
 //    la connexion reste bloquée jusqu'au timeout (ETIMEDOUT/ENETUNREACH),
-//    quelle que soit la config réseau côté nodemailer. Resend contourne ça
+//    quelle que soit la config réseau côté nodemailer. Brevo contourne ça
 //    entièrement puisque ce n'est qu'un appel HTTP normal.
 // 2) EMAIL_USER/EMAIL_PASS (Gmail SMTP, ancien système) : gardé en repli
 //    pour un déploiement sur un hébergeur qui n'a pas ce problème de port.
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const RESEND_FROM = process.env.RESEND_FROM || 'NullChat <onboarding@resend.dev>';
+//
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'onboarding@nullchat.app';
+const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'NullChat';
 
 const EMAIL_USER = process.env.EMAIL_USER || '';
 const EMAIL_PASS = process.env.EMAIL_PASS || '';
@@ -96,13 +98,13 @@ if (EMAIL_USER && EMAIL_PASS) {
   });
 }
 
-const emailServiceConfigured = !!RESEND_API_KEY || !!mailTransporter;
-if (RESEND_API_KEY) {
-  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — envoi des codes 2FA via Resend (${RESEND_FROM}).`);
+const emailServiceConfigured = !!BREVO_API_KEY || !!mailTransporter;
+if (BREVO_API_KEY) {
+  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — envoi des codes 2FA via Brevo (${BREVO_FROM_NAME} <${BREVO_FROM_EMAIL}>).`);
 } else if (mailTransporter) {
-  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — envoi des codes 2FA via SMTP Gmail (${EMAIL_FROM}). Sur Render, préfère RESEND_API_KEY si le SMTP reste bloqué.`);
+  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — envoi des codes 2FA via SMTP Gmail (${EMAIL_FROM}). Sur Render, préfère BREVO_API_KEY si le SMTP reste bloqué.`);
 } else {
-  console.warn('⚠️ Ni RESEND_API_KEY ni EMAIL_USER/EMAIL_PASS définis (.env manquant ?) : la vérification par e-mail (2FA) est désactivée, les connexions se feront sans code.');
+  console.warn('⚠️ Ni BREVO_API_KEY ni EMAIL_USER/EMAIL_PASS définis (.env manquant ?) : la vérification par e-mail (2FA) est désactivée, les connexions se feront sans code.');
 }
 
 const TWOFA_TTL_MS = 10 * 60 * 1000;     // un code envoyé par mail est valable 10 min
@@ -147,30 +149,31 @@ function twoFactorEmailHtml(code) {
     </div>`;
 }
 
-async function sendViaResend(toEmail, code) {
+async function sendViaBrevo(toEmail, code) {
   // Timeout manuel : fetch n'a pas de timeout par défaut, on ne veut pas
   // reproduire le même problème de requête qui pend indéfiniment.
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   let response;
   try {
-    response = await fetch('https://api.resend.com/emails', {
+    response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json'
+        'api-key': BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
       },
       body: JSON.stringify({
-        from: RESEND_FROM,
-        to: [toEmail],
+        sender: { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL },
+        to: [{ email: toEmail }],
         subject: 'Ton code de vérification NullChat',
-        text: `Ton code de vérification NullChat est : ${code}\nIl expire dans 10 minutes.\nSi tu n'es pas à l'origine de cette connexion, ignore cet e-mail.`,
-        html: twoFactorEmailHtml(code)
+        textContent: `Ton code de vérification NullChat est : ${code}\nIl expire dans 10 minutes.\nSi tu n'es pas à l'origine de cette connexion, ignore cet e-mail.`,
+        htmlContent: twoFactorEmailHtml(code)
       }),
       signal: controller.signal
     });
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Resend : délai dépassé (10s).');
+    if (e.name === 'AbortError') throw new Error('Brevo : délai dépassé (10s).');
     throw e;
   } finally {
     clearTimeout(timeout);
@@ -178,10 +181,10 @@ async function sendViaResend(toEmail, code) {
 
   if (!response.ok) {
     const errBody = await response.text().catch(() => '');
-    throw new Error(`Resend a refusé l'envoi (HTTP ${response.status}) : ${errBody.slice(0, 300)}`);
+    throw new Error(`Brevo a refusé l'envoi (HTTP ${response.status}) : ${errBody.slice(0, 300)}`);
   }
   const data = await response.json().catch(() => ({}));
-  log('E-mail 2FA envoyé via Resend, id =', data.id || '(inconnu)');
+  log('E-mail 2FA envoyé via Brevo, messageId =', data.messageId || '(inconnu)');
 }
 
 async function sendViaGmailSmtp(toEmail, code) {
@@ -204,7 +207,7 @@ async function sendViaGmailSmtp(toEmail, code) {
 }
 
 async function sendTwoFactorEmail(toEmail, code) {
-  if (RESEND_API_KEY) return sendViaResend(toEmail, code);
+  if (BREVO_API_KEY) return sendViaBrevo(toEmail, code);
   if (mailTransporter) return sendViaGmailSmtp(toEmail, code);
   throw new Error('Service mail non configuré.');
 }
