@@ -1244,7 +1244,7 @@ input:disabled{ opacity:.5; }
       <input type="text" id="auth2FACode" placeholder="123456" maxlength="6" inputmode="numeric" autocomplete="one-time-code" style="letter-spacing:6px; text-align:center; font-weight:700; font-size:18px;">
     </div>
 
-    <div class="input-group" id="authCaptchaGroup">
+    <div class="input-group" id="authCaptchaGroup" style="display:none;">
       <label for="authCaptchaInput">Code de vérification</label>
       <div style="display:flex; gap:8px; align-items:center;">
         <div id="authCaptchaCode" style="flex:1; text-align:center; letter-spacing:6px; font-weight:700; font-size:20px; font-family:monospace; background:var(--bg-input, rgba(255,255,255,0.05)); border:1px solid var(--border-soft); border-radius:8px; padding:10px 8px; user-select:none;">------</div>
@@ -2757,7 +2757,9 @@ function toggleAuthMode(){
   document.getElementById('toggleLink').innerText = isLoginMode ? "Besoin d'un compte ? S'inscrire" : 'Déjà un compte ? Se connecter';
   document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
   document.getElementById('authEmailGroup').style.display = isLoginMode ? 'none' : 'block';
-  loadAuthCaptcha();
+  // Captcha demandé une seule fois, à l'inscription — plus à chaque connexion.
+  document.getElementById('authCaptchaGroup').style.display = isLoginMode ? 'none' : 'block';
+  if (!isLoginMode) loadAuthCaptcha();
 }
 
 function setAuthLoading(loading){
@@ -2801,13 +2803,13 @@ function exitTwoFactorMode(){
   document.getElementById('authPassword').closest('.input-group').style.display = 'block';
   document.getElementById('authEmailGroup').style.display = isLoginMode ? 'none' : 'block';
   document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
-  document.getElementById('authCaptchaGroup').style.display = 'block';
+  document.getElementById('authCaptchaGroup').style.display = isLoginMode ? 'none' : 'block';
   document.getElementById('toggleLink').style.display = 'inline';
   document.getElementById('back2FALink').style.display = 'none';
   document.getElementById('authTitle').innerText = isLoginMode ? 'Bienvenue !' : 'Créer un compte';
   document.getElementById('authSubtitle').innerText = isLoginMode ? 'Nous sommes ravis de vous revoir !' : 'Rejoins NullChat dès maintenant.';
   setAuthLoading(false);
-  loadAuthCaptcha();
+  if (!isLoginMode) loadAuthCaptcha();
 }
 
 async function verifyTwoFactor(){
@@ -2853,20 +2855,13 @@ async function handleAuth(){
 
   setAuthLoading(true);
   try{
-    const captchaInput = document.getElementById('authCaptchaInput').value.trim().toUpperCase();
-    if (!captchaInput){
-      setAuthLoading(false);
-      return setAuthError('Recopie le code de vérification.');
-    }
-
     if (isLoginMode){
       const res = await fetch('/api/login', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ username, password, captchaId: currentCaptchaId, captchaInput })
+        body: JSON.stringify({ username, password })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok){
-        loadAuthCaptcha();
         return setAuthError(data.error || 'Connexion impossible.');
       }
 
@@ -2884,6 +2879,12 @@ async function handleAuth(){
       checkFirstLoginTutorial(username);
       startApp();
     } else {
+      const captchaInput = document.getElementById('authCaptchaInput').value.trim().toUpperCase();
+      if (!captchaInput){
+        setAuthLoading(false);
+        return setAuthError('Recopie le code de vérification.');
+      }
+
       const keyPair = await window.crypto.subtle.generateKey(
         { name:'ECDH', namedCurve:'P-256' }, true, ['deriveKey']
       );
