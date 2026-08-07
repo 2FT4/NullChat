@@ -1,4 +1,10 @@
-try { require('dotenv').config(); } catch (e) { /* dotenv optionnel : si absent, on utilise les vraies variables d'env */ }
+let dotenvLoaded = false;
+try {
+  require('dotenv').config();
+  dotenvLoaded = true;
+} catch (e) {
+  console.warn('⚠️ Le paquet "dotenv" n\'est pas installé (npm install dotenv) : le fichier .env ne sera PAS lu, seules les vraies variables d\'environnement système comptent.');
+}
 
 const express = require('express');
 const http = require('http');
@@ -74,6 +80,7 @@ if (EMAIL_USER && EMAIL_PASS) {
     service: 'gmail',
     auth: { user: EMAIL_USER, pass: EMAIL_PASS }
   });
+  console.log(`✅ .env ${dotenvLoaded ? 'chargé' : 'NON chargé (dotenv absent)'} — service mail configuré pour l'expéditeur ${EMAIL_FROM}.`);
 } else {
   console.warn('⚠️ EMAIL_USER/EMAIL_PASS non définis (.env manquant ?) : la vérification par e-mail (2FA) est désactivée, les connexions se feront sans code.');
 }
@@ -886,11 +893,11 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
 
 app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
   try {
-    const { username, password, captchaId, captchaInput } = req.body || {};
-
-    if (!checkAndConsumeCaptcha(captchaId, captchaInput)) {
-      return res.status(400).json({ error: 'Code de vérification incorrect ou expiré.' });
-    }
+    // Le captcha n'est demandé qu'à l'inscription (une seule fois par
+    // compte) : à la connexion, le mot de passe + le code 2FA par e-mail
+    // (juste en dessous) suffisent à filtrer les bots et les tentatives
+    // automatisées, pas besoin de le redemander à chaque fois.
+    const { username, password } = req.body || {};
 
     if (!isNonEmptyString(username, LIMITS.usernameMax) || !isNonEmptyString(password, LIMITS.passwordMax)) {
       return res.status(400).json({ error: 'Identifiants invalides.' });
