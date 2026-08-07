@@ -1231,7 +1231,7 @@ input:disabled{ opacity:.5; }
     <div class="input-group" id="authEmailGroup" style="display:none;">
       <label for="authEmail">Adresse e-mail</label>
       <input type="email" id="authEmail" placeholder="ton@email.com" maxlength="254" autocomplete="email">
-      <div style="font-size:12px; opacity:.6; margin-top:4px;">Un code de vérification y sera envoyé à chaque connexion.</div>
+      <div style="font-size:12px; opacity:.6; margin-top:4px;">Un code de vérification te sera envoyé la première fois que tu te connectes depuis un nouvel appareil.</div>
     </div>
 
     <div class="input-group" id="authNullIdGroup" style="display:none;">
@@ -2827,6 +2827,7 @@ async function verifyTwoFactor(){
     if (!res.ok) return setAuthError(data.error || 'Code incorrect.');
 
     const username = document.getElementById('authUsername').value.trim();
+    if (data.deviceToken) saveDeviceToken(username.toLowerCase().trim(), data.deviceToken);
     currentUser = username;
     myNullId = data.nullId || null;
     myAvatarDataUrl = data.avatarDataUrl || null;
@@ -2845,6 +2846,28 @@ async function verifyTwoFactor(){
   }
 }
 
+// Un deviceToken par pseudo : évite de redemander le code 2FA à chaque
+// connexion depuis ce même navigateur (voir issueTrustedDevice côté
+// serveur). Rien de sensible dedans — juste "ce navigateur a déjà prouvé
+// avoir accès à l'e-mail de ce compte une fois".
+const DEVICE_TOKENS_KEY = 'nullchat_device_tokens';
+
+function getDeviceToken(usernameKey){
+  try{
+    const all = JSON.parse(localStorage.getItem(DEVICE_TOKENS_KEY) || '{}');
+    return all[usernameKey] || null;
+  } catch(e){ return null; }
+}
+
+function saveDeviceToken(usernameKey, token){
+  if (!token) return;
+  try{
+    const all = JSON.parse(localStorage.getItem(DEVICE_TOKENS_KEY) || '{}');
+    all[usernameKey] = token;
+    localStorage.setItem(DEVICE_TOKENS_KEY, JSON.stringify(all));
+  } catch(e){}
+}
+
 async function handleAuth(){
   const username = document.getElementById('authUsername').value.trim();
   const password = document.getElementById('authPassword').value;
@@ -2856,9 +2879,10 @@ async function handleAuth(){
   setAuthLoading(true);
   try{
     if (isLoginMode){
+      const usernameKey = username.toLowerCase().trim();
       const res = await fetch('/api/login', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username, password, deviceToken: getDeviceToken(usernameKey) })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok){
@@ -2868,6 +2892,7 @@ async function handleAuth(){
       if (data.twoFactorRequired){
         return enterTwoFactorMode(data.pendingId, data.emailHint);
       }
+      if (data.deviceToken) saveDeviceToken(usernameKey, data.deviceToken);
 
       currentUser = username;
       myNullId = data.nullId || null;

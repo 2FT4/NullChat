@@ -89,11 +89,33 @@ const TWOFA_TTL_MS = 10 * 60 * 1000;     // un code envoyé par mail est valable
 const TWOFA_CODE_LENGTH = 6;
 const TWOFA_MAX_ATTEMPTS = 5;            // tentatives de saisie max avant expiration forcée
 
+// Un navigateur qui a déjà validé un code 2FA reçoit un "device token" et
+// n'a plus besoin de repasser par le code à chaque connexion pendant sa
+// durée de vie (voir /api/login et /api/login/verify-2fa). Le token est
+// propre à un (compte, navigateur) : voler le mot de passe seul ne suffit
+// toujours pas à se connecter depuis un appareil non reconnu.
+const TRUSTED_DEVICE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
+
 // pendingId -> { usernameKey, code, expiresAt, attempts, userAgent }
 const pending2FALogins = new Map();
+// deviceToken -> { usernameKey, expiresAt }
+const trustedDevices = new Map();
 
 function generateTwoFactorCode() {
   return String(crypto.randomInt(0, 1000000)).padStart(TWOFA_CODE_LENGTH, '0');
+}
+
+function issueTrustedDevice(usernameKey) {
+  const deviceToken = generateRandomToken();
+  trustedDevices.set(deviceToken, { usernameKey, expiresAt: Date.now() + TRUSTED_DEVICE_TTL_MS });
+  return deviceToken;
+}
+
+function isTrustedDeviceFor(usernameKey, deviceToken) {
+  if (!deviceToken) return false;
+  const entry = trustedDevices.get(deviceToken);
+  if (!entry || entry.expiresAt <= Date.now() || entry.usernameKey !== usernameKey) return false;
+  return true;
 }
 
 async function sendTwoFactorEmail(toEmail, code) {
@@ -125,6 +147,9 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, entry] of pending2FALogins.entries()) {
     if (entry.expiresAt <= now) pending2FALogins.delete(id);
+  }
+  for (const [token, entry] of trustedDevices.entries()) {
+    if (entry.expiresAt <= now) trustedDevices.delete(token);
   }
 }, 60 * 1000).unref();
 
@@ -897,7 +922,7 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
     // compte) : à la connexion, le mot de passe + le code 2FA par e-mail
     // (juste en dessous) suffisent à filtrer les bots et les tentatives
     // automatisées, pas besoin de le redemander à chaque fois.
-    const { username, password } = req.body || {};
+    const { username, password, deviceToken } = req.body || {};
 
     if (!isNonEmptyString(username, LIMITS.usernameMax) || !isNonEmptyString(password, LIMITS.passwordMax)) {
       return res.status(400).json({ error: 'Identifiants invalides.' });
@@ -928,9 +953,13 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
     // un code à 6 chiffres et on attend /api/login/verify-2fa. Les comptes
     // créés avant l'ajout de cette fonctionnalité (pas d'e-mail enregistré)
     // continuent de se connecter directement, pour ne rien casser.
+    // Exception : si ce navigateur a déjà validé un code pour ce compte
+    // récemment (deviceToken reconnu), on ne redemande pas de code — le 2FA
+    // ne sert alors qu'une fois par appareil, pas à chaque connexion.
     const userEmail = userEmails.get(usernameKey);
-    log('Login', usernameKey, '-> e-mail enregistré:', userEmail || '(aucun)', '| mailTransporter configuré:', !!mailTransporter);
-    if (userEmail && mailTransporter) {
+    const deviceIsTrusted = isTrustedDeviceFor(usernameKey, deviceToken);
+    log('Login', usernameKey, '-> e-mail enregistré:', userEmail || '(aucun)', '| mailTransporter configuré:', !!mailTransporter, '| appareil de confiance:', deviceIsTrusted);
+    if (userEmail && mailTransporter && !deviceIsTrusted) {
       const pendingId = generateRandomToken();
       const code = generateTwoFactorCode();
       pending2FALogins.set(pendingId, {
@@ -974,12 +1003,25 @@ app.post('/api/login', authRateLimitMiddleware, async (req, res) => {
     }
     saveSessionsToDisk();
 
+    // Si on vient de passer parce que l'appareil était déjà de confiance,
+    // on prolonge sa durée de vie (usage régulier = on ne redemande pas de
+    // code). On (re)émet aussi un token si l'e-mail 2FA est enregistré mais
+    // qu'aucun deviceToken valide n'était fourni (ex. tout premier login
+    // sans e-mail 2FA au moment de l'inscription, ajouté depuis) — jamais
+    // indispensable, juste pour fluidifier les prochaines connexions.
+    let responseDeviceToken;
+    if (userEmail) {
+      responseDeviceToken = deviceIsTrusted ? deviceToken : issueTrustedDevice(usernameKey);
+      if (deviceIsTrusted) trustedDevices.set(deviceToken, { usernameKey, expiresAt: Date.now() + TRUSTED_DEVICE_TTL_MS });
+    }
+
     return res.json({
       success: true,
       token,
       nullId: user.nullId,
       username: user.username,
-      avatarDataUrl: user.avatarDataUrl || null
+      avatarDataUrl: user.avatarDataUrl || null,
+      deviceToken: responseDeviceToken
     });
   } catch (err) {
     logError('Erreur /api/login :', err);
@@ -1050,12 +1092,18 @@ app.post('/api/login/verify-2fa', async (req, res) => {
     }
     saveSessionsToDisk();
 
+    // Code validé : ce navigateur devient "de confiance" pour ce compte
+    // pendant 30 jours, le client stocke ce token et ne repassera plus par
+    // le 2FA tant qu'il est valide (voir /api/login).
+    const deviceToken = issueTrustedDevice(usernameKey);
+
     return res.json({
       success: true,
       token,
       nullId: user.nullId,
       username: user.username,
-      avatarDataUrl: user.avatarDataUrl || null
+      avatarDataUrl: user.avatarDataUrl || null,
+      deviceToken
     });
   } catch (err) {
     logError('Erreur /api/login/verify-2fa :', err);
