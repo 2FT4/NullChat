@@ -80,6 +80,18 @@ const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'onboarding@nullchat.app';
 const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'NullChat';
 
+// NullAI : assistant IA (onglet dédié, hors du modèle E2E du reste de l'app).
+// La clé ne doit JAMAIS être envoyée au client ni committée sur Git — elle
+// vit uniquement dans .env / les variables d'environnement du serveur
+// (Render, etc.), exactement comme BREVO_API_KEY ci-dessus. Le client ne
+// parle qu'à /api/nullai/chat ; c'est ce endpoint qui appelle Gemini.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const nullaiConfigured = !!GEMINI_API_KEY;
+if (!nullaiConfigured) {
+  console.warn('⚠️ GEMINI_API_KEY non définie (.env manquant ?) : l\'onglet NullAI répondra "indisponible".');
+}
+
 const EMAIL_USER = process.env.EMAIL_USER || '';
 const EMAIL_PASS = process.env.EMAIL_PASS || '';
 const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
@@ -417,7 +429,8 @@ if (TRUST_PROXY) {
   app.set('trust proxy', 1);
 }
 if (NODE_ENV === 'production' && CORS_ORIGIN === '*') {
-  console.error('⚠️ CORS_ORIGIN="*" en production : configure la variable d’environnement CORS_ORIGIN avec ton vrai domaine.');
+  console.error('❌ CORS_ORIGIN="*" en production : configure la variable d’environnement CORS_ORIGIN avec ton vrai domaine avant de démarrer.');
+  process.exit(1);
 }
 
 app.use(express.json({ limit: '25MB' }));
@@ -818,6 +831,10 @@ const messageRateLimit = createRateLimiter({ windowMs: 10 * 1000, max: 40 });
 const attachmentRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 10 });
 const socketEventRateLimit = createRateLimiter({ windowMs: 5 * 1000, max: 120 });
 const serverActionRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 15 });
+// NullAI : chaque appel coûte de l'argent (API Gemini) → limite par compte,
+// pas seulement par IP, pour qu'un utilisateur ne puisse pas épuiser le
+// quota/budget à lui seul.
+const nullaiRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 200 });
 
 function clientIp(req) {
   return req.ip || req.socket.remoteAddress || 'unknown';
@@ -1180,36 +1197,100 @@ app.post('/api/login/verify-2fa', async (req, res) => {
   }
 });
 
-// Nouvelle route pour l'envoi de fichier / média lourd chiffré
-app.post('/api/upload', requireAuth, (req, res) => {
+// ⚠️ SÉCURITÉ : route /api/upload supprimée pour de bon. Le commentaire en
+// tête de fichier expliquait déjà qu'elle avait été retirée (fichiers écrits
+// en clair sur disque, servis publiquement, sans vérification d'amitié/
+// appartenance — contraire au modèle E2E où les médias ne transitent que
+// chiffrés via les sockets dm:message/encrypted_message), mais une version
+// résiduelle traînait encore ici, avec UPLOADS_DIR non défini nulle part
+// dans le fichier (crash garanti au premier appel, et faille réintroduite
+// entre-temps). Ne pas la recréer sans, a minima : whitelist stricte de
+// mimeType/extensions, vérification du contenu réel (magic bytes, jamais
+// l'extension fournie par le client), URL d'accès signée/à durée limitée
+// réservée aux destinataires légitimes, quota par utilisateur.
+
+// ==========================================
+// NullAI (assistant IA — hors modèle E2E, transparence obligatoire côté client)
+// ==========================================
+function isValidNullAIHistory(history) {
+  if (history === undefined || history === null) return true;
+  if (!Array.isArray(history) || history.length > 30) return false;
+  return history.every(turn =>
+    turn && (turn.role === 'user' || turn.role === 'model') &&
+    isNonEmptyString(turn.text, 4000)
+  );
+}
+
+async function callGemini(history, message) {
+  const contents = [
+    ...(history || []).map(turn => ({
+      role: turn.role,
+      parts: [{ text: turn.text }]
+    })),
+    { role: 'user', parts: [{ text: message }] }
+  ];
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  let response;
   try {
-    const { fileData, fileName, mimeType } = req.body || {};
-    if (!fileData || typeof fileData !== 'string') {
-      return res.status(400).json({ error: 'Fichier invalide.' });
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'x-goog-api-key': GEMINI_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          contents,
+          generationConfig: { maxOutputTokens: 1024 }
+        }),
+        signal: controller.signal
+      }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Gemini HTTP ${response.status} : ${errText.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  const reply = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+  if (!reply.trim()) {
+    // Peut arriver si Gemini bloque la réponse (safety filters) : on le
+    // signale proprement plutôt que de renvoyer une réponse vide muette.
+    const blockReason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason;
+    throw new Error(`Réponse vide de Gemini (${blockReason || 'raison inconnue'}).`);
+  }
+  return reply.trim();
+}
+
+app.post('/api/nullai/chat', requireAuth, async (req, res) => {
+  try {
+    if (!nullaiConfigured) {
+      return res.status(503).json({ error: "NullAI n'est pas configuré sur ce serveur." });
+    }
+    if (!nullaiRateLimit(req.session.nullId)) {
+      return res.status(429).json({ error: 'Trop de messages envoyés à NullAI, réessaie dans une minute.' });
     }
 
-    const fileId = crypto.randomBytes(16).toString('hex');
-    const safeExt = path.extname(fileName || '').slice(0, 10) || '.bin';
-    const savedName = `${fileId}${safeExt}`;
-    const filePath = path.join(UPLOADS_DIR, savedName);
+    const { message, history } = req.body || {};
+    if (!isNonEmptyString(message, 4000)) {
+      return res.status(400).json({ error: 'Message invalide (1 à 4000 caractères).' });
+    }
+    if (!isValidNullAIHistory(history)) {
+      return res.status(400).json({ error: 'Historique de conversation invalide.' });
+    }
 
-    // Extraction du buffer base64 si fourni sous forme de dataURL
-    const base64Data = fileData.replace(/^data:.*;base64,/, '');
-    fs.writeFile(filePath, base64Data, 'base64', (err) => {
-      if (err) {
-        logError("Erreur écriture fichier :", err);
-        return res.status(500).json({ error: 'Impossible de sauvegarder le fichier.' });
-      }
-      res.json({
-        success: true,
-        fileUrl: `/uploads/${savedName}`,
-        fileName: fileName || savedName,
-        mimeType: mimeType || 'application/octet-stream'
-      });
-    });
+    const reply = await callGemini(history, message);
+    res.json({ reply });
   } catch (err) {
-    logError("Erreur /api/upload :", err);
-    res.status(500).json({ error: 'Erreur serveur lors de l\'upload.' });
+    logError('Erreur /api/nullai/chat :', err);
+    res.status(502).json({ error: "NullAI n'a pas pu répondre, réessaie." });
   }
 });
 
