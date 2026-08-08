@@ -152,6 +152,31 @@ async function init() {
     if (!existingCols.has('phone')) {
       await client.execute(`ALTER TABLE users ADD COLUMN phone TEXT`);
     }
+    // Style du pseudo + thème de profil (bannière/fond) : avant, ces
+    // préférences n'existaient qu'en mémoire (Map côté server.js) et
+    // repartaient donc à zéro à chaque redémarrage/redéploiement, comme le
+    // reste avant la migration Turso.
+    if (!existingCols.has('name_font')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN name_font TEXT`);
+    }
+    if (!existingCols.has('name_effect')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN name_effect TEXT`);
+    }
+    if (!existingCols.has('name_colors')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN name_colors TEXT`); // JSON (tableau de couleurs hex)
+    }
+    if (!existingCols.has('banner_type')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN banner_type TEXT`);
+    }
+    if (!existingCols.has('banner_value')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN banner_value TEXT`);
+    }
+    if (!existingCols.has('bg_type')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN bg_type TEXT`);
+    }
+    if (!existingCols.has('bg_value')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN bg_value TEXT`);
+    }
     await client.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_null_id ON users(null_id)`);
     await client.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
     await client.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
@@ -203,12 +228,30 @@ module.exports = {
 
   async loadAllUsers() {
     const res = await client.execute(
-      `SELECT username, password_hash AS passwordHash, null_id AS nullId, email, phone, public_key AS publicKey, avatar_data_url AS avatarDataUrl FROM users`
+      `SELECT username, password_hash AS passwordHash, null_id AS nullId, email, phone, public_key AS publicKey, avatar_data_url AS avatarDataUrl,
+              name_font AS nameFont, name_effect AS nameEffect, name_colors AS nameColors,
+              banner_type AS bannerType, banner_value AS bannerValue, bg_type AS bgType, bg_value AS bgValue
+       FROM users`
     );
     return res.rows.map(u => ({
       ...u,
-      publicKey: u.publicKey ? JSON.parse(u.publicKey) : null
+      publicKey: u.publicKey ? JSON.parse(u.publicKey) : null,
+      nameColors: u.nameColors ? JSON.parse(u.nameColors) : []
     }));
+  },
+
+  async updateNameStyle(nullId, { nameFont, nameEffect, nameColors }) {
+    await client.execute({
+      sql: `UPDATE users SET name_font = ?, name_effect = ?, name_colors = ? WHERE null_id = ?`,
+      args: [nameFont || 'none', nameEffect || 'none', JSON.stringify(nameColors || []), nullId]
+    });
+  },
+
+  async updateProfileTheme(nullId, { bannerType, bannerValue, bgType, bgValue }) {
+    await client.execute({
+      sql: `UPDATE users SET banner_type = ?, banner_value = ?, bg_type = ?, bg_value = ? WHERE null_id = ?`,
+      args: [bannerType || 'none', bannerValue || null, bgType || 'none', bgValue || null, nullId]
+    });
   },
 
   async addFriendPair(a, b) {

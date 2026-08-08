@@ -1184,21 +1184,22 @@ input:disabled{ opacity:.5; }
       </div>
 
       <div class="main-area" id="viewDM" style="display:none;">
-        <div class="chat-header">
-          <button class="back-btn fx-btn" onclick="closeDm()" title="Retour">
+        <div class="chat-header" id="dmChatHeader" style="position:relative;">
+          <div id="dmPeerBanner" style="display:none; position:absolute; inset:0; z-index:0; background-size:cover; background-position:center; opacity:0.35; pointer-events:none;"></div>
+          <button class="back-btn fx-btn" onclick="closeDm()" title="Retour" style="position:relative; z-index:1;">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
           </button>
-          <span class="title" style="flex-direction:column; align-items:flex-start; line-height:1.2;">
+          <span class="title" style="flex-direction:column; align-items:flex-start; line-height:1.2; position:relative; z-index:1;">
             <span style="display:flex; align-items:center; gap:8px;">
               <span class="avatar" id="dmAvatar" style="width:26px;height:26px;font-size:11px;"></span>
               <span id="dmPeerName">—</span>
             </span>
             <span id="dmPeerStatus" style="font-size:11px; color:var(--text-faint); font-weight:400;"></span>
           </span>
-          <button class="dm-call-btn fx-btn" id="dmCallBtn" title="Appeler">
+          <button class="dm-call-btn fx-btn" id="dmCallBtn" title="Appeler" style="position:relative; z-index:1;">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
           </button>
-          <button class="dm-call-btn fx-btn" id="dmDeleteBtn" title="Supprimer la conversation" onclick="currentDmPeer && deleteConversation(currentDmPeer.nullId)">
+          <button class="dm-call-btn fx-btn" id="dmDeleteBtn" title="Supprimer la conversation" onclick="currentDmPeer && deleteConversation(currentDmPeer.nullId)" style="position:relative; z-index:1;">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>
           </button>
         </div>
@@ -1412,9 +1413,6 @@ input:disabled{ opacity:.5; }
     <div style="margin-top:8px;">
       <span class="switch-link" style="margin:0;" onclick="clearProfileBg()">Réinitialiser le fond</span>
     </div>
-    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:8px 0 16px 0;">
-      Visible uniquement sur ton propre profil pour l'instant (l'affichage côté amis nécessite une mise à jour du serveur — voir le contrat en tête de fichier).
-    </div>
 
 <script>
   function closeSettings() {
@@ -1492,13 +1490,6 @@ input:disabled{ opacity:.5; }
       <input type="color" id="nameColorPicker" value="#7c5cff" style="width:40px;height:32px;padding:0;border:none;border-radius:6px;cursor:pointer;background:none;">
       <button class="settings-btn fx-btn" onclick="addNameColor()">Ajouter une couleur</button>
       <span class="switch-link" style="margin-left:auto;" onclick="clearNameColors()">Réinitialiser</span>
-    </div>
-    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:4px 0 16px 0;">
-      Aucune couleur = couleur par défaut. Une seule = pseudo uni. Plusieurs = dégradé (ou une couleur différente par lettre avec les effets Vague/Glitch). 16 maximum, clique sur une pastille pour la retirer.
-    </div>
-
-    <div class="sub" style="font-size:12px; color:var(--text-muted); margin:-8px 0 16px 0;">
-      Visible par tes amis dans les messages, la liste d'amis et les appels. Ton pseudo réel (utilisé pour te connecter) ne change pas.
     </div>
 
     <div class="label-small">Micro (entrée audio)</div>
@@ -2155,6 +2146,26 @@ function applyProfileTheme(){
       bannerType: myProfileBanner.type, bannerValue: myProfileBanner.type === 'none' ? null : myProfileBanner.value,
       bgType: myProfileBg.type, bgValue: myProfileBg.type === 'none' ? null : myProfileBg.value
     });
+  }
+}
+// Bannière d'un AMI (reçue du serveur, pas la nôtre) : le serveur ne
+// persiste/diffuse que 'none' | 'image' | 'preset' pour bannerType (voir
+// validation dans profile:theme côté serveur), donc pas de cas 'gradient' ici.
+function friendBannerCssValue(bannerType, bannerValue){
+  if (bannerType === 'image' && typeof bannerValue === 'string') return `url("${bannerValue}")`;
+  if (bannerType === 'preset') return PROFILE_PRESETS[bannerValue]?.css || null;
+  return null;
+}
+function renderDmPeerBanner(friend){
+  const el = document.getElementById('dmPeerBanner');
+  if (!el) return;
+  const css = friend ? friendBannerCssValue(friend.bannerType, friend.bannerValue) : null;
+  if (css){
+    el.style.backgroundImage = css;
+    el.style.display = 'block';
+  } else {
+    el.style.backgroundImage = 'none';
+    el.style.display = 'none';
   }
 }
 function setBannerPreset(key){ myProfileBanner = { type:'preset', value:key }; applyProfileTheme(); }
@@ -2997,6 +3008,7 @@ function openDm(friend){
   unreadDm.delete(friend.nullId);
   renderAvatarInto(document.getElementById('dmAvatar'), friend);
   document.getElementById('dmPeerName').innerHTML = styledNameHTML(friend.username, friend.nameFont || 'none', friend.nameEffect || 'none', friend.nameColors || []);
+  renderDmPeerBanner(friend);
   const callBtn = document.getElementById('dmCallBtn');
   callBtn.disabled = !friend.online;
   callBtn.onclick = () => startCall(friend);
@@ -4727,6 +4739,23 @@ async function startApp(){
       document.getElementById('dmPeerName').innerHTML = styledNameHTML(currentDmPeer.username, currentDmPeer.nameFont, currentDmPeer.nameEffect, currentDmPeer.nameColors);
     }
     if (currentView === 'friends') renderFriendList();
+  });
+
+  socket.on('friend:theme_updated', (data) => {
+    const f = friends.get(data.nullId);
+    if (f){
+      f.bannerType = data.bannerType || 'none';
+      f.bannerValue = data.bannerValue || null;
+      f.bgType = data.bgType || 'none';
+      f.bgValue = data.bgValue || null;
+    }
+    if (currentDmPeer && currentDmPeer.nullId === data.nullId){
+      currentDmPeer.bannerType = data.bannerType || 'none';
+      currentDmPeer.bannerValue = data.bannerValue || null;
+      currentDmPeer.bgType = data.bgType || 'none';
+      currentDmPeer.bgValue = data.bgValue || null;
+      renderDmPeerBanner(currentDmPeer);
+    }
   });
 
   socket.on('friend:avatar_updated', (data) => {

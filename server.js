@@ -545,17 +545,16 @@ async function loadStateFromDb() {
       nullId: u.nullId,
       publicKey: u.publicKey,
       avatarDataUrl: u.avatarDataUrl || null,
-      // ⚠️ Pas encore persistés en base (db.js n'a pas de colonnes dédiées) :
-      // ces préférences de style/thème repartent à zéro après un redémarrage,
-      // même limitation que pour chatServers. À étendre dans db.js si une
-      // persistance est souhaitée (mêmes méthodes que updateAvatar).
-      nameFont: 'none',
-      nameEffect: 'none',
-      nameColors: [],
-      bannerType: 'none',
-      bannerValue: null,
-      bgType: 'none',
-      bgValue: null
+      // Persistés en base (colonnes name_font/name_effect/name_colors/
+      // banner_type/banner_value/bg_type/bg_value) : ces préférences
+      // survivent maintenant à un redémarrage/redéploiement.
+      nameFont: u.nameFont || 'none',
+      nameEffect: u.nameEffect || 'none',
+      nameColors: Array.isArray(u.nameColors) ? u.nameColors : [],
+      bannerType: u.bannerType || 'none',
+      bannerValue: u.bannerValue || null,
+      bgType: u.bgType || 'none',
+      bgValue: u.bgValue || null
     });
     nullIdToUser.set(u.nullId, u.username);
     if (!friends.has(u.nullId)) friends.set(u.nullId, new Set());
@@ -1474,7 +1473,11 @@ function sendFriendList(socket, nullId) {
         avatarDataUrl: friendUser?.avatarDataUrl || null,
         nameFont: friendUser?.nameFont || 'none',
         nameEffect: friendUser?.nameEffect || 'none',
-        nameColors: friendUser?.nameColors || []
+        nameColors: friendUser?.nameColors || [],
+        bannerType: friendUser?.bannerType || 'none',
+        bannerValue: friendUser?.bannerValue || null,
+        bgType: friendUser?.bgType || 'none',
+        bgValue: friendUser?.bgValue || null
       });
     }
   }
@@ -2022,6 +2025,7 @@ io.on('connection', (socket) => {
     user.nameFont = nameFont;
     user.nameEffect = nameEffect;
     user.nameColors = nameColors;
+    persist(db.updateNameStyle(nullId, { nameFont, nameEffect, nameColors }));
 
     const userFriendsList = friends.get(nullId) || new Set();
     for (const fNullId of userFriendsList) {
@@ -2064,8 +2068,18 @@ io.on('connection', (socket) => {
     user.bannerValue = bannerValue;
     user.bgType = bgType;
     user.bgValue = bgValue;
-    // Pas de diffusion aux amis : côté client, seul le "propre profil" affiche
-    // pour l'instant la bannière/le fond (voir note dans le contrat réseau).
+    persist(db.updateProfileTheme(nullId, { bannerType, bannerValue, bgType, bgValue }));
+
+    // Diffusion aux amis connectés, comme pour l'avatar et le style de
+    // pseudo : leur client affiche maintenant la bannière dans l'en-tête
+    // de la conversation privée (voir friend:theme_updated côté client).
+    const userFriendsList = friends.get(nullId) || new Set();
+    for (const fNullId of userFriendsList) {
+      const friendSocketId = userSockets.get(fNullId);
+      if (friendSocketId) {
+        io.to(friendSocketId).emit('friend:theme_updated', { nullId, bannerType, bannerValue, bgType, bgValue });
+      }
+    }
   }));
 
   socket.on('dm:key_exchange', safeHandler(socket, (data = {}) => {
