@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0">
 <script>
-// Évite le flash de l'écran de connexion si une session valide (< 2 mois) est déjà stockée.
+
 (function(){
   try{
     var raw = localStorage.getItem('nullchat_session_v1');
@@ -16,8 +16,7 @@
     }
   }catch(e){}
 })();
-// Applique immédiatement le thème de couleurs choisi par l'utilisateur (fond + accent),
-// avant même le premier rendu, pour éviter un flash avec les couleurs par défaut.
+
 (function(){
   try{
     var raw = localStorage.getItem('nullchat_app_theme_v1');
@@ -36,247 +35,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-/*
-  =====================================================================
-  CONTRAT SERVEUR REQUIS (Socket.IO) — à implémenter côté backend
-  =====================================================================
-  Ce fichier est uniquement le client. Pour que le système d'amis, les
-  messages privés et les appels fonctionnent, le serveur doit gérer les
-  événements suivants.
-
-  --- Identité ---
-  - /api/login et /api/register doivent renvoyer un champ `nullId`
-    (identifiant unique et stable de l'utilisateur, ex: "A3F9-72CD").
-  - [NOUVEAU] 2FA par e-mail : /api/register prend désormais un champ `email`
-    obligatoire. /api/login, si un e-mail est enregistré pour le compte, ne
-    renvoie plus directement `token` : il renvoie
-    { twoFactorRequired: true, pendingId, emailHint } après avoir envoyé un
-    code à 6 chiffres par e-mail. Le client doit alors appeler
-    POST /api/login/verify-2fa avec { pendingId, code } pour recevoir enfin
-    { token, nullId, username, avatarDataUrl } (même forme que l'ancien
-    /api/login réussi).
-
-  --- Émis par le client, à écouter côté serveur ---
-  - "friend:request"      { targetNullId }
-  - "friend:accept"       { requestId }
-  - "friend:decline"      { requestId }
-  - "friend:remove"       { nullId }
-  - "friend:block"        { nullId }   [NOUVEAU] le serveur doit empêcher ce
-                                        nullId d'envoyer messages/appels/
-                                        demandes d'ami tant qu'il est bloqué.
-  - "friend:unblock"      { nullId }   [NOUVEAU]
-  - "dm:key_exchange"     { targetSocketId, publicKey, isNewUser }
-  - "dm:message"          { targetNullId, targetSocketId, ciphertext, iv,
-                             kind, mime, filename, timestamp }
-                             [NOUVEAU] kind/mime/filename sont optionnels et
-                             juste relayés tels quels (kind: 'text'|'image'|
-                             'video'|'audio'). Le contenu reste chiffré E2E,
-                             donc mime/filename sont les seules métadonnées
-                             en clair — à garder minimales par design.
-                             Le serveur doit aussi imposer une limite de
-                             taille de payload (actuellement 10 Go côté serveur —
-                             voir l'avertissement dans server.js, LIMITS.mediaCiphertextMaxBytes)
-                             pour éviter l'abus.
-  - "call:offer"          { targetNullId, targetSocketId, sdp }
-  - "call:answer"         { targetNullId, targetSocketId, sdp }
-  - "call:ice"            { targetNullId, targetSocketId, candidate }
-  - "call:end"            { targetNullId, targetSocketId, reason? }
-                             reason: 'declined' pour un refus explicite,
-                             sinon un simple raccrochage ("call:ended").
-  - "profile:avatar"      { avatarDataUrl }  [NOUVEAU] data URL image ou null
-                             pour retirer l'avatar (250 Ko max, redimensionné
-                             côté client avant envoi).
-  - "profile:style"       { nameFont, nameEffect, nameColors }  [NOUVEAU] préférence
-                             de style du pseudo (police "Instagram" + effet visuel
-                             wave/néon/etc. + jusqu'à 6 couleurs personnalisées).
-                             Le serveur doit stocker ces champs et les renvoyer avec
-                             l'utilisateur dans "friend:list", "friend:added",
-                             "friend:status", "friend:request_received" et dans
-                             "author"/"senderNullId" des messages, comme pour
-                             avatarDataUrl. Valeurs attendues : nameFont/nameEffect
-                             = chaînes courtes (clés), ex: "bold", "gothic", "none".
-                             nameColors = tableau de 0 à 6 chaînes hexadécimales
-                             strictes ("#rrggbb") ; le serveur doit rejeter/filtrer
-                             toute valeur qui ne respecte pas ce format avant
-                             stockage. Ne jamais faire confiance à du HTML envoyé
-                             par le client : ce ne sont que des clés/couleurs d'un
-                             format fixe connu du client, jamais du texte libre.
-  - "profile:theme"       { bannerType, bannerValue, bgType, bgValue }  [NOUVEAU]
-                             bannière + fond de profil façon Nitro. bannerType ∈
-                             ('none'|'image'|'preset'). Si 'image' : bannerValue
-                             est une data URL image (même contrainte que
-                             avatarDataUrl, prévoir une limite de taille côté
-                             serveur, ex: 400 Ko après compression client). Si
-                             'preset' : bannerValue est une clé parmi l'ensemble
-                             FIXE PROFILE_PRESETS défini dans le client (crimson,
-                             sunset, ocean, purple, forest, candy, midnight, gold)
-                             — le serveur doit valider que la clé fait partie de
-                             cette liste connue, jamais de CSS libre. bgType ∈
-                             ('none'|'preset'), bgValue = même liste de clés que
-                             ci-dessus (pas d'image pour le fond, uniquement des
-                             dégradés prédéfinis). À stocker et renvoyer comme
-                             pour avatarDataUrl/nameFont, dans les mêmes
-                             événements ("friend:list", "friend:added", etc.).
-                             ⚠️ Cette fonctionnalité n'est pour l'instant câblée
-                             que côté "propre profil" dans le client (visible
-                             uniquement par soi-même) : l'affichage de la
-                             bannière/du fond des AMIS n'est pas encore construit
-                             côté UI, seul le contrat réseau est prêt.
-  - "dm:typing"           { targetNullId, isTyping }  [NOUVEAU]
-  - "dm:read"             { targetNullId, messageId? }  [NOUVEAU]
-
-  --- Serveurs (groupes chiffrés créés par les utilisateurs) ---
-  Le salon "#général" global a été retiré : toute discussion de groupe se
-  fait désormais dans un serveur créé par un utilisateur, avec un code
-  d'invitation, sur le même modèle de chiffrement pair-à-pair que les DM
-  (ECDH + AES-GCM), mais étendu à chaque membre en ligne du serveur.
-  - "server:create"        { name }
-  - "server:join"          { inviteCode }
-  - "server:leave"         { serverId }
-  - "server:key_exchange"  { serverId, targetSocketId, publicKey, isNewMember }
-                              targetSocketId absent/null = diffusion à tous
-                              les membres actuellement en ligne du serveur.
-  - "server:message"       { serverId, targets: [{ targetId, ciphertext, iv }],
-                              kind, mime, filename, timestamp }
-                              même principe que l'ancien "encrypted_message" :
-                              un ciphertext différent par membre en ligne,
-                              chiffré avec la clé partagée dérivée pour ce
-                              membre. Le serveur ne voit jamais le texte en
-                              clair. Limite de taille de payload à imposer
-                              comme pour "dm:message".
-
-  --- Serveurs : modération (admins de serveur)  [NOUVEAU] ---
-  Chaque serveur a un "owner" (ownerNullId, déjà existant) et peut avoir
-  plusieurs "admins". Le owner ne peut pas être rétrogradé/exclu/banni.
-  - "server:promote"       { serverId, targetNullId }  passe targetNullId
-                              admin de ce serveur. Émetteur DOIT être le
-                              owner (le serveur vérifie, jamais le client).
-  - "server:demote"        { serverId, targetNullId }  retire le rôle admin.
-                              Émetteur DOIT être le owner.
-  - "server:kick"          { serverId, targetNullId }  exclut un membre
-                              (il pourra revenir avec le code d'invitation).
-                              Émetteur DOIT être owner ou admin ; un admin ne
-                              peut pas exclure le owner ni un autre admin.
-  - "server:ban"           { serverId, targetNullId }  exclut ET empêche de
-                              revenir tant qu'il n'est pas débanni (le serveur
-                              doit rejeter son "server:join" sur ce serverId).
-                              Mêmes règles de permission que "server:kick".
-  - "server:unban"         { serverId, targetNullId }  lève un bannissement
-                              de serveur. Owner ou admin.
-
-  --- Serveurs : modération, événements envoyés par le serveur  [NOUVEAU] ---
-  - "server:list" / "server:created" / "server:joined" / "server:members"
-                              doivent maintenant inclure, par serveur :
-                              admins: [nullId, ...] et bannedNullIds: [nullId, ...]
-                              (en plus des champs déjà listés plus haut).
-  - "server:kicked"         { serverId, reason? }  envoyé au membre exclu,
-                              pour que son client quitte la vue localement.
-  - "server:banned"         { serverId, reason? }  envoyé au membre banni.
-  - "server:role_changed"   { serverId, nullId, role }  role ∈ ('member'|'admin'),
-                              diffusé à tous les membres pour rafraîchir l'UI.
-
-  --- Owner de l'application (modération globale, pas juste un serveur)  [NOUVEAU] ---
-  ⚠️ Le/la "owner de l'app" est une notion GLOBALE au produit (une poignée de
-  NULLID de confiance définis côté serveur, ex. variable d'env OWNER_NULLIDS),
-  totalement différente du "owner" d'un serveur créé par un utilisateur. Le
-  client n'est qu'une interface : il affiche ces actions si myNullId figure
-  dans une constante locale (voir OWNER_NULLIDS/COOWNER_NULLIDS dans le JS)
-  mais ça ne PROUVE rien — le serveur doit revalider indépendamment que le
-  nullId associé au socket émetteur fait bien partie de sa propre liste
-  d'admins globaux avant d'agir, sans quoi n'importe qui pourrait forger ces
-  événements depuis la console.
-  "Owner" et "Co-Owner" ont EXACTEMENT les mêmes droits (bannir/débannir de
-  toute l'app) ; seul le libellé affiché diffère. Le plus simple côté serveur
-  est de garder une seule liste de confiance regroupant les deux (ex.
-  OWNER_NULLIDS = owner + co-owners), la distinction Owner/Co-Owner n'étant
-  qu'un affichage côté client.
-  - "app:ban_user"          { nullId, reason? }  bannit un compte de TOUTE
-                              l'app : le serveur doit déconnecter tous ses
-                              sockets actifs et refuser tout futur
-                              /api/login (et idéalement /api/register avec le
-                              même pseudo) tant qu'il est banni.
-  - "app:unban_user"        { nullId }  lève un bannissement global.
-  - "app:list_banned"       {}  demande la liste des comptes actuellement
-                              bannis de l'app (réservé aux OWNER_NULLIDS).
-  - "app:banned_users"      { users: [{ nullId, username?, bannedAt }] }
-                              réponse du serveur à "app:list_banned".
-  - "app:user_banned"       { reason? }  envoyé à l'utilisateur juste avant
-                              de couper sa connexion, pour qu'il comprenne
-                              pourquoi il est déconnecté de force.
-
-  --- Serveurs : événements supplémentaires envoyés par le serveur ---
-  (les événements "server:key_exchange" et "server:message" sont réutilisés
-  dans les deux sens, exactement comme "dm:key_exchange" et "dm:message" :
-  le serveur relaie en ajoutant senderSocketId/senderNullId.)
-  - "server:list"          { servers: [{ id, name, inviteCode, ownerNullId,
-                               members:[{nullId,username,online,socketId,
-                               avatarDataUrl}] }] }  envoyé à la connexion.
-  - "server:created"       { id, name, inviteCode, ownerNullId, members }
-                              accusé après "server:create".
-  - "server:joined"        { id, name, inviteCode, ownerNullId, members }
-                              accusé après "server:join" réussi.
-  - "server:left"          { serverId }  accusé après "server:leave".
-  - "server:error"         { message }  ex: code d'invitation invalide.
-  - "server:member_status" { serverId, nullId, online, socketId }
-  - "server:members"       { serverId, members }  liste complète, ex à
-                              chaque arrivée/départ d'un membre.
-  - "server:key_exchange"  { serverId, senderSocketId, senderNullId,
-                               publicKey, isNewMember }
-  - "server:message"       { serverId, messageId, senderSocketId,
-                               senderNullId, author, ciphertext, iv, kind,
-                               mime, filename, timestamp }  le serveur
-                               éclate le tableau "targets" envoyé par
-                               l'auteur et livre à chaque membre son
-                               ciphertext individuel sous ce même événement.
-
-  --- Envoyés par le serveur, écoutés ici ---
-  - "friend:list"            { friends: [{ nullId, username, online, socketId, avatarDataUrl }] }
-  - "friend:request_received"{ requestId, from: { nullId, username, avatarDataUrl } }
-  - "friend:pending_list"    { requests: [...] }  [NOUVEAU] rattrapage des demandes
-                               reçues pendant une déconnexion.
-  - "friend:added"           { nullId, username, socketId, online, avatarDataUrl }
-  - "friend:removed"         { nullId }
-  - "friend:status"          { nullId, online, socketId }
-  - "friend:avatar_updated"  { nullId, avatarDataUrl }  [NOUVEAU]
-  - "friend:style_updated"   { nullId, nameFont, nameEffect, nameColors }  [NOUVEAU]
-                               diffusé à ses amis en ligne quand quelqu'un change
-                               son style de pseudo (miroir de "profile:style").
-  - "friend:error"           { message }
-  - "dm:key_exchange"        { senderNullId, senderSocketId, publicKey, isNewUser }
-  - "dm:message"             { messageId, senderNullId, author, ciphertext, iv, timestamp }
-  - "dm:queued_messages"     { messages: [...] }  [NOUVEAU] DM reçus hors ligne,
-                               livrés à la reconnexion (file bornée à 200
-                               messages / 14 jours par destinataire).
-  - "dm:pending"             { messageId, targetNullId }  [NOUVEAU] accusé que le
-                               message vient d'être mis en attente (destinataire
-                               hors ligne) plutôt que livré immédiatement.
-  - "dm:typing"              { nullId, isTyping }  [NOUVEAU]
-  - "dm:read"                { nullId, messageId }  [NOUVEAU]
-  - "call:incoming"          { from: { nullId, username, socketId, avatarDataUrl }, sdp }
-  - "call:answer"            { from: { nullId }, sdp }
-  - "call:ice"               { from: { nullId }, candidate }
-  - "call:ended"             { nullId }
-  - "call:declined"          { nullId }
-
-  --- HTTP additionnel ---
-  - GET    /api/sessions      (Authorization: Bearer <token>) [NOUVEAU]
-           -> { sessions: [{ id, current, createdAt, userAgent }] }
-  - DELETE /api/sessions/:id  (Authorization: Bearer <token>) [NOUVEAU]
-           révoque une session (déconnecte cet appareil).
-
-  Note DM : le serveur relaie simplement "dm:key_exchange" et "dm:message"
-  entre les deux sockets concernés (il n'a jamais accès au contenu en
-  clair, tout est chiffré en E2E côté client via ECDH + AES-GCM, comme
-  pour le salon général).
-
-  Si votre serveur actuel ne gère pas encore ça, l'UI reste utilisable
-  (affichage, recherche par NULLID, etc.) mais les actions réseau
-  échoueront silencieusement / afficheront une erreur générique.
-  =====================================================================
-*/
 
 :root {
-  /* ---- Palette : Rouge Foncé & Noir — identité "chiffrée" ---- */
+
   --bg-deepest:   #08080a;
   --bg-panel:     #131316;
   --bg-panel-2:   #1b1b20;
@@ -338,9 +99,6 @@ input{ font-family: var(--font-body); }
 
 :focus-visible{ outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 4px; }
 
-/* =========================================================
-   EFFETS BOUTONS (ripple + retour tactile + brillance)
-   ========================================================= */
 button{ -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .fx-btn{
   position:relative; overflow:hidden;
@@ -355,7 +113,6 @@ button{ -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 @keyframes fx-ripple-anim{ to{ transform: scale(2.6); opacity:0; } }
 @media (prefers-reduced-motion: reduce){ .fx-btn, .fx-btn:active{ transition:none; transform:none; } .fx-ripple{ display:none; } }
 
-/* Boutons "vedette" : lueur douce au survol + shimmer occasionnel */
 .btn-auth.fx-btn:hover:not(:disabled),
 .btn-send.fx-btn:hover:not(:disabled){
   transform: translateY(-1px);
@@ -378,9 +135,6 @@ button{ -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
 .call-btn.fx-btn:hover{ filter: brightness(1.12); box-shadow: 0 6px 18px rgba(0,0,0,0.35); }
 .btn-mini.fx-btn:hover{ transform: translateY(-1px); box-shadow: 0 4px 14px var(--accent-glow); }
 
-/* =========================================================
-   ÉCRAN D'AUTHENTIFICATION
-   ========================================================= */
 html.returning-user .auth-wrap{ display:none !important; }
 .auth-wrap{
   display:flex;
@@ -475,9 +229,6 @@ input:disabled{ opacity:.5; }
 }
 .switch-link:hover{ text-decoration: underline; }
 
-/* =========================================================
-   APPLICATION
-   ========================================================= */
 #chatApp{
   width: 100vw; max-width: none; height: 100vh; height: 100dvh;
   background: var(--bg-panel);
@@ -489,7 +240,6 @@ input:disabled{ opacity:.5; }
 }
 .app-shell{ display:flex; height:100%; width:100%; }
 
-/* --- Rail d'icônes --- */
 .rail{
   width: 72px; background: var(--bg-deepest);
   display:flex; flex-direction:column; align-items:center;
@@ -530,7 +280,6 @@ input:disabled{ opacity:.5; }
   border-radius:50%; background: var(--online); border: 3px solid var(--bg-deepest);
 }
 
-/* --- Panneau latéral (contenu contextuel) --- */
 .side-panel{
   width: 300px; background: var(--bg-panel-2); flex-shrink:0;
   display:flex; flex-direction:column; border-right: 1px solid var(--border-soft);
@@ -599,7 +348,6 @@ input:disabled{ opacity:.5; }
 }
 .request-row:hover{ background: var(--bg-raised); }
 
-/* --- Zone principale --- */
 .main-area{ flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 .chat-header{
   display:flex; align-items:center; justify-content:space-between;
@@ -661,7 +409,6 @@ input:disabled{ opacity:.5; }
 .chat-input-box{ display:flex; gap:10px; padding: 14px 20px 18px 20px; }
 .chat-input-box input{ flex:1; }
 
-/* --- Salons (channels) dans un serveur --- */
 .channel-bar{
   display:flex; align-items:center; gap:6px; padding: 8px 14px; overflow-x:auto;
   border-bottom: 1px solid var(--border-soft); flex-shrink:0;
@@ -680,7 +427,6 @@ input:disabled{ opacity:.5; }
 }
 .channel-add-chip:hover{ background: var(--accent-1); color:white; }
 
-/* --- Réponse / citation --- */
 .reply-context-bar{
   display:flex; align-items:center; justify-content:space-between; gap:10px;
   padding: 8px 20px; background: var(--bg-panel-2); border-top:1px solid var(--border-soft);
@@ -697,7 +443,6 @@ input:disabled{ opacity:.5; }
 .reply-quote .rq-author{ font-weight:700; color: var(--text-muted); }
 .msg.deleted .text{ color: var(--text-faint); font-style:italic; }
 
-/* --- Réactions --- */
 .reactions-row{ display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
 .reaction-pill{
   display:flex; align-items:center; gap:4px; padding: 2px 8px; border-radius: 999px;
@@ -707,7 +452,6 @@ input:disabled{ opacity:.5; }
 .reaction-pill:hover{ filter:brightness(1.15); }
 .reaction-pill.mine{ border-color: var(--accent-2); color: var(--text-primary); background: var(--accent-ring); }
 
-/* --- Menu contextuel message (réagir / répondre / transférer / supprimer) --- */
 .msg-actions-menu{
   position:fixed; z-index:500; background: var(--bg-panel); border:1px solid var(--border-soft);
   border-radius: var(--radius-md); box-shadow: 0 10px 30px rgba(0,0,0,.4); padding:6px; min-width:190px;
@@ -724,7 +468,6 @@ input:disabled{ opacity:.5; }
 .msg-action-item:hover{ background: var(--bg-raised); }
 .msg-action-item.danger{ color: var(--danger); }
 
-/* --- Sélecteur d'amis (création de groupe) / cible de transfert --- */
 .friend-picker-row, .forward-target-row{
   display:flex; align-items:center; gap:10px; padding: 8px; border-radius: var(--radius-md); cursor:pointer;
 }
@@ -737,7 +480,6 @@ input:disabled{ opacity:.5; }
 .btn-send:disabled{ background: var(--bg-raised); color: var(--text-faint); cursor:not-allowed; }
 .char-count{ font-size:10.5px; color: var(--text-faint); text-align:right; padding: 0 20px; font-family: var(--font-mono); }
 
-/* --- Vue "Friends" centrale (placeholder quand aucun DM ouvert) --- */
 .friends-hero{
   flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
   color: var(--text-muted); gap:14px; padding: 20px;
@@ -746,7 +488,6 @@ input:disabled{ opacity:.5; }
 .friends-hero .lead{ font-family: var(--font-display); font-weight:700; font-size:16px; color: var(--text-primary); }
 .friends-hero .sub{ font-size:13px; max-width:320px; text-align:center; line-height:1.5; }
 
-/* --- Profil / NULLID popover --- */
 .profile-pop{
   position:fixed; z-index:40; display:none; width:230px;
   background: var(--bg-raised); border:1px solid var(--border-soft); border-radius: var(--radius-md);
@@ -819,7 +560,6 @@ input:disabled{ opacity:.5; }
   font-weight:700;
 }
 
-/* --- Toast (demande d'ami reçue, erreurs, etc.) --- */
 .toast-stack{ position:fixed; top:18px; right:18px; z-index:60; display:flex; flex-direction:column; gap:10px; }
 .toast{
   background: var(--bg-raised); border:1px solid var(--border-soft); border-left:3px solid var(--accent-2);
@@ -838,16 +578,34 @@ input:disabled{ opacity:.5; }
 .toast .t-decline{ background: var(--bg-panel-2); color: var(--text-muted); }
 .toast .t-decline:hover{ color: var(--text-primary); }
 
-/* --- Overlay d'appel --- */
 .call-overlay{
   position:fixed; inset:0; background: rgba(10,10,14,0.75); backdrop-filter: blur(6px);
   z-index:70; display:none; align-items:center; justify-content:center;
 }
-.call-overlay.open{ display:flex; }
+.call-overlay.open{ display:flex; animation: call-bg-in .28s var(--ease-out); }
+.call-overlay.closing{ animation: call-bg-out .22s ease forwards; }
+@keyframes call-bg-in{ from{ opacity:0; } to{ opacity:1; } }
+@keyframes call-bg-out{ from{ opacity:1; } to{ opacity:0; } }
+@media (prefers-reduced-motion: reduce){ .call-overlay.open, .call-overlay.closing{ animation:none; } }
+
 .call-card{
   background: var(--bg-panel); border:1px solid var(--border-soft); border-radius: var(--radius-lg);
   padding: 36px 32px; width:320px; text-align:center; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  animation: call-card-in .38s cubic-bezier(.34,1.56,.64,1);
 }
+.call-overlay.closing .call-card{ animation: call-card-out .2s ease forwards; }
+@keyframes call-card-in{ from{ opacity:0; transform: scale(.82) translateY(14px); } to{ opacity:1; transform: scale(1) translateY(0); } }
+@keyframes call-card-out{ from{ opacity:1; transform: scale(1); } to{ opacity:0; transform: scale(.92); } }
+.call-card.incoming-shake{ animation: call-card-in .38s cubic-bezier(.34,1.56,.64,1), call-shake 2.4s ease-in-out .4s infinite; }
+@keyframes call-shake{
+  0%, 100%{ transform: rotate(0deg); }
+  4%{ transform: rotate(-1.4deg); }
+  8%{ transform: rotate(1.4deg); }
+  12%{ transform: rotate(-1deg); }
+  16%{ transform: rotate(0deg); }
+}
+@media (prefers-reduced-motion: reduce){ .call-card, .call-card.incoming-shake{ animation:none; } }
+
 .call-avatar{
   width:84px; height:84px; border-radius:50%; margin: 0 auto 16px auto;
   display:flex; align-items:center; justify-content:center; font-family: var(--font-display);
@@ -857,9 +615,34 @@ input:disabled{ opacity:.5; }
   content:""; position:absolute; inset:-8px; border-radius:50%;
   border:2px solid var(--accent-2); animation: ring-pulse 1.4s ease-out infinite;
 }
+.call-avatar.ringing::before{
+  content:""; position:absolute; inset:-8px; border-radius:50%;
+  border:2px solid var(--accent-2); animation: ring-pulse 1.4s ease-out .7s infinite;
+}
 @keyframes ring-pulse{ 0%{ transform:scale(0.9); opacity:1;} 100%{ transform:scale(1.35); opacity:0;} }
+.call-avatar.connected{ animation: call-connected-pop .4s var(--ease-out); }
+.call-avatar.connected::after{
+  content:""; position:absolute; inset:-6px; border-radius:50%;
+  box-shadow: 0 0 0 0 var(--accent-glow); animation: connected-breathe 2.6s ease-in-out infinite;
+}
+@keyframes call-connected-pop{ 0%{ transform:scale(.85); } 55%{ transform:scale(1.08); } 100%{ transform:scale(1); } }
+@keyframes connected-breathe{
+  0%, 100%{ box-shadow: 0 0 0 0 var(--accent-glow); }
+  50%{ box-shadow: 0 0 0 8px rgba(0,0,0,0); }
+}
+@media (prefers-reduced-motion: reduce){
+  .call-avatar.ringing::after, .call-avatar.ringing::before, .call-avatar.connected, .call-avatar.connected::after{ animation:none; }
+}
+
 .call-name{ font-family: var(--font-display); font-weight:700; font-size:17px; margin-bottom:4px; }
-.call-status{ font-size:12.5px; color: var(--text-muted); margin-bottom: 24px; font-family: var(--font-mono); }
+.call-status{ font-size:12.5px; color: var(--text-muted); margin-bottom: 24px; font-family: var(--font-mono); transition: opacity .18s ease; }
+.call-status.dots::after{
+  content:''; display:inline-block; width:1.2em; text-align:left;
+  animation: call-status-dots 1.3s steps(4,end) infinite;
+}
+@keyframes call-status-dots{
+  0%{ content:''; } 25%{ content:'.'; } 50%{ content:'..'; } 75%{ content:'...'; } 100%{ content:''; }
+}
 .call-actions{ display:flex; gap:16px; justify-content:center; }
 .call-btn{
   width:52px; height:52px; border-radius:50%; border:none; cursor:pointer;
@@ -867,20 +650,21 @@ input:disabled{ opacity:.5; }
 }
 .call-btn:active{ transform: scale(0.92); }
 .call-btn svg{ width:22px; height:22px; }
-.call-btn.accept{ background: var(--online); color:#0d0e13; }
+.call-btn.accept{ background: var(--online); color:#0d0e13; animation: accept-btn-pulse 1.6s ease-in-out infinite; }
 .call-btn.decline{ background: var(--danger); color:white; }
 .call-btn.hangup{ background: var(--danger); color:white; }
 .call-btn.mute{ background: var(--bg-raised); color: var(--text-primary); }
 .call-btn.mute.active-mute{ background: var(--accent-1); color:white; }
+@keyframes accept-btn-pulse{
+  0%, 100%{ box-shadow: 0 0 0 0 rgba(60, 220, 130, .55); }
+  50%{ box-shadow: 0 0 0 9px rgba(60, 220, 130, 0); }
+}
+@media (prefers-reduced-motion: reduce){ .call-btn.accept{ animation:none; } }
 
-/* --- Fondu doux entre les vues --- */
 .view-fade{ animation: view-fade-in .22s var(--ease-out); }
 @keyframes view-fade-in{ from{ opacity:0; transform: translateY(6px); } to{ opacity:1; transform:none; } }
 @media (prefers-reduced-motion: reduce){ .view-fade{ animation:none; } }
 
-/* =========================================================
-   TUTORIEL D'ONBOARDING
-   ========================================================= */
 .tuto-overlay{
   position:fixed; inset:0; background: rgba(6,6,9,0.78); backdrop-filter: blur(6px);
   z-index:300; display:none; align-items:center; justify-content:center; padding:16px;
@@ -923,9 +707,6 @@ input:disabled{ opacity:.5; }
 .tuto-help-btn{ position:relative; }
 .tuto-help-btn .rail-badge.pulse{ animation: pulseRec 1.6s infinite; }
 
-/* =========================================================
-   RESPONSIVE MOBILE
-   ========================================================= */
 @media (max-width: 860px){
   #chatApp{ width:100vw; max-width:none; height:100dvh; border-radius:0; border:none; }
   .side-panel{
@@ -943,7 +724,6 @@ input:disabled{ opacity:.5; }
   #chatApp{ width:100vw; height:100dvh; height:100svh; border-radius:0; }
   .app-shell{ flex-direction:column-reverse; }
 
-  /* La barre d'icônes devient une barre du bas, façon app mobile */
   .rail{
     width:100%; flex-direction:row; align-items:center; justify-content:space-around;
     padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)) 10px;
@@ -972,7 +752,6 @@ input:disabled{ opacity:.5; }
 
   .call-card{ width:min(320px, 88vw); padding: 28px 22px; }
 
-  /* Le popover profil devient une feuille ancrée en bas de l'écran */
   .profile-pop{
     left:12px !important; right:12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); top:auto !important;
     width:auto; max-height:70vh; overflow-y:auto;
@@ -986,13 +765,9 @@ input:disabled{ opacity:.5; }
   .avatar{ width:38px; height:38px; }
 }
 
-/* =========================================================
-   STYLES DE PSEUDO — polices "façon Instagram" + effets
-   ========================================================= */
 .styled-name{ display:inline-flex; flex-wrap:wrap; }
 .styled-name .ln{ display:inline-block; white-space:pre; }
 
-/* --- Néon --- */
 .fx-neon{
   color:#fff;
   text-shadow:
@@ -1007,7 +782,6 @@ input:disabled{ opacity:.5; }
   4%, 5%{ opacity:0.55; }
 }
 
-/* --- Vague --- */
 .fx-wave .ln{
   animation: fxWave 1.6s ease-in-out infinite;
   animation-delay: calc(var(--i, 0) * 0.08s);
@@ -1017,7 +791,6 @@ input:disabled{ opacity:.5; }
   50%{ transform: translateY(-5px); }
 }
 
-/* --- Arc-en-ciel --- */
 .fx-rainbow{
   background: linear-gradient(90deg,#ff5f6d,#ffc371,#f9f871,#7bed9f,#5ee7ff,#a29bfe,#ff5f6d);
   background-size: 300% 100%;
@@ -1029,7 +802,6 @@ input:disabled{ opacity:.5; }
   100%{ background-position: 300% 50%; }
 }
 
-/* --- Glitch --- */
 .fx-glitch{ position:relative; display:inline-block; }
 .fx-glitch .ln{ animation: fxGlitchJitter 3.2s infinite; animation-delay: calc(var(--i, 0) * 0.05s); }
 @keyframes fxGlitchJitter{
@@ -1039,7 +811,6 @@ input:disabled{ opacity:.5; }
   97%{ transform:translate(0,0); text-shadow:none; }
 }
 
-/* --- Brillance / Shine --- */
 .fx-shine{
   background: linear-gradient(100deg, currentColor 30%, #fff 50%, currentColor 70%);
   background-size: 220% 100%;
@@ -1051,14 +822,12 @@ input:disabled{ opacity:.5; }
   100%{ background-position: -50% 0; }
 }
 
-/* --- Pulse --- */
 .fx-pulse{ display:inline-block; animation: fxPulse 1.4s ease-in-out infinite; transform-origin:center; }
 @keyframes fxPulse{
   0%, 100%{ transform: scale(1); }
   50%{ transform: scale(1.12); }
 }
 
-/* --- Secousse (shake) : jitter continu, différent du glitch (pas de dédoublement couleur) --- */
 .fx-shake .ln{ display:inline-block; animation: fxShake 0.42s ease-in-out infinite; animation-delay: calc(var(--i, 0) * 0.045s); }
 @keyframes fxShake{
   0%, 100%{ transform: rotate(0deg) translateX(0); }
@@ -1066,14 +835,12 @@ input:disabled{ opacity:.5; }
   75%{ transform: rotate(6deg) translateX(1px); }
 }
 
-/* --- Contour (outline) : lettres évidées, statique --- */
 .fx-outline{
   color: transparent;
   -webkit-text-stroke: 1.5px var(--outline-color, var(--text-primary));
   text-stroke: 1.5px var(--outline-color, var(--text-primary));
 }
 
-/* --- Ombre 3D --- */
 .fx-shadow3d{
   color: var(--shadow3d-color, var(--text-primary));
   text-shadow:
@@ -1081,7 +848,6 @@ input:disabled{ opacity:.5; }
     4px 4px 6px rgba(0,0,0,0.4);
 }
 
-/* --- Soulignement animé --- */
 .fx-underline{ position:relative; display:inline-block; padding-bottom:3px; }
 .fx-underline::after{
   content:""; position:absolute; left:0; right:0; bottom:0; height:2px;
@@ -1094,14 +860,12 @@ input:disabled{ opacity:.5; }
   100%{ background-position: 250% 0; }
 }
 
-/* --- Scintillement (sparkle) : chaque lettre clignote légèrement --- */
 .fx-sparkle .ln{ display:inline-block; animation: fxSparkle 1.8s ease-in-out infinite; animation-delay: calc(var(--i, 0) * 0.13s); }
 @keyframes fxSparkle{
   0%, 100%{ opacity:1; filter:none; }
   50%{ opacity:0.45; filter: drop-shadow(0 0 4px #fff); }
 }
 
-/* --- Feu --- */
 .fx-fire{
   background: linear-gradient(180deg, #fff5b8 0%, #ffd23f 20%, #ff8c00 45%, #ff3d00 70%, #b30000 100%);
   background-size: 100% 250%;
@@ -1114,7 +878,6 @@ input:disabled{ opacity:.5; }
   50%{ background-position: 0% 40%; }
 }
 
-/* --- Glace --- */
 .fx-ice{
   color:#eaffff;
   text-shadow:
@@ -1129,11 +892,9 @@ input:disabled{ opacity:.5; }
   50%{ filter:brightness(1.3); }
 }
 
-/* --- Clignotant --- */
 .fx-blink{ animation: fxBlink 1.1s steps(1) infinite; }
 @keyframes fxBlink{ 0%, 49%{ opacity:1; } 50%, 100%{ opacity:0.15; } }
 
-/* --- Rotation 3D --- */
 .fx-rotate3d{ perspective:300px; }
 .fx-rotate3d .ln{
   display:inline-block; transform-style:preserve-3d;
@@ -1145,7 +906,6 @@ input:disabled{ opacity:.5; }
   100%{ transform: rotateY(360deg); }
 }
 
-/* --- Gélatine --- */
 .fx-jelly .ln{
   display:inline-block;
   animation: fxJelly 1s ease-in-out infinite;
@@ -1158,7 +918,6 @@ input:disabled{ opacity:.5; }
   70%{ transform: scale(0.9,1.1); }
 }
 
-/* --- Battement de cœur --- */
 .fx-heartbeat{ display:inline-block; transform-origin:center; animation: fxHeartbeat 1.2s ease-in-out infinite; }
 @keyframes fxHeartbeat{
   0%, 100%{ transform:scale(1); }
@@ -1168,7 +927,6 @@ input:disabled{ opacity:.5; }
   70%{ transform:scale(1); }
 }
 
-/* --- Aperçu dans les Paramètres --- */
 .name-style-preview{
   display:flex; align-items:center; justify-content:center;
   min-height:44px; padding:10px; margin:8px 0 14px 0;
@@ -1205,9 +963,6 @@ input:disabled{ opacity:.5; }
 </head>
 <body>
 
-<!-- ============================================================
-     ÉCRAN DE CONNEXION / INSCRIPTION
-     ============================================================ -->
 <div class="auth-wrap" id="authWrap">
   <div class="cipher-rain" id="cipherRain"></div>
   <div class="auth-card" id="authBox">
@@ -1262,13 +1017,9 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- ============================================================
-     APPLICATION
-     ============================================================ -->
 <div id="chatApp">
   <div class="app-shell">
 
-    <!-- Rail d'icônes -->
     <div class="rail">
 <img src="logo.png" alt="Logo" style="width: 48px; height: 48px; object-fit: cover; margin-bottom: 6px; border-radius: 50%; background: var(--accent-grad);"
      onerror="this.style.display='none'; document.getElementById('railBrandFallback').style.display='flex';">
@@ -1303,7 +1054,6 @@ input:disabled{ opacity:.5; }
       </div>
     </div>
 
-    <!-- Panneau latéral : Amis -->
     <div class="side-panel" id="friendsPanel" style="display:none;">
       <div class="side-header">
         <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
@@ -1329,7 +1079,6 @@ input:disabled{ opacity:.5; }
       <div class="list-scroll" id="friendListScroll"></div>
     </div>
 
-    <!-- Panneau latéral : Serveurs -->
     <div class="side-panel" id="serversPanel" style="display:none;">
       <div class="side-header">
         <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
@@ -1357,7 +1106,6 @@ input:disabled{ opacity:.5; }
       <div class="list-scroll" id="serverListScroll"></div>
     </div>
 
-    <!-- Panneau latéral : Groupes -->
     <div class="side-panel" id="groupsPanel" style="display:none;">
       <div class="side-header">
         <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
@@ -1373,9 +1121,7 @@ input:disabled{ opacity:.5; }
       <div class="list-scroll" id="groupListScroll"></div>
     </div>
 
-    <!-- Zone principale -->
     <div class="main-area">
-      <!-- Vue Salon général -->
       <div class="main-area" id="viewGeneral" style="display:flex;">
         <div class="chat-header">
           <span class="title"><span class="hash">#</span> général</span>
@@ -1396,14 +1142,12 @@ input:disabled{ opacity:.5; }
         <div class="char-count" id="charCount"></div>
       </div>
 
-      <!-- Vue Amis (placeholder central) -->
       <div class="friends-hero" id="viewFriendsHero" style="display:none;">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <div class="lead">Tes amis</div>
         <div class="sub">Ajoute quelqu'un avec son NULLID pour discuter en privé et l'appeler. Clique sur un ami dans la liste pour ouvrir la conversation.</div>
       </div>
 
-      <!-- Vue Conversation privée (DM) -->
       <div class="main-area" id="viewDM" style="display:none;">
         <div class="chat-header">
           <button class="back-btn fx-btn" onclick="closeDm()" title="Retour">
@@ -1438,21 +1182,18 @@ input:disabled{ opacity:.5; }
         </div>
       </div>
 
-      <!-- Vue Serveurs (placeholder central) -->
       <div class="friends-hero" id="viewServersHero" style="display:none;">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
         <div class="lead">Tes serveurs</div>
         <div class="sub">Crée un serveur ou rejoins-en un avec un code d'invitation pour discuter chiffré à plusieurs, comme sur Discord. Clique sur un serveur dans la liste pour l'ouvrir.</div>
       </div>
 
-      <!-- Vue Groupes (placeholder central) -->
       <div class="friends-hero" id="viewGroupsHero" style="display:none;">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <div class="lead">Tes groupes</div>
         <div class="sub">Un groupe réunit entre 2 et 30 amis pour discuter à plusieurs, chiffré de bout en bout, sans code d'invitation à partager. Clique sur "+ Créer un groupe" pour commencer.</div>
       </div>
 
-      <!-- Vue Conversation de serveur -->
       <div class="main-area" id="viewServerChat" style="display:none;">
         <div class="chat-header">
           <button class="back-btn fx-btn" onclick="closeServer()" title="Retour">
@@ -1491,7 +1232,6 @@ input:disabled{ opacity:.5; }
         </div>
       </div>
 
-      <!-- Vue Conversation de groupe -->
       <div class="main-area" id="viewGroupChat" style="display:none;">
         <div class="chat-header">
           <button class="back-btn fx-btn" onclick="closeGroup()" title="Retour">
@@ -1522,7 +1262,6 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- Popover profil / NULLID -->
 <div class="profile-pop" id="profilePop">
   <div class="profile-banner" id="profileBanner">
     <div class="avatar profile-pop-avatar" id="profilePopAvatar"></div>
@@ -1545,7 +1284,6 @@ input:disabled{ opacity:.5; }
   <div class="credit-line">Fait par <span>2FT4</span></div>
 </div>
 
-<!-- Modale Paramètres -->
 <div class="settings-overlay" id="settingsOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
  <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(420px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
@@ -1591,7 +1329,7 @@ input:disabled{ opacity:.5; }
       </div>
     </div>
 
-    <div class="label-small">Bannière de profil <span style="text-transform:none; color:var(--text-faint);">(comme Nitro)</span></div>
+    <div class="label-small">Bannière de profil</div>
     <div class="profile-theme-preview" id="bannerPreview" style="margin:8px 0 10px 0;"></div>
     <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px;">
       <button class="settings-btn fx-btn" onclick="document.getElementById('bannerFileInput').click()">Choisir une image</button>
@@ -1749,7 +1487,6 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- Modale Membres du serveur (rôles, exclusion, bannissement) -->
 <div class="settings-overlay" id="serverMembersOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
   <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(440px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
@@ -1769,7 +1506,6 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- Modale Membres du groupe -->
 <div class="settings-overlay" id="groupMembersOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
   <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(440px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
@@ -1786,7 +1522,6 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- Modale Création de groupe (nom + sélection d'amis) -->
 <div class="settings-overlay" id="createGroupOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:200; align-items:center; justify-content:center;">
   <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(440px, 92vw); max-height:85vh; overflow-y:auto; padding:22px;">
     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
@@ -1806,7 +1541,6 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- Modale Transférer un message -->
 <div class="settings-overlay" id="forwardMessageOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:210; align-items:center; justify-content:center;">
   <div class="settings-card" style="background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-lg); width:min(400px, 92vw); max-height:80vh; overflow-y:auto; padding:20px;">
     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
@@ -1820,7 +1554,6 @@ input:disabled{ opacity:.5; }
   </div>
 </div>
 
-<!-- Menu contextuel flottant sur un message (réagir / répondre / transférer / supprimer) -->
 <div class="msg-actions-menu" id="msgActionMenu" style="display:none;">
   <div class="emoji-quickbar" id="msgActionEmojis"></div>
   <button class="msg-action-item" id="msgActionReply" onclick="msgActionMenuReply()">↩️ Répondre</button>
@@ -1828,10 +1561,8 @@ input:disabled{ opacity:.5; }
   <button class="msg-action-item danger" id="msgActionDelete" onclick="msgActionMenuDelete()">🗑️ Supprimer</button>
 </div>
 
-<!-- Toasts (demandes d'amis, erreurs) -->
 <div class="toast-stack" id="toastStack"></div>
 
-<!-- Overlay d'appel -->
 <div class="call-overlay" id="callOverlay">
   <div class="call-card">
     <div class="call-avatar" id="callAvatar">?</div>
@@ -1842,8 +1573,8 @@ input:disabled{ opacity:.5; }
 </div>
 
 <audio id="remoteAudio" autoplay></audio>
+<audio id="tutoAudio" src="/audio/echoed-audio.wav" preload="none"></audio>
 
-<!-- Tutoriel de bienvenue -->
 <div class="tuto-overlay" id="tutoOverlay">
   <div class="tuto-card">
     <button class="tuto-skip" onclick="closeTutorial()">Passer ✕</button>
@@ -1859,92 +1590,77 @@ input:disabled{ opacity:.5; }
 </div>
 
 <script>
-/* =========================================================
-   ÉTAT GLOBAL
-   ========================================================= */
+
 let isLoginMode = true;
 let currentUser = null;
 let myNullId = null;
 let myAvatarDataUrl = null;
 let myNameFont = 'none';
 let myNameEffect = 'none';
-let myNameColors = []; // 0 = couleur par défaut, 1 = uni, 2+ = dégradé / multicolore
+let myNameColors = [];
 let authToken = null;
 let socket = null;
 let myKeyPair = null;
 let currentView = 'general';
 let currentFriendTab = 'online';
 
-// --- Persistance de session : quasi-permanente, on reste connecté d'un lancement à l'autre ---
-// (la session se prolonge automatiquement à chaque ouverture réussie de l'app via renewSession(),
-// donc en pratique le mot de passe n'est redemandé qu'après une déconnexion manuelle ou ~10 ans d'inactivité)
 const SESSION_STORAGE_KEY = 'nullchat_session_v1';
-const SESSION_DURATION_MS = 3650 * 24 * 60 * 60 * 1000; // ~10 ans
+const SESSION_DURATION_MS = 3650 * 24 * 60 * 60 * 1000;
 const NEW_ACCOUNT_FLAG_KEY = 'nullchat_new_account';
 const TUTORIAL_SEEN_KEY = 'nullchat_tutorial_seen';
 const NAME_STYLE_KEY = 'nullchat_name_style_v1';
 let tutorialStepIndex = 0;
 let pendingTutorialAfterLogin = false;
 
-// Chat général : peer -> { sharedKey }, indexé par socket id (comportement existant)
 const peers = new Map();
 
-// Amis : nullId -> { nullId, username, online, socketId }
 const friends = new Map();
-// Demandes reçues en attente : requestId -> { nullId, username }
+
 const pendingRequests = new Map();
-// Clés partagées pour les messages privés, indexées par nullId
+
 const dmKeys = new Map();
-// Historique des conversations privées, indexé par nullId
+
 const dmHistory = new Map();
-// Messages non lus par ami, indexé par nullId
+
 const unreadDm = new Map();
-// Ami actuellement ouvert en DM
+
 let currentDmPeer = null;
-// NULLIDs bloqués (persistés localement, propagés au serveur via friend:block)
+
 const blockedIds = new Set();
 
-// ---- Serveurs (groupes chiffrés façon Discord) ----
-// Mes serveurs : serverId -> { id, name, inviteCode, ownerNullId, members: [...] }
 const myServers = new Map();
-// Clés partagées par serveur et par socket de membre : serverId -> Map(socketId -> { sharedKey, nullId })
+
 const serverKeys = new Map();
-// Historique des messages par serveur, indexé par serverId
+
 const serverHistory = new Map();
-// Messages non lus par serveur, indexé par serverId
+
 const unreadServer = new Map();
-// Serveur actuellement ouvert
+
 let currentServerId = null;
-// Salon actuellement ouvert dans le serveur courant : serverId -> channelId
+
 const currentChannelByServer = new Map();
 
-// ---- Groupes (chat à plusieurs, 2 à 30 membres, sans code d'invitation) ----
-// Mes groupes : groupId -> { id, name, ownerNullId, members: [...] }
 const myGroups = new Map();
-// Clés partagées par groupe et par socket de membre : groupId -> Map(socketId -> { sharedKey, nullId })
+
 const groupKeys = new Map();
-// Historique des messages par groupe, indexé par groupId
+
 const groupHistory = new Map();
-// Messages non lus par groupe, indexé par groupId
+
 const unreadGroup = new Map();
-// Groupe actuellement ouvert
+
 let currentGroupId = null;
 
-// ---- Réactions / réponses / suppression de message (DM, serveur, groupe) ----
-// Message auquel on est en train de répondre : { scope, messageId, author, preview, ctx } | null
 let pendingReplyTo = null;
-// Émoji utilisés récemment pour la palette d'appui long (persistés localement)
+
 const RECENT_EMOJIS_KEY = 'nullchat_recent_emojis_v1';
 const DEFAULT_EMOJI_PALETTE = ['❤️','😂','😮','😢','👍','🔥','🎉','😡'];
-// Registre des bulles actuellement affichées à l'écran, indexé par messageId,
-// pour pouvoir retrouver/mettre à jour une bulle précise (réaction/suppression)
-// sans devoir re-render tout l'historique. Vidé/reconstruit à chaque render.
+
 const renderedMessageEls = new Map();
-// Message actuellement ciblé par le menu contextuel (appui long / clic droit)
-let msgActionMenuTarget = null; // { entry, scope, ctx }
-// Message actuellement ciblé par la modale "Transférer"
-let forwardMessageTarget = null; // entry
-// Timer d'appui long en cours (pour distinguer tap simple / double-tap / appui long)
+
+let msgActionMenuTarget = null;
+
+let forwardMessageTarget = null;
+
 let longPressTimer = null;
 let lastTapInfo = { id: null, time: 0 };
 
@@ -1953,9 +1669,6 @@ function genMessageId(){
   return 'm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 }
 
-// Encapsule un texte clair avant chiffrement, en y attachant éventuellement une
-// référence de réponse. Reste rétro-compatible : un ancien message texte "brut"
-// (sans enveloppe JSON) est traité comme { body: <texte>, reply: null } à la lecture.
 function packTextEnvelope(body, replyTo){
   if (!replyTo) return body;
   return JSON.stringify({ __nc: 1, body, reply: { author: replyTo.author, preview: replyTo.preview } });
@@ -1968,21 +1681,13 @@ function unpackTextEnvelope(raw){
       if (parsed && parsed.__nc === 1 && typeof parsed.body === 'string'){
         return { body: parsed.body, reply: parsed.reply || null };
       }
-    }catch(e){ /* pas une enveloppe JSON, on retombe sur le texte brut */ }
+    }catch(e){  }
   }
   return { body: raw, reply: null };
 }
 
-// ---- Owner de l'application (modération globale, PAS le "owner" d'un serveur créé) ----
-// Remplace la valeur ci-dessous par TON NULLID (visible dans Paramètres) pour débloquer
-// le panneau d'administration globale ("Bannir de l'app"). Ce n'est qu'un affichage côté
-// client : le serveur DOIT revérifier indépendamment ce nullId avant d'agir (voir contrat
-// réseau en tête de fichier, section "Owner de l'application").
 const OWNER_NULLIDS = ['OWNERISPEAK'];
-// Ajoute ici les NULLID d'amis à qui tu veux donner exactement les mêmes droits
-// d'administration globale que toi (bannir/débannir de toute l'app). Ils apparaîtront
-// avec le libellé "Co-Owner" au lieu de "Owner", mais les permissions sont identiques.
-// Ex: const COOWNER_NULLIDS = ['A3F9-72CD', 'B7K2-91XZ'];
+
 const COOWNER_NULLIDS = ['ISNABDD'];
 function isAppOwner(){ return !!myNullId && (OWNER_NULLIDS.includes(myNullId) || COOWNER_NULLIDS.includes(myNullId)); }
 function appOwnerRoleLabel(){
@@ -1991,7 +1696,7 @@ function appOwnerRoleLabel(){
   if (COOWNER_NULLIDS.includes(myNullId)) return 'Co-Owner';
   return '';
 }
-let appBannedUsers = []; // rempli via l'évènement "app:banned_users" (réservé owner)
+let appBannedUsers = [];
 
 function banUserFromApp(nullId, username){
   if (!isAppOwner() || !nullId) return;
@@ -2046,8 +1751,6 @@ function banUserFromAppByInput(){
   input.value = '';
 }
 
-// S'assure qu'un objet serveur reçu du réseau a bien des tableaux admins/bannedNullIds
-// (rétro-compatible si le serveur ne les envoie pas encore).
 function normalizeServer(srv){
   if (!srv) return srv;
   if (!Array.isArray(srv.admins)) srv.admins = srv.ownerNullId ? [srv.ownerNullId] : [];
@@ -2058,25 +1761,21 @@ function isServerOwner(srv, nullId){ return !!srv && srv.ownerNullId === (nullId
 function isServerAdmin(srv, nullId){ return !!srv && Array.isArray(srv.admins) && srv.admins.includes(nullId || myNullId); }
 function canModerateServer(srv){ return isServerOwner(srv) || isServerAdmin(srv); }
 
-// ---- Perf : évite le gel de l'UI après beaucoup de messages ----
-const MAX_RENDERED_MESSAGES = 200; // messages gardés dans le DOM par salon/conv
+const MAX_RENDERED_MESSAGES = 200;
 let activeReveals = 0;
-const MAX_CONCURRENT_REVEALS = 6; // au-delà, on affiche le texte direct (pas d'anim)
+const MAX_CONCURRENT_REVEALS = 6;
 
-// ---- Pièces jointes ----
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024; // 10 Go, avant chiffrement (voir avertissement dans le contrat serveur en tête de fichier)
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024 * 1024;
 const ATTACHMENT_LIMIT_LABEL = '10 Go';
 let mediaRecorder = null;
 let recordedChunks = [];
 
-// Notifications
 let notifsEnabled = false;
 let audioCtx = null;
 
-// Appel en cours
 let rtcConn = null;
 let localStream = null;
-let activeCallPeer = null; // { nullId, username, socketId }
+let activeCallPeer = null;
 let callMuted = false;
 
 function colorForName(name){
@@ -2087,7 +1786,6 @@ function colorForName(name){
 }
 function initialFor(name){ return (name || '?').trim().charAt(0).toUpperCase(); }
 
-// Retrouve la préférence de style (police/effet/couleurs) à appliquer à l'auteur d'un message.
 function nameStyleForAuthor(author, isOwn){
   if (isOwn) return { font: myNameFont, effect: myNameEffect, colors: myNameColors };
   for (const f of friends.values()){
@@ -2096,14 +1794,13 @@ function nameStyleForAuthor(author, isOwn){
   return { font: 'none', effect: 'none', colors: [] };
 }
 
-// Affiche une photo de profil si disponible, sinon retombe sur l'initiale colorée.
 function renderAvatarInto(el, { username, avatarDataUrl }){
   if (!el) return;
   if (avatarDataUrl){
     el.style.backgroundImage = `url(${avatarDataUrl})`;
     el.style.backgroundSize = 'cover';
     el.style.backgroundPosition = 'center';
-    el.style.background = el.style.background; // no-op, garde le fallback si l'image casse
+    el.style.background = el.style.background;
     el.textContent = '';
   } else {
     el.style.backgroundImage = 'none';
@@ -2111,9 +1808,7 @@ function renderAvatarInto(el, { username, avatarDataUrl }){
     el.textContent = initialFor(username);
   }
 }
-// Revalidation côté client (défense en profondeur) : on ne fait jamais confiance
-// à une chaîne provenant du réseau avant de l'interpoler dans un attribut HTML,
-// même si le serveur est censé l'avoir déjà validée.
+
 const SAFE_AVATAR_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
 function avatarStyleAttr({ username, avatarDataUrl }){
   if (avatarDataUrl && SAFE_AVATAR_DATA_URL_RE.test(avatarDataUrl)){
@@ -2127,11 +1822,7 @@ const SAFE_ATTACHMENT_DATA_URL_RE = {
   video: /^data:video\/[a-z0-9.+-]+;base64,/i,
   audio: /^data:audio\/[a-z0-9.+-]+;base64,/i
 };
-// Le contenu déchiffré (dataUrl) provient d'un contact et n'est jamais un pur hasard
-// bienveillant à faire confiance : on vérifie que c'est bien un data: URI local du bon
-// type avant de l'utiliser comme src, sinon un contact malveillant pourrait glisser une
-// URL externe qui, chargée automatiquement, servirait de balise de tracking (fuite d'IP,
-// confirmation de lecture silencieuse).
+
 function isSafeAttachmentDataUrl(dataUrl, kind){
   return typeof dataUrl === 'string' && !!SAFE_ATTACHMENT_DATA_URL_RE[kind]?.test(dataUrl);
 }
@@ -2142,13 +1833,6 @@ function escapeHtml(str){
   return div.innerHTML;
 }
 
-/* =========================================================
-   POLICES "FAÇON INSTAGRAM" (Unicode) + EFFETS DE PSEUDO
-   Ceci ne change jamais le pseudo réel (login, recherche, NULLID) :
-   on ne fait que remplacer, à l'AFFICHAGE, chaque lettre par son
-   équivalent Unicode stylisé. Aucune donnée envoyée au serveur
-   n'est du HTML libre : uniquement des clés fixes (voir NAME_FONTS).
-   ========================================================= */
 const NAME_FONTS = {
   none:  { label: 'Normale',        sample: 'Abc' },
   upperCase:{ label: 'MAJUSCULES',  sample: 'ABC', caseTransform: 'upper' },
@@ -2195,7 +1879,6 @@ const NAME_EFFECTS = {
   heartbeat:{ label: 'Battement', cls: 'fx-heartbeat' }
 };
 
-// Convertit une chaîne normale vers son équivalent Unicode stylisé.
 function toFancyFont(text, fontKey){
   const def = NAME_FONTS[fontKey];
   if (!def || fontKey === 'none') return text || '';
@@ -2235,9 +1918,6 @@ function toFancyFont(text, fontKey){
   return out;
 }
 
-// Construit le HTML (échappé) d'un pseudo stylisé, prêt à insérer via innerHTML.
-// rawName = pseudo réel (jamais modifié en base) ; font/effect = clés fixes ci-dessus ;
-// colors = tableau de couleurs hex (#rrggbb) validées, 0 à 6 éléments.
 function styledNameHTML(rawName, font, effect, colors){
   colors = Array.isArray(colors) ? colors.filter(c => /^#[0-9a-fA-F]{6}$/.test(c)).slice(0, 16) : [];
   const fancy = toFancyFont(rawName || '', font || 'none');
@@ -2286,7 +1966,6 @@ function styledNameHTML(rawName, font, effect, colors){
   return `<span class="styled-name ${fx.cls}"${colorStyle ? ` style="${colorStyle}"` : ''}>${escapeHtml(fancy)}</span>`;
 }
 
-// --- Gestion de la préférence de style du pseudo (locale + envoyée aux amis) ---
 function loadNameStylePref(){
   try{
     const raw = localStorage.getItem(NAME_STYLE_KEY);
@@ -2301,7 +1980,7 @@ function loadNameStylePref(){
 function saveNameStylePref(){
   try{ localStorage.setItem(NAME_STYLE_KEY, JSON.stringify({ font: myNameFont, effect: myNameEffect, colors: myNameColors })); }catch(e){}
 }
-// Sauvegarde, rediffuse aux amis et rafraîchit l'UI après tout changement de style.
+
 function commitNameStyle(){
   saveNameStylePref();
   renderNameStylePicker();
@@ -2361,14 +2040,6 @@ function renderNameStylePicker(){
 }
 loadNameStylePref();
 
-/* =========================================================
-   BANNIÈRE & FOND DE PROFIL (façon Nitro)
-   La bannière peut être une image (redimensionnée côté client) ou l'un des
-   dégradés prédéfinis ci-dessous ; le fond du profil ne propose que des
-   dégradés prédéfinis (on n'envoie jamais de CSS libre au serveur/aux amis,
-   uniquement une clé fixe parmi PROFILE_PRESETS, ou une data URL image pour
-   la bannière — même logique de sûreté que pour la photo de profil).
-   ========================================================= */
 const PROFILE_THEME_KEY = 'nullchat_profile_theme_v1';
 const PROFILE_PRESETS = {
   crimson:  { label: 'Cramoisi',  css: 'linear-gradient(135deg,#8b0000,#ff2d47)' },
@@ -2391,9 +2062,8 @@ const PROFILE_PRESETS = {
 const MAX_BANNER_SOURCE_BYTES = 8 * 1024 * 1024;
 const BANNER_TARGET_W = 480, BANNER_TARGET_H = 160;
 
-// { type: 'none'|'image'|'preset'|'gradient', value: null|dataUrl|presetKey|{c1,c2} }
 let myProfileBanner = { type: 'none', value: null };
-// { type: 'none'|'preset'|'gradient', value: null|presetKey|{c1,c2} }
+
 let myProfileBg = { type: 'none', value: null };
 
 function isValidGradientValue(v){
@@ -2421,7 +2091,7 @@ function bannerCssValue(){
 function bgCssValue(){
   if (myProfileBg.type === 'preset') return PROFILE_PRESETS[myProfileBg.value]?.css || 'none';
   if (myProfileBg.type === 'gradient' && isValidGradientValue(myProfileBg.value)) return customGradientCss(myProfileBg.value);
-  return null; // null = on retombe sur var(--bg-raised) via la CSS de base
+  return null;
 }
 function applyProfileTheme(){
   const banner = document.getElementById('profileBanner');
@@ -2523,12 +2193,6 @@ function renderProfileThemePicker(){
 }
 loadProfileTheme();
 
-/* =========================================================
-   THÈME DE L'APPLICATION (couleurs du fond + accent, écran
-   d'accueil/connexion inclus) — presets prêts à l'emploi ou
-   couleurs 100% personnalisées. Purement local (jamais envoyé
-   au serveur, contrairement au thème de profil ci-dessus).
-   ========================================================= */
 const APP_THEME_KEY = 'nullchat_app_theme_v1';
 const APP_THEME_PRESETS = {
   default:  { label: 'Rouge foncé (défaut)', vars: {
@@ -2564,7 +2228,6 @@ const APP_THEME_PRESETS = {
 };
 const APP_THEME_VAR_KEYS = ['--bg-deepest','--bg-panel','--bg-panel-2','--bg-raised','--border-soft','--accent-1','--accent-2','--accent-solid','--accent-grad','--accent-ring','--accent-glow'];
 
-// { mode: 'preset'|'custom', preset: clé, custom: {bg, panel, accent}, vars: {..résolues..} }
 let myAppTheme = { mode: 'preset', preset: 'default', custom: { bg: '#08080a', panel: '#131316', accent: '#ff2d47' }, vars: null };
 
 function clampByte(n){ return Math.max(0, Math.min(255, Math.round(n))); }
@@ -2664,21 +2327,13 @@ function renderAppThemePicker(){
 loadAppTheme();
 applyAppTheme();
 
-/* =========================================================
-   ANIMATION SIGNATURE : "déchiffrement" visuel du texte
-   Les messages reçus se révèlent depuis un flux de caractères
-   cryptiques vers le texte en clair, pour rendre visible ce que
-   fait réellement l'app à chaque message.
-   ========================================================= */
 const CIPHER_CHARS = '!<>-_\\/[]{}—=+*^?#$%&01';
 function prefersReducedMotion(){
   return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 function revealText(el, finalText, duration){
   duration = duration || Math.min(700, 220 + finalText.length * 6);
-  // Si trop de messages arrivent d'un coup (spam), on saute l'animation :
-  // c'est ce qui provoquait le "gel" de la fenêtre / l'impression de ne
-  // plus pouvoir écrire après avoir reçu beaucoup de messages.
+
   if (prefersReducedMotion() || !finalText || activeReveals >= MAX_CONCURRENT_REVEALS){
     el.textContent = finalText;
     return;
@@ -2693,7 +2348,7 @@ function revealText(el, finalText, duration){
   const len = finalText.length;
   const start = performance.now();
   function frame(now){
-    // Si l'élément a été retiré du DOM (historique tronqué), on arrête proprement.
+
     if (!el.isConnected){ finish(); return; }
     const t = Math.min(1, (now - start) / duration);
     let out = '';
@@ -2713,14 +2368,8 @@ function revealText(el, finalText, duration){
   requestAnimationFrame(frame);
 }
 
-/* =========================================================
-   AUTHENTIFICATION
-   ========================================================= */
 function setAuthError(msg){ document.getElementById('authError').textContent = msg || ''; }
 
-// Identifiant du code de vérification actuellement affiché (fourni par le
-// serveur via GET /api/auth/captcha). Doit être renvoyé avec captchaInput
-// lors de /api/login et /api/register.
 let currentCaptchaId = null;
 
 async function loadAuthCaptcha(){
@@ -2744,8 +2393,6 @@ async function loadAuthCaptcha(){
   }
 }
 
-// Identifiant de la vérification 2FA en attente (renvoyé par /api/login
-// quand le compte a un e-mail enregistré). null = pas de 2FA en cours.
 let pending2FAId = null;
 
 function toggleAuthMode(){
@@ -2757,7 +2404,7 @@ function toggleAuthMode(){
   document.getElementById('toggleLink').innerText = isLoginMode ? "Besoin d'un compte ? S'inscrire" : 'Déjà un compte ? Se connecter';
   document.getElementById('authNullIdGroup').style.display = isLoginMode ? 'none' : 'block';
   document.getElementById('authEmailGroup').style.display = isLoginMode ? 'none' : 'block';
-  // Captcha demandé une seule fois, à l'inscription — plus à chaque connexion.
+
   document.getElementById('authCaptchaGroup').style.display = isLoginMode ? 'none' : 'block';
   if (!isLoginMode) loadAuthCaptcha();
 }
@@ -2769,8 +2416,6 @@ function setAuthLoading(loading){
   btn.innerText = pending2FAId ? 'Vérifier' : (isLoginMode ? 'Se connecter' : "S'inscrire");
 }
 
-// Appelée par le bouton principal : redirige vers la vérification du code
-// si une 2FA est en attente, sinon vers le login/inscription classique.
 function handleAuthOrVerify(){
   return pending2FAId ? verifyTwoFactor() : handleAuth();
 }
@@ -2846,10 +2491,6 @@ async function verifyTwoFactor(){
   }
 }
 
-// Un deviceToken par pseudo : évite de redemander le code 2FA à chaque
-// connexion depuis ce même navigateur (voir issueTrustedDevice côté
-// serveur). Rien de sensible dedans — juste "ce navigateur a déjà prouvé
-// avoir accès à l'e-mail de ce compte une fois".
 const DEVICE_TOKENS_KEY = 'nullchat_device_tokens';
 
 function getDeviceToken(usernameKey){
@@ -2957,9 +2598,6 @@ async function handleAuth(){
 document.getElementById('authPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleAuthOrVerify(); });
 document.getElementById('auth2FACode').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleAuthOrVerify(); });
 
-/* =========================================================
-   SESSION PERSISTANTE (connexion valable ~2 mois)
-   ========================================================= */
 function saveSession(){
   if (!authToken) return;
   try{
@@ -2970,7 +2608,7 @@ function saveSession(){
       avatarDataUrl: myAvatarDataUrl,
       expiresAt: Date.now() + SESSION_DURATION_MS
     }));
-  }catch(e){ /* quota localStorage, tant pis, la session ne survivra pas */ }
+  }catch(e){  }
 }
 function loadSession(){
   try{
@@ -2984,7 +2622,7 @@ function loadSession(){
 function clearSession(){
   try{ localStorage.removeItem(SESSION_STORAGE_KEY); }catch(e){}
 }
-// Tant que la personne revient dans les 2 mois, on prolonge la session en silence.
+
 function renewSession(){ if (authToken) saveSession(); }
 
 function attemptAutoLogin(){
@@ -3009,9 +2647,6 @@ function checkFirstLoginTutorial(username){
   }catch(e){}
 }
 
-/* =========================================================
-   NAVIGATION / VUES
-   ========================================================= */
 function switchView(view){
   currentView = view;
   closeMsgActionMenu();
@@ -3035,7 +2670,6 @@ function switchView(view){
   playViewTransition(view);
 }
 
-// Petite animation de fondu/glissement pour que la navigation entre vues soit fluide.
 function playViewTransition(view){
   const map = { general: 'viewGeneral', friends: 'friendsPanel', dm: 'viewDM', servers: 'serversPanel', server: 'viewServerChat', groups: 'groupsPanel', group: 'viewGroupChat' };
   const id = map[view];
@@ -3043,7 +2677,7 @@ function playViewTransition(view){
   const el = document.getElementById(id);
   if (!el || el.style.display === 'none') return;
   el.classList.remove('view-fade');
-  void el.offsetWidth; // force reflow pour redémarrer l'animation
+  void el.offsetWidth;
   el.classList.add('view-fade');
 }
 
@@ -3053,9 +2687,6 @@ function setFriendTab(tab){
   renderFriendList();
 }
 
-/* =========================================================
-   PROFIL / NULLID
-   ========================================================= */
 function toggleProfilePop(evt){
   const pop = document.getElementById('profilePop');
   const isOpen = pop.classList.contains('open');
@@ -3067,10 +2698,7 @@ function toggleProfilePop(evt){
   renderAvatarInto(document.getElementById('profilePopAvatar'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
   document.getElementById('profileBanner').style.backgroundImage = bannerCssValue();
   pop.style.background = bgCssValue() || '';
-  // Le contenu du popover a une hauteur variable (avatar, bannière, éventuel panneau
-  // Owner/Co-Owner...). On l'ouvre d'abord hors champ pour mesurer sa vraie hauteur,
-  // puis on cale sa position pour qu'il reste toujours entièrement visible à l'écran
-  // (avant, un décalage fixe pouvait pousser le bouton "Paramètres" hors de l'écran).
+
   pop.style.visibility = 'hidden';
   pop.classList.add('open');
   const popHeight = pop.offsetHeight;
@@ -3113,13 +2741,10 @@ function copyNullId(){
   setTimeout(() => { btn.innerHTML = original; }, 1200);
 }
 
-/* =========================================================
-   NOTIFICATIONS (son + notification navigateur)
-   ========================================================= */
 async function toggleNotifs(){
   notifsEnabled = !notifsEnabled;
   if (notifsEnabled && 'Notification' in window && Notification.permission === 'default'){
-    try{ await Notification.requestPermission(); } catch(e){ /* ignore */ }
+    try{ await Notification.requestPermission(); } catch(e){  }
   }
   document.getElementById('notifToggle').classList.toggle('on', notifsEnabled);
 }
@@ -3138,20 +2763,17 @@ function playNotifSound(){
     osc.connect(gain).connect(audioCtx.destination);
     osc.start();
     osc.stop(audioCtx.currentTime + 0.3);
-  } catch(e){ /* audio indisponible, on ignore */ }
+  } catch(e){  }
 }
 
 function notifyIncoming(title, body){
   if (!notifsEnabled) return;
   playNotifSound();
   if (document.hidden && 'Notification' in window && Notification.permission === 'granted'){
-    try{ new Notification(title, { body, silent:true }); } catch(e){ /* ignore */ }
+    try{ new Notification(title, { body, silent:true }); } catch(e){  }
   }
 }
 
-/* =========================================================
-   TOASTS
-   ========================================================= */
 function showToast({ title, body, actions }){
   const stack = document.getElementById('toastStack');
   const el = document.createElement('div');
@@ -3175,9 +2797,6 @@ function showToast({ title, body, actions }){
   stack.appendChild(el);
 }
 
-/* =========================================================
-   SYSTÈME D'AMIS
-   ========================================================= */
 function normalizeNullId(raw){
   return (raw || '').trim().toUpperCase();
 }
@@ -3308,19 +2927,16 @@ function renderFriendList(){
   }
 }
 
-/* =========================================================
-   MESSAGES PRIVÉS (DM) — chiffrés de bout en bout par ami
-   ========================================================= */
 async function ensureDmKey(friend){
   if (dmKeys.has(friend.nullId)) return dmKeys.get(friend.nullId);
-  if (!friend.socketId) return null; // ami hors ligne : pas de session possible pour l'instant
+  if (!friend.socketId) return null;
   const rawPublicKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
   socket.emit('dm:key_exchange', {
     targetSocketId: friend.socketId,
     publicKey: Array.from(new Uint8Array(rawPublicKey)),
     isNewUser: true
   });
-  return null; // la clé sera dérivée à la réception de la réponse "dm:key_exchange"
+  return null;
 }
 
 function openDm(friend){
@@ -3344,10 +2960,9 @@ function openDm(friend){
   socket.emit('dm:read', { targetNullId: friend.nullId });
 }
 
-// Traite un DM chiffré reçu, qu'il arrive en direct ou via la file d'attente hors-ligne.
 async function handleIncomingDm(data, opts){
   opts = opts || {};
-  if (blockedIds.has(data.senderNullId)) return; // bloqué localement : on ignore silencieusement
+  if (blockedIds.has(data.senderNullId)) return;
   const key = dmKeys.get(data.senderNullId);
   if (!key){ console.warn("Message privé reçu sans clé établie, ignoré."); return; }
   try{
@@ -3389,7 +3004,7 @@ function showDmTypingIndicator(isTyping){
   clearTimeout(dmTypingTimeout);
   if (isTyping){
     el.textContent = 'en train d\u2019écrire…';
-    // Filet de sécurité si l'événement "stop typing" se perd (déconnexion, etc.)
+
     dmTypingTimeout = setTimeout(() => { el.textContent = ''; }, 6000);
   } else {
     el.textContent = '';
@@ -3433,13 +3048,6 @@ function renderDmHistory(nullId){
   box.scrollTop = box.scrollHeight;
 }
 
-/* =========================================================
-   RÉACTIONS / RÉPONSE / TRANSFERT / SUPPRESSION — logique
-   partagée entre DM, serveurs et groupes.
-   ========================================================= */
-
-// Construit la ligne de pastilles de réactions (agrégées par émoji) à
-// l'intérieur du conteneur donné, à partir de entry.reactions = { emoji: [nullId,...] }.
 function renderReactionsInto(container, entry, scope, ctx){
   container.innerHTML = '';
   const reactions = entry.reactions;
@@ -3473,8 +3081,6 @@ function persistHistoryFor(scope, ctx){
   else if (scope === 'group') saveGroupHistory(ctx.groupId);
 }
 
-// Applique une réaction localement (soi-même ou un autre membre) : met à jour
-// l'entrée d'historique, persiste, et rafraîchit la bulle si elle est affichée.
 function applyReactionLocally(entry, scope, ctx, emoji, action, fromNullId){
   if (!entry.reactions) entry.reactions = {};
   const arr = entry.reactions[emoji] || (entry.reactions[emoji] = []);
@@ -3509,7 +3115,7 @@ function pushRecentEmoji(emoji){
     const list = recentEmojis().filter(e => e !== emoji);
     list.unshift(emoji);
     localStorage.setItem(RECENT_EMOJIS_KEY, JSON.stringify(list.slice(0, 8)));
-  }catch(e){ /* ignore */ }
+  }catch(e){  }
 }
 
 function markEntryDeleted(entry, scope, ctx){
@@ -3557,7 +3163,6 @@ function renderReplyContextBar(){
 }
 function cancelReply(){ pendingReplyTo = null; renderReplyContextBar(); }
 
-/* --- Menu contextuel (double-tap = ❤️ rapide, appui long / clic droit = menu) --- */
 function openMsgActionMenu(x, y, entry, scope, ctx){
   if (!entry.id) return;
   closeMsgActionMenu();
@@ -3623,9 +3228,8 @@ document.addEventListener('click', (e) => {
   if (menu && menu.style.display !== 'none' && !menu.contains(e.target)) closeMsgActionMenu();
 });
 
-// Attache : double-clic/double-tap = ❤️ rapide ; clic droit / appui long = menu contextuel.
 function attachMessageInteractions(wrapper, entry, scope, ctx){
-  if (!entry.id) return; // messages système ou historique legacy sans id : pas d'actions
+  if (!entry.id) return;
   wrapper.dataset.mid = entry.id;
   renderedMessageEls.set(entry.id, { el: wrapper, entry, scope, ctx });
   wrapper.style.cursor = 'pointer';
@@ -3668,7 +3272,6 @@ function attachMessageInteractions(wrapper, entry, scope, ctx){
   });
 }
 
-// Insère la citation "réponse à" au-dessus du contenu d'une bulle, si présente.
 function prependReplyQuote(wrapper, entry){
   if (!entry.replyTo) return;
   const quote = document.createElement('div');
@@ -3752,28 +3355,22 @@ function appendDmBubble(entry, animate){
   box.scrollTop = box.scrollHeight;
 }
 
-/* ---------------------------------------------------------
-   Persistance locale des conversations privées.
-   Important : la conversation est stockée par (mon nullId, nullId
-   du contact) et n'est JAMAIS effacée quand on retire/bloque un
-   ami — seulement via "Supprimer la conversation" (bouton dédié).
-   --------------------------------------------------------- */
 function dmStorageKey(peerNullId){
   return `nullchat_dm_${myNullId}_${peerNullId}`;
 }
 function saveDmHistory(nullId){
   try{
     const hist = dmHistory.get(nullId) || [];
-    // on ne garde que les 500 derniers messages en stockage local
+
     localStorage.setItem(dmStorageKey(nullId), JSON.stringify(hist.slice(-500)));
   }catch(e){ console.warn('Sauvegarde locale impossible (quota ?)', e); }
 }
 function loadDmHistory(nullId){
-  if (dmHistory.has(nullId)) return; // déjà en mémoire pour cette session
+  if (dmHistory.has(nullId)) return;
   try{
     const raw = localStorage.getItem(dmStorageKey(nullId));
     if (raw) dmHistory.set(nullId, JSON.parse(raw));
-  }catch(e){ /* ignore */ }
+  }catch(e){  }
 }
 function deleteConversation(nullId){
   if (!confirm('Supprimer définitivement cette conversation (localement) ?')) return;
@@ -3788,7 +3385,7 @@ function loadBlockedIds(){
     const raw = localStorage.getItem(blockedStorageKey());
     blockedIds.clear();
     if (raw) JSON.parse(raw).forEach(id => blockedIds.add(id));
-  }catch(e){ /* ignore */ }
+  }catch(e){  }
 }
 function saveBlockedIds(){
   try{ localStorage.setItem(blockedStorageKey(), JSON.stringify([...blockedIds])); }catch(e){}
@@ -3797,7 +3394,7 @@ function blockFriend(nullId){
   if (!confirm("Bloquer cet utilisateur ? Il ne pourra plus t'envoyer de messages ni t'appeler. La conversation est conservée.")) return;
   blockedIds.add(nullId);
   saveBlockedIds();
-  socket.emit('friend:block', { nullId }); // le serveur doit aussi faire respecter le blocage
+  socket.emit('friend:block', { nullId });
   friends.delete(nullId);
   dmKeys.delete(nullId);
   if (currentDmPeer && currentDmPeer.nullId === nullId) closeDm();
@@ -3810,11 +3407,6 @@ function unblockFriend(nullId){
   socket.emit('friend:unblock', { nullId });
 }
 
-/* =========================================================
-   SERVEURS — groupes chiffrés créés par les utilisateurs
-   (comme sur Discord : nom, code d'invitation, plusieurs membres,
-   chiffrement de bout en bout étendu à chaque membre en ligne)
-   ========================================================= */
 function toggleCreateServerForm(){
   const form = document.getElementById('createServerForm');
   form.style.display = form.style.display === 'none' ? 'block' : 'none';
@@ -3888,9 +3480,6 @@ function copyServerInvite(){
   showToast({ title: 'Code copié', body: `Partage "${srv.inviteCode}" pour inviter quelqu\u2019un sur ${srv.name}.` });
 }
 
-/* =========================================================
-   ADMINISTRATION D'UN SERVEUR (owner + admins)
-   ========================================================= */
 function openServerMembersModal(){
   if (!currentServerId) return;
   renderServerMembersModal();
@@ -3999,8 +3588,6 @@ function unbanServerMember(serverId, nullId){
   socket.emit('server:unban', { serverId, targetNullId: nullId });
 }
 
-// Établit une clé partagée (ECDH) avec chaque membre en ligne du serveur
-// avec qui on n'a pas encore de session, sur le même principe que les DM.
 async function ensureServerKeysWithOnlineMembers(serverId){
   const srv = myServers.get(serverId);
   if (!srv || !myKeyPair) return;
@@ -4054,7 +3641,7 @@ function loadServerHistory(serverId){
   try{
     const raw = localStorage.getItem(serverStorageKey(serverId));
     if (raw) serverHistory.set(serverId, JSON.parse(raw));
-  }catch(e){ /* ignore */ }
+  }catch(e){  }
 }
 function pushServerToHistory(serverId, entry){
   if (!serverHistory.has(serverId)) serverHistory.set(serverId, []);
@@ -4163,10 +3750,7 @@ async function sendServerMessage(){
 
 async function sendServerPayload(payload){
   if (!currentServerId) return;
-  // On tente d'établir/rafraîchir les clés avec les membres actuellement en ligne, mais
-  // on n'attend plus dessus pour envoyer : sinon, seul dans un serveur qu'on vient de
-  // créer (aucun autre membre en ligne pour échanger une clé), il était impossible
-  // d'écrire quoi que ce soit — le message reste au moins visible dans son propre historique.
+
   ensureServerKeysWithOnlineMembers(currentServerId);
   if (!serverKeys.has(currentServerId)) serverKeys.set(currentServerId, new Map());
   const keys = serverKeys.get(currentServerId);
@@ -4258,25 +3842,22 @@ document.getElementById('serverInput').addEventListener('keydown', (e) => { if (
 document.getElementById('joinServerInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') joinServer(); });
 document.getElementById('newServerNameInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') createServer(); });
 
-/* =========================================================
-   PARAMÈTRES : photo de profil + périphériques audio
-   ========================================================= */
-const MAX_AVATAR_SOURCE_BYTES = 8 * 1024 * 1024; // fichier source max avant compression
-const AVATAR_TARGET_SIZE = 200; // photo réduite à 200x200 avant envoi
+const MAX_AVATAR_SOURCE_BYTES = 8 * 1024 * 1024;
+const AVATAR_TARGET_SIZE = 200;
 
 function avatarLocalKey(){ return `nullchat_avatar_${myNullId}`; }
 function saveOwnAvatarLocally(dataUrl){
   try{
     if (dataUrl) localStorage.setItem(avatarLocalKey(), dataUrl);
     else localStorage.removeItem(avatarLocalKey());
-  }catch(e){ /* ignore, quota localStorage */ }
+  }catch(e){  }
 }
 function loadOwnAvatar(){
-  if (myAvatarDataUrl) return; // déjà connu (ex: renvoyé par /api/login)
+  if (myAvatarDataUrl) return;
   try{
     const raw = localStorage.getItem(avatarLocalKey());
     if (raw) myAvatarDataUrl = raw;
-  }catch(e){ /* ignore */ }
+  }catch(e){  }
 }
 
 function openSettings(){
@@ -4321,7 +3902,7 @@ async function loadActiveSessions(){
 }
 
 function summarizeUserAgent(ua){
-  // Résumé lisible et court, sans exposer la chaîne complète (empreinte moins bavarde à l'écran).
+
   if (/mobile/i.test(ua)) return 'Mobile';
   if (/chrome/i.test(ua)) return 'Chrome';
   if (/firefox/i.test(ua)) return 'Firefox';
@@ -4334,11 +3915,9 @@ async function revokeSession(id){
   try{
     await fetch(`/api/sessions/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${authToken}` } });
     loadActiveSessions();
-  }catch(e){ /* ignore */ }
+  }catch(e){  }
 }
 
-// Redimensionne l'image côté client avant envoi : garde les photos de
-// profil légères (elles transitent par le serveur puis vers tous les amis).
 function resizeImageToDataUrl(file, targetSize){
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -4394,13 +3973,12 @@ function removeAvatar(){
   socket.emit('profile:avatar', { avatarDataUrl: null });
 }
 
-/* ---- Choix micro / haut-parleur ---- */
 function audioPrefsKey(){ return `nullchat_audio_prefs_${myNullId || 'anon'}`; }
 function loadAudioPrefs(){
   try{ return JSON.parse(localStorage.getItem(audioPrefsKey()) || '{}'); }catch(e){ return {}; }
 }
 function saveAudioPrefs(prefs){
-  try{ localStorage.setItem(audioPrefsKey(), JSON.stringify(prefs)); }catch(e){ /* ignore */ }
+  try{ localStorage.setItem(audioPrefsKey(), JSON.stringify(prefs)); }catch(e){  }
 }
 function getPreferredInputDeviceId(){ return loadAudioPrefs().inputId || null; }
 function getPreferredOutputDeviceId(){ return loadAudioPrefs().outputId || null; }
@@ -4412,9 +3990,8 @@ async function populateAudioDeviceSelects(){
   inputSelect.innerHTML = '<option>Chargement...</option>';
   outputSelect.innerHTML = '<option>Chargement...</option>';
 
-  // Il faut l'autorisation micro pour obtenir les libellés des périphériques (sinon "Micro 1", "Micro 2"...).
   try{ const s = await navigator.mediaDevices.getUserMedia({ audio: true }); s.getTracks().forEach(t => t.stop()); }
-  catch(e){ /* l'utilisateur peut refuser, on affichera des libellés génériques */ }
+  catch(e){  }
 
   let devices = [];
   try{ devices = await navigator.mediaDevices.enumerateDevices(); }
@@ -4454,7 +4031,7 @@ async function applyPreferredAudioOutput(){
   const outputId = getPreferredOutputDeviceId();
   const remoteAudio = document.getElementById('remoteAudio');
   if (!outputId || !remoteAudio || typeof remoteAudio.setSinkId !== 'function') return;
-  try{ await remoteAudio.setSinkId(outputId); }catch(e){ /* périphérique débranché ou navigateur non supporté */ }
+  try{ await remoteAudio.setSinkId(outputId); }catch(e){  }
 }
 
 function pushDmToHistory(nullId, entry){
@@ -4472,13 +4049,6 @@ async function sendDM(){
   input.value = '';
 }
 
-/**
- * Chiffre et envoie n'importe quel type de contenu DM (texte, image,
- * vidéo, audio). payload: { text } ou { kind, dataUrl, mime, filename }.
- * Le contenu (texte ou data URL base64) est chiffré comme avant en AES-GCM,
- * seul le champ transporté change — le serveur continue de ne voir que
- * du chiffré, quel que soit le type.
- */
 async function sendDmPayload(payload){
   if (!currentDmPeer) return;
   const key = dmKeys.get(currentDmPeer.nullId);
@@ -4537,7 +4107,7 @@ function readFileAsDataURL(file){
 
 async function handleDmFileSelected(event){
   const file = event.target.files && event.target.files[0];
-  event.target.value = ''; // permet de re-sélectionner le même fichier plus tard
+  event.target.value = '';
   if (!file || !currentDmPeer) return;
   if (file.size > MAX_ATTACHMENT_BYTES){
     showToast({ title: 'Fichier trop lourd', body: `Limite actuelle : ${ATTACHMENT_LIMIT_LABEL}.` });
@@ -4552,9 +4122,6 @@ async function handleDmFileSelected(event){
   await sendDmPayload({ kind, dataUrl, mime: file.type, filename: file.name });
 }
 
-/* ---------------------------------------------------------
-   Messages vocaux (enregistrement micro -> envoi chiffré)
-   --------------------------------------------------------- */
 async function toggleVoiceRecording(){
   const micBtn = document.getElementById('dmMicBtn');
   if (mediaRecorder && mediaRecorder.state === 'recording'){
@@ -4592,13 +4159,8 @@ async function toggleVoiceRecording(){
 document.getElementById('dmInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendDM(); });
 document.getElementById('dmInput').addEventListener('input', () => { notifyTyping(); });
 
-/* =========================================================
-   APPELS VOCAUX (WebRTC)
-   ========================================================= */
 const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-// Le serveur peut fournir un TURN (nécessaire derrière NAT/CGNAT strict) sans
-// avoir à modifier ce fichier : voir TURN_URL/TURN_USERNAME/TURN_CREDENTIAL.
 async function fetchIceServers(){
   try{
     const res = await fetch('/api/ice-servers', { headers: { Authorization: `Bearer ${authToken}` } });
@@ -4607,16 +4169,24 @@ async function fetchIceServers(){
     if (Array.isArray(data?.iceServers) && data.iceServers.length){
       RTC_CONFIG.iceServers = data.iceServers;
     }
-  }catch(e){ /* pas grave, on garde le STUN par défaut */ }
+  }catch(e){  }
 }
 
-function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions }){
-  document.getElementById('callOverlay').classList.add('open');
+function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions, variant }){
+  const overlay = document.getElementById('callOverlay');
+  overlay.classList.remove('closing');
+  overlay.classList.add('open');
   { const st = nameStyleForAuthor(name, false); document.getElementById('callName').innerHTML = styledNameHTML(name, st.font, st.effect, st.colors); }
-  document.getElementById('callStatusText').textContent = statusText;
+  const statusEl = document.getElementById('callStatusText');
+  statusEl.textContent = statusText;
+  statusEl.classList.toggle('dots', !!ringing);
   const avatar = document.getElementById('callAvatar');
   renderAvatarInto(avatar, { username: name, avatarDataUrl });
   avatar.classList.toggle('ringing', !!ringing);
+  avatar.classList.toggle('connected', variant === 'connected');
+
+  const card = document.querySelector('.call-card');
+  if (card) card.classList.toggle('incoming-shake', variant === 'incoming');
 
   const actionsEl = document.getElementById('callActions');
   actionsEl.innerHTML = '';
@@ -4630,8 +4200,18 @@ function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions }){
   });
 }
 function closeCallOverlay(){
-  document.getElementById('callOverlay').classList.remove('open');
-  document.getElementById('callAvatar').classList.remove('ringing');
+  const overlay = document.getElementById('callOverlay');
+  if (!overlay.classList.contains('open')) return;
+  overlay.classList.add('closing');
+  const avatar = document.getElementById('callAvatar');
+  avatar.classList.remove('ringing');
+  avatar.classList.remove('connected');
+  const card = document.querySelector('.call-card');
+  if (card) card.classList.remove('incoming-shake');
+  setTimeout(() => {
+    overlay.classList.remove('open');
+    overlay.classList.remove('closing');
+  }, 220);
 }
 
 const ICONS = {
@@ -4662,7 +4242,7 @@ function buildPeerConnection(targetSocketId, targetNullId){
 }
 
 async function startCall(friend){
-  if (activeCallPeer) return; // un seul appel à la fois
+  if (activeCallPeer) return;
   activeCallPeer = friend;
   try{
     await getMic();
@@ -4680,7 +4260,7 @@ async function startCall(friend){
   socket.emit('call:offer', { targetNullId: friend.nullId, targetSocketId: friend.socketId, sdp: offer });
 
   openCallOverlay({
-    name: friend.username, statusText: 'Appel en cours…', avatarDataUrl: friend.avatarDataUrl, ringing: true,
+    name: friend.username, statusText: 'Appel en cours…', avatarDataUrl: friend.avatarDataUrl, ringing: true, variant: 'outgoing',
     actions: [{ cls:'hangup', icon: ICONS.phoneDecline, title:'Raccrocher', onClick: hangupCall }]
   });
 }
@@ -4691,7 +4271,7 @@ function handleIncomingCall({ from, sdp }){
     return;
   }
   if (activeCallPeer){
-    // déjà en appel : on décline automatiquement
+
     socket.emit('call:end', { targetNullId: from.nullId, targetSocketId: from.socketId, reason: 'declined' });
     return;
   }
@@ -4701,7 +4281,7 @@ function handleIncomingCall({ from, sdp }){
   notifyIncoming('Appel entrant', `${from.username} t'appelle`);
 
   openCallOverlay({
-    name: from.username, statusText: 'Appel entrant…', avatarDataUrl: from.avatarDataUrl, ringing: true,
+    name: from.username, statusText: 'Appel entrant…', avatarDataUrl: from.avatarDataUrl, ringing: true, variant: 'incoming',
     actions: [
       { cls:'decline', icon: ICONS.phoneDecline, title:'Refuser', onClick: () => declineCall(from) },
       { cls:'accept', icon: ICONS.phoneAccept, title:'Accepter', onClick: () => acceptCall(from, sdp) }
@@ -4725,7 +4305,7 @@ async function acceptCall(from, sdp){
   socket.emit('call:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, sdp: answer });
 
   openCallOverlay({
-    name: from.username, statusText: 'En appel', avatarDataUrl: from.avatarDataUrl, ringing: false,
+    name: from.username, statusText: 'En appel', avatarDataUrl: from.avatarDataUrl, ringing: false, variant: 'connected',
     actions: [
       { cls:'mute', icon: ICONS.mic, title:'Muet', onClick: toggleMute },
       { cls:'hangup', icon: ICONS.phoneDecline, title:'Raccrocher', onClick: hangupCall }
@@ -4740,7 +4320,7 @@ async function handleCallAnswer({ sdp }){
   if (!rtcConn) return;
   await rtcConn.setRemoteDescription(new RTCSessionDescription(sdp));
   openCallOverlay({
-    name: activeCallPeer.username, statusText: 'En appel', avatarDataUrl: activeCallPeer.avatarDataUrl, ringing:false,
+    name: activeCallPeer.username, statusText: 'En appel', avatarDataUrl: activeCallPeer.avatarDataUrl, ringing:false, variant: 'connected',
     actions: [
       { cls:'mute', icon: ICONS.mic, title:'Muet', onClick: toggleMute },
       { cls:'hangup', icon: ICONS.phoneDecline, title:'Raccrocher', onClick: hangupCall }
@@ -4749,7 +4329,7 @@ async function handleCallAnswer({ sdp }){
 }
 async function handleCallIce({ candidate }){
   if (!rtcConn || !candidate) return;
-  try{ await rtcConn.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e){ /* ignore */ }
+  try{ await rtcConn.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e){  }
 }
 function toggleMute(){
   if (!localStream) return;
@@ -4773,9 +4353,6 @@ function cleanupCall(){
   closeCallOverlay();
 }
 
-/* =========================================================
-   MESSAGES (SALON GÉNÉRAL) — logique de chiffrement existante
-   ========================================================= */
 function addSystemMessage(text){
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
@@ -4868,22 +4445,21 @@ async function startApp(){
   renderAvatarInto(document.getElementById('myAvatar'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
   setConnectionStatus('connecting');
 
-  fetchIceServers(); // best-effort ; les appels retombent sur le STUN par défaut si ça échoue
+  fetchIceServers();
 
   socket = io({ reconnectionAttempts: 10, reconnectionDelay: 1000, auth: { token: authToken } });
 
   socket.on('connect', async () => {
     setConnectionStatus('connected');
-    renewSession(); // tant que la connexion réussit, on prolonge la session de 2 mois
+    renewSession();
     myKeyPair = await window.crypto.subtle.generateKey(
       { name:'ECDH', namedCurve:'P-256' }, true, ['deriveKey']
     );
     const rawPublicKey = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
     socket.emit('share_public_key', Array.from(new Uint8Array(rawPublicKey)));
-    // Resynchronise la préférence de style de pseudo (police/effet) auprès du serveur,
-    // au cas où elle aurait changé sur un autre appareil ou avant que ce socket existe.
+
     socket.emit('profile:style', { nameFont: myNameFont, nameEffect: myNameEffect, nameColors: myNameColors });
-    // Idem pour la bannière/le fond de profil.
+
     socket.emit('profile:theme', {
       bannerType: myProfileBanner.type, bannerValue: myProfileBanner.type === 'none' ? null : myProfileBanner.value,
       bgType: myProfileBg.type, bgValue: myProfileBg.type === 'none' ? null : myProfileBg.value
@@ -4899,8 +4475,6 @@ async function startApp(){
     peers.clear();
   });
 
-  // Le token stocké n'est plus valide (expiré côté serveur, session révoquée...) :
-  // on efface la session locale et on revient proprement à l'écran de connexion.
   socket.on('connect_error', (err) => {
     const msg = (err && err.message) || '';
     if (/auth|token|unauthor/i.test(msg)){
@@ -4946,7 +4520,6 @@ async function startApp(){
     } catch(err){ console.error('Échec du déchiffrement:', err); }
   });
 
-  /* ---------- Événements du système d'amis ---------- */
   socket.on('friend:list', (data) => {
     friends.clear();
     (data.friends || []).forEach(f => friends.set(f.nullId, f));
@@ -4978,7 +4551,6 @@ async function startApp(){
     showToast({ title: 'Nouvel ami', body: `${data.username} a été ajouté.` });
   });
 
-  // Rattrapage : demandes d'amis reçues pendant qu'on était hors ligne
   socket.on('friend:pending_list', (data) => {
     (data.requests || []).forEach(r => {
       if (blockedIds.has(r.from.nullId)) return;
@@ -4991,7 +4563,6 @@ async function startApp(){
     }
   });
 
-  // Style de pseudo d'un ami mis à jour en temps réel (police/effet/couleurs)
   socket.on('friend:style_updated', (data) => {
     const f = friends.get(data.nullId);
     if (f){
@@ -5008,7 +4579,6 @@ async function startApp(){
     if (currentView === 'friends') renderFriendList();
   });
 
-  // Avatar d'un ami mis à jour en temps réel
   socket.on('friend:avatar_updated', (data) => {
     const f = friends.get(data.nullId);
     if (f){
@@ -5033,7 +4603,7 @@ async function startApp(){
     if (f){
       f.online = data.online;
       f.socketId = data.socketId;
-      // une nouvelle session = nouvelles clés éphémères, on force un nouvel échange
+
       if (!data.online) dmKeys.delete(data.nullId);
     }
     if (currentDmPeer && currentDmPeer.nullId === data.nullId){
@@ -5050,14 +4620,10 @@ async function startApp(){
   socket.on('friend:error', (data) => {
     const errEl = document.getElementById('friendError');
     if (errEl) errEl.textContent = data.message || 'Une erreur est survenue.';
-    // Avant ce correctif, un message comme "tu envoies trop vite" n'apparaissait
-    // que dans le panneau "Ajouter un ami" (souvent invisible) : depuis le salon
-    // général ou une DM, l'envoi semblait juste s'arrêter sans aucune explication.
-    // On l'affiche donc aussi en toast, quelle que soit la vue active.
+
     showToast({ title: 'Info', body: data.message || 'Une erreur est survenue.' });
   });
 
-  /* ---------- Serveurs (groupes chiffrés façon Discord) ---------- */
   socket.on('server:list', (data) => {
     myServers.clear();
     (data.servers || []).forEach(s => myServers.set(s.id, normalizeServer(s)));
@@ -5149,10 +4715,7 @@ async function startApp(){
     const srv = myServers.get(data.serverId);
     if (!srv) return;
     srv.members = data.members || [];
-    // Bug corrigé : ces deux champs étaient auparavant ignorés ici, donc la liste des
-    // admins/bannis restait figée sur l'état au moment de la création/adhésion du
-    // serveur — un bannissement ultérieur n'était donc jamais reflété côté client
-    // (impossible de le voir dans la modale, impossible de débannir).
+
     if (Array.isArray(data.admins)) srv.admins = data.admins;
     if (Array.isArray(data.bannedNullIds)) srv.bannedNullIds = data.bannedNullIds;
     normalizeServer(srv);
@@ -5228,7 +4791,6 @@ async function startApp(){
     } catch(err){ console.error('Échec du déchiffrement (serveur) :', err); }
   });
 
-  /* ---------- Messages privés (DM) ---------- */
   socket.on('dm:key_exchange', async (data) => {
     const peerPublicKeyBuffer = new Uint8Array(data.publicKey).buffer;
     const peerPublicKey = await window.crypto.subtle.importKey(
@@ -5251,7 +4813,6 @@ async function startApp(){
 
   socket.on('dm:message', (data) => handleIncomingDm(data));
 
-  // Messages accumulés pendant que j'étais hors ligne : traités dans l'ordre d'arrivée.
   socket.on('dm:queued_messages', async (data) => {
     for (const msg of (data.messages || [])) {
       await handleIncomingDm(msg, { silent: true });
@@ -5262,28 +4823,24 @@ async function startApp(){
     }
   });
 
-  // Le message n'a pas pu être livré immédiatement : mis en attente côté serveur.
   socket.on('dm:pending', (data) => {
     if (currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.targetNullId){
       showToast({ title: 'Message en attente', body: 'Ton ami est hors ligne, le message lui sera livré à sa reconnexion.' });
     }
   });
 
-  // Indicateur "en train d'écrire"
   socket.on('dm:typing', (data) => {
     if (currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.nullId){
       showDmTypingIndicator(!!data.isTyping);
     }
   });
 
-  // Accusé de lecture : marque les bulles envoyées comme lues
   socket.on('dm:read', (data) => {
     if (currentView === 'dm' && currentDmPeer && currentDmPeer.nullId === data.nullId){
       markDmBubblesRead();
     }
   });
 
-  /* ---------- Appels ---------- */
   socket.on('call:incoming', handleIncomingCall);
   socket.on('call:answer', handleCallAnswer);
   socket.on('call:ice', handleCallIce);
@@ -5376,9 +4933,6 @@ document.getElementById('msgInput').addEventListener('input', (e) => {
 });
 document.getElementById('addFriendInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendFriendRequest(); });
 
-/* =========================================================
-   TUTORIEL D'ONBOARDING
-   ========================================================= */
 const TUTORIAL_STEPS = [
   {
     icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>',
@@ -5416,9 +4970,16 @@ function openTutorial(){
   tutorialStepIndex = 0;
   renderTutorialStep();
   document.getElementById('tutoOverlay').classList.add('open');
+  const audio = document.getElementById('tutoAudio');
+  if (audio){
+    audio.currentTime = 0;
+    audio.play().catch(() => { /* autoplay bloqué par le navigateur, on ignore */ });
+  }
 }
 function closeTutorial(){
   document.getElementById('tutoOverlay').classList.remove('open');
+  const audio = document.getElementById('tutoAudio');
+  if (audio){ audio.pause(); audio.currentTime = 0; }
   try{ localStorage.setItem(TUTORIAL_SEEN_KEY, '1'); }catch(e){}
 }
 function tutorialNext(){
@@ -5447,9 +5008,6 @@ function renderTutorialStep(){
   });
 }
 
-/* =========================================================
-   EFFET RIPPLE SUR LES BOUTONS (retour visuel au clic)
-   ========================================================= */
 document.addEventListener('pointerdown', (e) => {
   const btn = e.target.closest('.fx-btn');
   if (!btn || btn.disabled) return;
@@ -5464,20 +5022,11 @@ document.addEventListener('pointerdown', (e) => {
   setTimeout(() => ripple.remove(), 600);
 });
 
-/* =========================================================
-   RECONNEXION AUTOMATIQUE (session valable ~2 mois)
-   ========================================================= */
 attemptAutoLogin();
 if (document.getElementById('authWrap').style.display !== 'none'){
   loadAuthCaptcha();
 }
-// Le code de vérification expire après 5 minutes côté serveur (CAPTCHA_TTL_MS).
-// Sans ça, un utilisateur qui prend du temps à remplir le formulaire se
-// retrouve avec un code affiché mais déjà expiré côté serveur, d'où l'erreur
-// "Code de vérification incorrect ou expiré" alors qu'il a bien recopié ce
-// qu'il voit à l'écran. On rafraîchit donc automatiquement le code avant
-// qu'il n'expire, tant que l'écran de connexion est affiché et qu'on n'est
-// pas déjà en train de saisir un code 2FA.
+
 setInterval(() => {
   const authVisible = document.getElementById('authWrap').style.display !== 'none';
   const captchaVisible = document.getElementById('authCaptchaGroup').style.display !== 'none';
@@ -5486,9 +5035,6 @@ setInterval(() => {
   }
 }, 4 * 60 * 1000);
 
-/* =========================================================
-   DÉCOR DE L'ÉCRAN DE CONNEXION (rideau de caractères chiffrés)
-   ========================================================= */
 (function initCipherRain(){
   const host = document.getElementById('cipherRain');
   if (!host || prefersReducedMotion()) return;
