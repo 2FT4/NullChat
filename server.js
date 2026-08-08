@@ -780,6 +780,17 @@ function isValidHexColor(v) {
   return typeof v === 'string' && LIMITS.hexColorRegex.test(v);
 }
 
+// Un emoji de réaction ne doit jamais pouvoir casser hors de l'attribut/du
+// innerHTML où le client l'affiche : on rejette tout caractère utilisable
+// pour une injection HTML plutôt que d'essayer de définir "ce qu'est un
+// vrai emoji" (trop de faux négatifs avec les familles d'emoji/ZWJ).
+function isSafeReactionEmoji(str) {
+  if (typeof str !== 'string') return false;
+  const trimmed = str.trim();
+  if (!trimmed || trimmed.length > LIMITS.reactionEmojiMax) return false;
+  return !/[<>&"'`]/.test(trimmed);
+}
+
 function isValidNameColors(arr) {
   return Array.isArray(arr) && arr.length <= LIMITS.nameColorsMax && arr.every(isValidHexColor);
 }
@@ -2789,7 +2800,7 @@ io.on('connection', (socket) => {
     const messageId = data.messageId;
     const emoji = typeof data.emoji === 'string' ? data.emoji.slice(0, LIMITS.reactionEmojiMax) : '';
     const action = data.action === 'remove' ? 'remove' : 'add';
-    if (!isNonEmptyString(messageId, 100) || !emoji) return;
+    if (!isNonEmptyString(messageId, 100) || !isSafeReactionEmoji(emoji)) return;
 
     if (scope === 'dm') {
       const targetNullId = data.targetNullId;

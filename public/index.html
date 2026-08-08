@@ -3124,7 +3124,12 @@ function renderReactionsInto(container, entry, scope, ctx){
     const pill = document.createElement('button');
     pill.className = 'reaction-pill' + (ids.includes(myNullId) ? ' mine' : '');
     pill.type = 'button';
-    pill.innerHTML = `<span>${emoji}</span><span>${ids.length}</span>`;
+    const emojiSpan = document.createElement('span');
+    emojiSpan.textContent = emoji;
+    const countSpan = document.createElement('span');
+    countSpan.textContent = String(ids.length);
+    pill.appendChild(emojiSpan);
+    pill.appendChild(countSpan);
     pill.onclick = (e) => {
       e.stopPropagation();
       sendReaction(entry, scope, ctx, emoji, ids.includes(myNullId) ? 'remove' : 'add');
