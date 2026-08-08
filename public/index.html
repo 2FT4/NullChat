@@ -2691,8 +2691,9 @@ function attemptAutoLogin(){
   if (!s) return false;
   currentUser = s.username;
   myNullId = s.nullId;
-  myAvatarDataUrl = s.avatarDataUrl;
   authToken = s.token;
+  loadOwnAvatar();
+  if (!myAvatarDataUrl && s.avatarDataUrl) myAvatarDataUrl = s.avatarDataUrl;
   loadBlockedIds();
   startApp();
   return true;
@@ -4775,6 +4776,16 @@ async function startApp(){
     dmKeys.delete(data.nullId);
     if (currentDmPeer && currentDmPeer.nullId === data.nullId) closeDm();
     if (currentView === 'friends') renderFriendList();
+  });
+
+  socket.on('me:profile', (data) => {
+    myAvatarDataUrl = data.avatarDataUrl || null;
+    saveOwnAvatarLocally(myAvatarDataUrl);
+    renderAvatarInto(document.getElementById('myAvatar'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
+    renderAvatarInto(document.getElementById('settingsAvatarPreview'), { username: currentUser, avatarDataUrl: myAvatarDataUrl });
+    const removeRow = document.getElementById('avatarRemoveRow');
+    if (removeRow) removeRow.style.display = myAvatarDataUrl ? 'block' : 'none';
+    saveSession();
   });
 
   socket.on('friend:status', (data) => {
