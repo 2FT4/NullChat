@@ -1302,8 +1302,6 @@ input:disabled{ opacity:.5; }
           </span>
           <button class="btn-mini fx-btn" style="width:auto; padding:6px 12px; font-size:11.5px;" onclick="clearNullAIChat()" title="Effacer la conversation">Effacer</button>
         </div>
-        <div class="nullai-disclaimer">
-        </div>
         <div id="nullaiChat"></div>
         <div class="chat-input-box">
           <input type="text" id="nullaiInput" placeholder="Écris à NullAI..." maxlength="4000" onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); sendNullAIMessage(); }">

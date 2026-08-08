@@ -535,8 +535,8 @@ function appRoleOf(candidateNullId) {
 // users / friends / blocked / pending_requests survivent désormais à un
 // redémarrage ; seules les sessions (activeTokens) et l'état de connexion
 // restent volatiles, ce qui est le comportement attendu.
-function loadStateFromDb() {
-  for (const u of db.loadAllUsers()) {
+async function loadStateFromDb() {
+  for (const u of await db.loadAllUsers()) {
     if (!u.nullId) continue; // ligne orpheline sans null_id, ignorée
     const key = u.username.toLowerCase();
     users.set(key, {
@@ -560,20 +560,21 @@ function loadStateFromDb() {
     nullIdToUser.set(u.nullId, u.username);
     if (!friends.has(u.nullId)) friends.set(u.nullId, new Set());
   }
-  for (const f of db.loadAllFriends()) {
+  const allFriends = await db.loadAllFriends();
+  for (const f of allFriends) {
     if (!friends.has(f.userNullId)) friends.set(f.userNullId, new Set());
     friends.get(f.userNullId).add(f.friendNullId);
   }
-  for (const b of db.loadAllBlocked()) {
+  for (const b of await db.loadAllBlocked()) {
     if (!blocked.has(b.userNullId)) blocked.set(b.userNullId, new Set());
     blocked.get(b.userNullId).add(b.blockedNullId);
   }
-  for (const r of db.loadAllPendingRequests()) {
+  for (const r of await db.loadAllPendingRequests()) {
     pendingRequests.set(r.id, { id: r.id, fromNullId: r.fromNullId, toNullId: r.toNullId, createdAt: r.createdAt });
   }
 
   // Serveurs + groupes (table commune chat_groups, distingués par .type)
-  for (const g of db.loadAllGroups()) {
+  for (const g of await db.loadAllGroups()) {
     if (g.type === 'server') {
       chatServers.set(g.id, {
         id: g.id, name: g.name, inviteCode: g.inviteCode, ownerNullId: g.ownerNullId,
@@ -584,7 +585,7 @@ function loadStateFromDb() {
       chatGroups.set(g.id, { id: g.id, name: g.name, ownerNullId: g.ownerNullId, members: new Set() });
     }
   }
-  for (const m of db.loadAllGroupMembers()) {
+  for (const m of await db.loadAllGroupMembers()) {
     const srv = chatServers.get(m.groupId);
     if (srv) {
       srv.members.add(m.nullId);
@@ -594,11 +595,11 @@ function loadStateFromDb() {
     const grp = chatGroups.get(m.groupId);
     if (grp) grp.members.add(m.nullId);
   }
-  for (const b of db.loadAllGroupBans()) {
+  for (const b of await db.loadAllGroupBans()) {
     const srv = chatServers.get(b.groupId);
     if (srv) srv.bannedNullIds.add(b.nullId);
   }
-  for (const c of db.loadAllChannels()) {
+  for (const c of await db.loadAllChannels()) {
     const srv = chatServers.get(c.groupId);
     if (srv) srv.channels.push({ id: c.id, name: c.name, type: c.type, position: c.position });
   }
@@ -608,19 +609,21 @@ function loadStateFromDb() {
     if (srv.channels.length === 0) {
       const chId = crypto.randomUUID();
       srv.channels.push({ id: chId, name: 'Général', type: 'text', position: 0 });
-      db.createChannel({ id: chId, groupId: srv.id, name: 'Général', type: 'text', position: 0 });
+      await db.createChannel({ id: chId, groupId: srv.id, name: 'Général', type: 'text', position: 0 });
     } else {
       srv.channels.sort((a, b) => a.position - b.position);
     }
   }
 
-  for (const b of db.loadAllAppBans()) {
+  for (const b of await db.loadAllAppBans()) {
     appBannedUsers.set(b.nullId, { nullId: b.nullId, username: b.username, reason: b.reason, bannedAt: b.bannedAt });
   }
 
-  log(`Base chargée : ${users.size} compte(s), ${db.loadAllFriends().length} lien(s) d'amitié, ${pendingRequests.size} demande(s) en attente, ${chatServers.size} serveur(s), ${chatGroups.size} groupe(s), ${appBannedUsers.size} bannissement(s) global(aux).`);
+  log(`Base chargée : ${users.size} compte(s), ${allFriends.length} lien(s) d'amitié, ${pendingRequests.size} demande(s) en attente, ${chatServers.size} serveur(s), ${chatGroups.size} groupe(s), ${appBannedUsers.size} bannissement(s) global(aux).`);
 }
-loadStateFromDb();
+// NB : le chargement effectif est déclenché plus bas, dans le bootstrap
+// asynchrone juste avant server.listen() — il faut que db.init() (création
+// du client Turso + migrations) soit terminé avant de lire quoi que ce soit.
 
 // ==========================================
 // PERSISTANCE DES SESSIONS (activeTokens) SUR DISQUE
@@ -956,18 +959,28 @@ app.post('/api/register', authRateLimitMiddleware, async (req, res) => {
       bgValue: null
     };
 
+    // On écrit d'abord en base (await, contrairement aux autres écritures
+    // fire-and-forget de ce fichier) : c'est la création du compte lui-même,
+    // pas question de répondre "compte créé" au client avant d'être sûr que
+    // ça a vraiment été persisté côté Turso.
+    try {
+      await db.createUser({
+        username: newUser.username,
+        passwordHash: newUser.passwordHash,
+        nullId: newUser.nullId,
+        publicKey: newUser.publicKey,
+        avatarDataUrl: newUser.avatarDataUrl
+      });
+    } catch (err) {
+      logError('Erreur db.createUser :', err);
+      return res.status(500).json({ success: false, message: "Erreur serveur, réessaie dans un instant." });
+    }
+
     users.set(cleanUsername.toLowerCase(), newUser);
     userEmails.set(cleanUsername.toLowerCase(), cleanEmail);
     saveUserEmailsToDisk();
     nullIdToUser.set(nullId, cleanUsername);
     friends.set(nullId, new Set());
-    db.createUser({
-      username: newUser.username,
-      passwordHash: newUser.passwordHash,
-      nullId: newUser.nullId,
-      publicKey: newUser.publicKey,
-      avatarDataUrl: newUser.avatarDataUrl
-    });
 
     // Auto-connexion directement après l'inscription
     const token = generateRandomToken();
@@ -1384,7 +1397,7 @@ setInterval(() => {
   for (const [id, reqData] of pendingRequests.entries()) {
     if (now - reqData.createdAt > PENDING_REQUEST_TTL_MS) {
       pendingRequests.delete(id);
-      db.removePendingRequest(id);
+      persist(db.removePendingRequest(id));
     }
   }
 }, 60 * 60 * 1000).unref();
@@ -1730,15 +1743,27 @@ function notifyServersMemberStatus(nullId, online) {
 }
 
 function safeHandler(socket, handler) {
-  return (data) => {
+  // async pour pouvoir attraper aussi bien une exception synchrone qu'une
+  // promesse rejetée (nécessaire depuis le passage de db.js à des appels
+  // asynchrones vers Turso).
+  return async (data) => {
     if (!socketEventRateLimit(socket.id)) return;
     try {
-      handler(data);
+      await handler(data);
     } catch (err) {
       logError(`Erreur socket (${socket.id}) :`, err);
       socket.emit('friend:error', { message: 'Une erreur interne est survenue.' });
     }
   };
+}
+
+// Petit helper pour les écritures DB "fire-and-forget" : la donnée qui
+// compte pour le fonctionnement en temps réel vit déjà dans les Map en
+// mémoire (mises à jour avant l'appel), l'écriture en base n'est là que
+// pour la persistance. On ne bloque donc pas la réponse dessus, mais on
+// logue toute erreur au lieu de la laisser en rejection non gérée.
+function persist(promise) {
+  Promise.resolve(promise).catch(err => logError('Erreur de persistance DB :', err));
 }
 
 // ==========================================
@@ -1844,7 +1869,7 @@ io.on('connection', (socket) => {
     const requestId = crypto.randomUUID();
     const newRequest = { id: requestId, fromNullId: nullId, toNullId: targetNullId, createdAt: Date.now() };
     pendingRequests.set(requestId, newRequest);
-    db.addPendingRequest(newRequest);
+    persist(db.addPendingRequest(newRequest));
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -1876,10 +1901,10 @@ io.on('connection', (socket) => {
     if (!friends.has(toNullId)) friends.set(toNullId, new Set());
     friends.get(fromNullId).add(toNullId);
     friends.get(toNullId).add(fromNullId);
-    db.addFriendPair(fromNullId, toNullId);
+    persist(db.addFriendPair(fromNullId, toNullId));
 
     pendingRequests.delete(requestId);
-    db.removePendingRequest(requestId);
+    persist(db.removePendingRequest(requestId));
 
     const fromSocket = userSockets.get(fromNullId);
     const toSocket = userSockets.get(toNullId);
@@ -1923,14 +1948,14 @@ io.on('connection', (socket) => {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     pendingRequests.delete(requestId);
-    db.removePendingRequest(requestId);
+    persist(db.removePendingRequest(requestId));
   }));
 
   socket.on('friend:remove', safeHandler(socket, ({ nullId: targetNullId } = {}) => {
     if (!nullId || !isValidNullId(targetNullId)) return;
     friends.get(nullId)?.delete(targetNullId);
     friends.get(targetNullId)?.delete(nullId);
-    db.removeFriendPair(nullId, targetNullId);
+    persist(db.removeFriendPair(nullId, targetNullId));
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -1942,11 +1967,11 @@ io.on('connection', (socket) => {
     if (!nullId || !isValidNullId(targetNullId)) return;
     if (!blocked.has(nullId)) blocked.set(nullId, new Set());
     blocked.get(nullId).add(targetNullId);
-    db.addBlock(nullId, targetNullId);
+    persist(db.addBlock(nullId, targetNullId));
 
     friends.get(nullId)?.delete(targetNullId);
     friends.get(targetNullId)?.delete(nullId);
-    db.removeFriendPair(nullId, targetNullId);
+    persist(db.removeFriendPair(nullId, targetNullId));
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -1957,7 +1982,7 @@ io.on('connection', (socket) => {
   socket.on('friend:unblock', safeHandler(socket, ({ nullId: targetNullId } = {}) => {
     if (!nullId || !isValidNullId(targetNullId)) return;
     blocked.get(nullId)?.delete(targetNullId);
-    db.removeBlock(nullId, targetNullId);
+    persist(db.removeBlock(nullId, targetNullId));
   }));
 
   socket.on('profile:avatar', safeHandler(socket, (data = {}) => {
@@ -1969,7 +1994,7 @@ io.on('connection', (socket) => {
     const user = getUserByNullId(nullId);
     if (!user) return;
     user.avatarDataUrl = avatarDataUrl;
-    db.updateAvatar(nullId, avatarDataUrl);
+    persist(db.updateAvatar(nullId, avatarDataUrl));
 
     const userFriendsList = friends.get(nullId) || new Set();
     for (const fNullId of userFriendsList) {
@@ -2191,10 +2216,10 @@ io.on('connection', (socket) => {
     chatServers.set(id, srv);
     inviteCodeToServerId.set(inviteCode, id);
 
-    db.createGroup({ id, type: 'server', name, inviteCode, ownerNullId: nullId, createdAt: Date.now() });
-    db.addGroupMember(id, nullId, 'owner');
-    db.createChannel({ id: generalChannelId, groupId: id, name: 'Général', type: 'text', position: 0 });
-    db.createChannel({ id: voiceChannelId, groupId: id, name: 'Vocal', type: 'voice', position: 1 });
+    persist(db.createGroup({ id, type: 'server', name, inviteCode, ownerNullId: nullId, createdAt: Date.now() }));
+    persist(db.addGroupMember(id, nullId, 'owner'));
+    persist(db.createChannel({ id: generalChannelId, groupId: id, name: 'Général', type: 'text', position: 0 }));
+    persist(db.createChannel({ id: voiceChannelId, groupId: id, name: 'Vocal', type: 'voice', position: 1 }));
 
     socket.join(serverRoom(id));
     socket.emit('server:created', serializeServer(id));
@@ -2226,7 +2251,7 @@ io.on('connection', (socket) => {
     }
 
     srv.members.add(nullId);
-    db.addGroupMember(srv.id, nullId, 'member');
+    persist(db.addGroupMember(srv.id, nullId, 'member'));
     socket.join(serverRoom(srv.id));
     socket.emit('server:joined', serializeServer(srv.id));
 
@@ -2243,19 +2268,19 @@ io.on('connection', (socket) => {
 
     srv.members.delete(nullId);
     srv.admins.delete(nullId);
-    db.removeGroupMember(srv.id, nullId);
+    persist(db.removeGroupMember(srv.id, nullId));
     socket.leave(serverRoom(srv.id));
 
     if (srv.members.size === 0) {
       chatServers.delete(srv.id);
       inviteCodeToServerId.delete(srv.inviteCode);
-      db.deleteGroup(srv.id);
+      persist(db.deleteGroup(srv.id));
     } else {
       if (srv.ownerNullId === nullId) {
         srv.ownerNullId = srv.members.values().next().value; // transfert au membre le plus ancien restant
         srv.admins.delete(srv.ownerNullId); // le nouveau owner n'est plus listé comme "admin"
-        db.transferGroupOwner(srv.id, srv.ownerNullId);
-        db.setGroupMemberRole(srv.id, srv.ownerNullId, 'owner');
+        persist(db.transferGroupOwner(srv.id, srv.ownerNullId));
+        persist(db.setGroupMemberRole(srv.id, srv.ownerNullId, 'owner'));
       }
       broadcastServerMembers(srv.id);
     }
@@ -2360,7 +2385,7 @@ io.on('connection', (socket) => {
     const channelId = crypto.randomUUID();
     const position = srv.channels.length;
     srv.channels.push({ id: channelId, name, type, position });
-    db.createChannel({ id: channelId, groupId: srv.id, name, type, position });
+    persist(db.createChannel({ id: channelId, groupId: srv.id, name, type, position }));
 
     io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
   }));
@@ -2382,7 +2407,7 @@ io.on('connection', (socket) => {
       return socket.emit('server:error', { message: `Nom de salon invalide (${LIMITS.channelNameMin} à ${LIMITS.channelNameMax} caractères).` });
     }
     channel.name = name;
-    db.renameChannel(channel.id, name);
+    persist(db.renameChannel(channel.id, name));
     io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
   }));
 
@@ -2403,7 +2428,7 @@ io.on('connection', (socket) => {
       return socket.emit('server:error', { message: 'Impossible de supprimer le dernier salon textuel.' });
     }
     srv.channels = srv.channels.filter(c => c.id !== channel.id);
-    db.deleteChannel(channel.id);
+    persist(db.deleteChannel(channel.id));
     io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
   }));
 
@@ -2430,7 +2455,7 @@ io.on('connection', (socket) => {
     if (targetNullId === srv.ownerNullId) return; // déjà "au-dessus" d'admin, no-op silencieux
 
     srv.admins.add(targetNullId);
-    db.setGroupMemberRole(srv.id, targetNullId, 'admin');
+    persist(db.setGroupMemberRole(srv.id, targetNullId, 'admin'));
     io.to(serverRoom(srv.id)).emit('server:role_changed', { serverId: srv.id, nullId: targetNullId, role: 'admin' });
   }));
 
@@ -2448,7 +2473,7 @@ io.on('connection', (socket) => {
     if (!isValidNullId(targetNullId) || !srv.admins.has(targetNullId)) return;
 
     srv.admins.delete(targetNullId);
-    db.setGroupMemberRole(srv.id, targetNullId, 'member');
+    persist(db.setGroupMemberRole(srv.id, targetNullId, 'member'));
     io.to(serverRoom(srv.id)).emit('server:role_changed', { serverId: srv.id, nullId: targetNullId, role: 'member' });
   }));
 
@@ -2476,7 +2501,7 @@ io.on('connection', (socket) => {
 
     srv.members.delete(targetNullId);
     srv.admins.delete(targetNullId);
-    db.removeGroupMember(srv.id, targetNullId);
+    persist(db.removeGroupMember(srv.id, targetNullId));
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -2510,8 +2535,8 @@ io.on('connection', (socket) => {
     srv.members.delete(targetNullId);
     srv.admins.delete(targetNullId);
     srv.bannedNullIds.add(targetNullId);
-    db.removeGroupMember(srv.id, targetNullId);
-    db.addGroupBan(srv.id, targetNullId, typeof data.reason === 'string' ? data.reason.slice(0, 300) : null);
+    persist(db.removeGroupMember(srv.id, targetNullId));
+    persist(db.addGroupBan(srv.id, targetNullId, typeof data.reason === 'string' ? data.reason.slice(0, 300) : null));
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -2534,7 +2559,7 @@ io.on('connection', (socket) => {
     const targetNullId = data.targetNullId;
     if (!isValidNullId(targetNullId)) return;
     srv.bannedNullIds.delete(targetNullId);
-    db.removeGroupBan(srv.id, targetNullId);
+    persist(db.removeGroupBan(srv.id, targetNullId));
     broadcastServerMembers(srv.id);
   }));
 
@@ -2563,9 +2588,9 @@ io.on('connection', (socket) => {
     const id = crypto.randomUUID();
     const grp = { id, name, ownerNullId: nullId, members: new Set([nullId, ...memberNullIds]) };
     chatGroups.set(id, grp);
-    db.createGroup({ id, type: 'group', name, inviteCode: null, ownerNullId: nullId, createdAt: Date.now() });
-    db.addGroupMember(id, nullId, 'owner');
-    for (const m of memberNullIds) db.addGroupMember(id, m, 'member');
+    persist(db.createGroup({ id, type: 'group', name, inviteCode: null, ownerNullId: nullId, createdAt: Date.now() }));
+    persist(db.addGroupMember(id, nullId, 'owner'));
+    for (const m of memberNullIds) persist(db.addGroupMember(id, m, 'member'));
 
     socket.join(groupRoom(id));
     socket.emit('group:created', serializeGroup(id));
@@ -2598,7 +2623,7 @@ io.on('connection', (socket) => {
     }
 
     grp.members.add(targetNullId);
-    db.addGroupMember(grp.id, targetNullId, 'member');
+    persist(db.addGroupMember(grp.id, targetNullId, 'member'));
 
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
@@ -2622,7 +2647,7 @@ io.on('connection', (socket) => {
     if (!isValidNullId(targetNullId) || targetNullId === grp.ownerNullId || !grp.members.has(targetNullId)) return;
 
     grp.members.delete(targetNullId);
-    db.removeGroupMember(grp.id, targetNullId);
+    persist(db.removeGroupMember(grp.id, targetNullId));
     const targetSocketId = userSockets.get(targetNullId);
     if (targetSocketId) {
       io.sockets.sockets.get(targetSocketId)?.leave(groupRoom(grp.id));
@@ -2643,7 +2668,7 @@ io.on('connection', (socket) => {
       return socket.emit('group:error', { message: `Nom de groupe invalide (${LIMITS.groupNameMin} à ${LIMITS.groupNameMax} caractères).` });
     }
     grp.name = name;
-    db.renameGroup(grp.id, name);
+    persist(db.renameGroup(grp.id, name));
     io.to(groupRoom(grp.id)).emit('group:renamed', { groupId: grp.id, name });
   }));
 
@@ -2653,17 +2678,17 @@ io.on('connection', (socket) => {
     if (!grp || !grp.members.has(nullId)) return;
 
     grp.members.delete(nullId);
-    db.removeGroupMember(grp.id, nullId);
+    persist(db.removeGroupMember(grp.id, nullId));
     socket.leave(groupRoom(grp.id));
 
     if (grp.members.size === 0) {
       chatGroups.delete(grp.id);
-      db.deleteGroup(grp.id);
+      persist(db.deleteGroup(grp.id));
     } else {
       if (grp.ownerNullId === nullId) {
         grp.ownerNullId = grp.members.values().next().value;
-        db.transferGroupOwner(grp.id, grp.ownerNullId);
-        db.setGroupMemberRole(grp.id, grp.ownerNullId, 'owner');
+        persist(db.transferGroupOwner(grp.id, grp.ownerNullId));
+        persist(db.setGroupMemberRole(grp.id, grp.ownerNullId, 'owner'));
       }
       broadcastGroupMembers(grp.id);
     }
@@ -2838,7 +2863,7 @@ io.on('connection', (socket) => {
       reason: banReason,
       bannedAt: Date.now()
     });
-    db.addAppBan(targetNullId, targetUsername, banReason);
+    persist(db.addAppBan(targetNullId, targetUsername, banReason));
 
     // Déconnecte TOUTES les sockets actives de ce nullId (pas seulement la
     // dernière connue via userSockets, au cas où plusieurs onglets/sessions
@@ -2865,7 +2890,7 @@ io.on('connection', (socket) => {
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
     appBannedUsers.delete(targetNullId);
-    db.removeAppBan(targetNullId);
+    persist(db.removeAppBan(targetNullId));
     log('Compte débanni de l’app par', nullId, ':', targetNullId);
   }));
 
@@ -2891,9 +2916,24 @@ io.on('connection', (socket) => {
 // ==========================================
 // DÉMARRAGE
 // ==========================================
-server.listen(PORT, () => {
-  log(`Serveur NullChat démarré sur http://localhost:${PORT} (${NODE_ENV})`);
-});
+// ==========================================
+// BOOTSTRAP ASYNCHRONE
+// ==========================================
+// db.init() (connexion Turso + migrations de schéma) et loadStateFromDb()
+// (hydratation des Map en mémoire) doivent être terminés avant d'accepter
+// la moindre connexion — d'où l'attente ici, avant server.listen().
+(async () => {
+  try {
+    await db.init();
+    await loadStateFromDb();
+    server.listen(PORT, () => {
+      log(`Serveur NullChat démarré sur http://localhost:${PORT} (${NODE_ENV})`);
+    });
+  } catch (err) {
+    logError('Échec du démarrage (db.init/loadStateFromDb) :', err);
+    process.exit(1);
+  }
+})();
 
 function shutdown(signal) {
   log(`${signal} reçu, arrêt en cours...`);
