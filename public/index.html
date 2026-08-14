@@ -31,6 +31,7 @@
 </script>
 <title>NullChat</title>
 <script src="/socket.io/socket.io.js"></script>
+<script src="/virtual-list.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1266,6 +1267,9 @@ input:disabled{ opacity:.5; }
           <button class="dm-call-btn fx-btn" id="serverInviteBtn" title="Copier le code d'invitation" onclick="copyServerInvite()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
+          <button class="dm-call-btn fx-btn" id="serverEphemeralBtn" title="Minuteur d'auto-destruction du salon" onclick="promptChannelEphemeral()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+          </button>
           <button class="dm-call-btn fx-btn" id="serverLeaveBtn" title="Quitter le serveur" onclick="currentServerId && leaveServer(currentServerId)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>
           </button>
@@ -1698,6 +1702,36 @@ let myNameColors = [];
 let authToken = null;
 let socket = null;
 let myKeyPair = null;
+// --- Panic Button : purge RAM flash de toutes les clés + fermeture UI ---
+// Raccourci : Ctrl+Shift+X (ou Cmd+Shift+X sur Mac). Purge synchrone et
+// irréversible des clés en mémoire volatile ; ne touche pas le serveur/la BDD
+// (les messages E2E déjà chiffrés y restent illisibles, c'est le but).
+function panicPurge(){
+  try{
+    // Clés ECDH long terme
+    myKeyPair = null;
+    // Clés de session dérivées (DM, serveurs, groupes)
+    if (typeof dmKeys !== 'undefined') dmKeys.clear();
+    if (typeof serverKeys !== 'undefined') serverKeys.forEach(m => m.clear && m.clear());
+    if (typeof serverKeys !== 'undefined') serverKeys.clear();
+    if (typeof groupKeys !== 'undefined') groupKeys.clear();
+    if (typeof peers !== 'undefined') peers.clear();
+    // Coupe tout appel en cours (mic + peer connection)
+    if (typeof cleanupCall === 'function') cleanupCall();
+    // Purge des messages en clair déjà rendus dans le DOM
+    document.querySelectorAll('[data-e2e-plaintext], .dm-messages, .server-messages, #serverMessages, #dmMessages')
+      .forEach(el => { el.innerHTML = ''; });
+    // Déconnexion socket + verrouillage dur de l'écran
+    try{ socket && socket.disconnect(); }catch(e){}
+  } finally {
+    document.title = 'NulChat';
+    document.documentElement.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0b0b0d;color:#a3888a;font-family:monospace;font-size:14px;">Session purgée. Recharge la page pour continuer.</div>';
+  }
+}
+window.addEventListener('keydown', (e) => {
+  const isPanicCombo = (e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'X' || e.key === 'x');
+  if (isPanicCombo){ e.preventDefault(); panicPurge(); }
+});
 let currentView = 'general';
 let currentFriendTab = 'online';
 
@@ -4638,7 +4672,159 @@ async function toggleVoiceRecording(){
 document.getElementById('dmInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendDM(); });
 document.getElementById('dmInput').addEventListener('input', () => { notifyTyping(); });
 
+// ==========================================
+// MESSAGES ÉPHÉMÈRES (#10) — le serveur gère déjà le minuteur et diffuse
+// `message:expired` (voir scheduleEphemeralExpiry dans server.js) ; il ne
+// manquait que la config côté client et la purge RAM/DOM/localStorage à
+// réception de l'event, qu'on ajoute ici sans toucher au reste du pipeline
+// de rendu existant (renderedMessageEls, serverHistory, persistHistoryFor).
+const channelEphemeralTtlMs = new Map(); // channelId -> ttlMs|null, mis à jour via server:channels
+
+function formatTtl(ms){
+  if (!ms) return 'désactivé';
+  if (ms < 60000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 3600000) return `${Math.round(ms / 60000)}min`;
+  if (ms < 86400000) return `${Math.round(ms / 3600000)}h`;
+  return `${Math.round(ms / 86400000)}j`;
+}
+
+// Parse une saisie humaine ("30s", "10min", "2h", "1j", "off"/"" pour désactiver)
+// vers des ms, bornée aux limites serveur (LIMITS.ephemeralTtlMinMs/MaxMs).
+function parseTtlInput(raw){
+  const s = (raw || '').trim().toLowerCase();
+  if (!s || s === 'off' || s === '0') return null;
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(s|sec|min|m|h|j|d)?$/);
+  if (!m) return NaN;
+  const n = parseFloat(m[1]);
+  const unit = m[2] || 's';
+  const mult = { s:1000, sec:1000, min:60000, m:60000, h:3600000, j:86400000, d:86400000 }[unit];
+  return Math.round(n * mult);
+}
+
+function promptChannelEphemeral(){
+  if (!currentServerId) return;
+  const channelId = currentChannelByServer.get(currentServerId) || null;
+  if (!channelId){
+    showToast({ title: 'Aucun salon sélectionné', body: "Ouvre d'abord un salon texte." });
+    return;
+  }
+  const current = channelEphemeralTtlMs.get(channelId);
+  const input = prompt(
+    `Minuteur d'auto-destruction pour ce salon (ex: 30s, 10min, 2h, 1j).\nLaisse vide ou tape "off" pour désactiver.\nActuel : ${formatTtl(current)}`,
+    current ? formatTtl(current) : ''
+  );
+  if (input === null) return; // annulé
+  const ttlMs = parseTtlInput(input);
+  if (Number.isNaN(ttlMs)){
+    showToast({ title: 'Format invalide', body: 'Exemples valides : 30s, 10min, 2h, 1j, off.' });
+    return;
+  }
+  socket.emit('server:channel_set_ephemeral', { serverId: currentServerId, channelId, ephemeralTtlMs: ttlMs });
+  showToast({ title: 'Minuteur envoyé', body: `Ce salon : ${formatTtl(ttlMs)} (si tu es modérateur)` });
+}
+
+// Purge une entrée expirée de la mémoire (serverHistory), du DOM
+// (renderedMessageEls) et de la persistance locale — même chemin que
+// markEntryDeleted, sans dépendre d'une action explicite de l'utilisateur.
+function purgeExpiredMessage({ scope, serverId, channelId, messageId }){
+  if (scope !== 'server' || !messageId) return; // DM/groupes : à étendre si des salons DM éphémères sont ajoutés plus tard
+  const hist = serverHistory.get(serverId);
+  if (hist){
+    const idx = hist.findIndex(e => e.id === messageId);
+    if (idx !== -1) hist.splice(idx, 1);
+    saveServerHistory(serverId);
+  }
+  const rec = renderedMessageEls.get(messageId);
+  if (rec){
+    rec.el.remove();
+    renderedMessageEls.delete(messageId);
+  }
+}
+
 const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+// --- Audio HD + Zero-Bitrate Mute + VAD Worker (NulChat perf core) ---
+// Contraintes micro "HD" : echo cancellation / noise suppression natifs activés,
+// auto gain désactivé (on gère notre propre gate via le Worker VAD), 48kHz.
+const MIC_CONSTRAINTS_HD = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: false,
+  channelCount: 1,
+  sampleRate: 48000,
+  sampleSize: 16
+};
+
+// Force Opus HD (stereo off, forte bitrate, DTX activé pour couper le flux
+// silencieux au niveau codec en plus de notre coupe applicative) via SDP munging.
+// C'est la façon la plus fiable de forcer des paramètres Opus fins sans backend SFU dédié.
+function forceOpusHD(sdp){
+  return sdp.replace(/a=fmtp:(\d+) apt=\d+\r?\n/g, m => m).replace(
+    /(m=audio.*\r\n(?:a=.*\r\n)*)/,
+    (block) => {
+      const opusPt = (block.match(/a=rtpmap:(\d+) opus\/48000/) || [])[1];
+      if (!opusPt) return block;
+      const fmtpRe = new RegExp(`a=fmtp:${opusPt}.*\\r\\n`);
+      const fmtpLine = `a=fmtp:${opusPt} minptime=10;useinbandfec=1;stereo=0;maxaveragebitrate=64000;usedtx=1\r\n`;
+      return fmtpRe.test(block) ? block.replace(fmtpRe, fmtpLine) : block.replace(`a=rtpmap:${opusPt} opus/48000\r\n`, `a=rtpmap:${opusPt} opus/48000\r\n${fmtpLine}`);
+    }
+  );
+}
+
+// Worker dédié VAD (jamais sur le thread principal -> 0 impact FPS UI).
+let vadWorker = null;
+function getVadWorker(){
+  if (!vadWorker) vadWorker = new Worker('/audio-worker.js');
+  return vadWorker;
+}
+
+// Envoie l'audio brut au Worker via un AudioWorklet/ScriptProcessor léger pour
+// analyse VAD, puis pilote le zero-bitrate mute automatiquement.
+let vadAudioCtx = null, vadSourceNode = null, vadProcessorNode = null;
+function attachVadPipeline(stream, { onSpeakingChange } = {}){
+  vadAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  vadSourceNode = vadAudioCtx.createMediaStreamSource(stream);
+  // ScriptProcessor est deprecated mais reste le plus simple pour extraire des
+  // frames PCM à transférer au Worker sans copie (transferable ArrayBuffer).
+  // Migration AudioWorklet possible sans changer l'API du Worker.
+  vadProcessorNode = vadAudioCtx.createScriptProcessor(2048, 1, 1);
+  const worker = getVadWorker();
+  worker.onmessage = (e) => {
+    if (e.data.type === 'vad'){ onSpeakingChange && onSpeakingChange(e.data.speaking); }
+  };
+  vadProcessorNode.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const copy = new Float32Array(input); // copie car le buffer source est réutilisé par le navigateur
+    worker.postMessage({ type: 'frame', sampleRate: vadAudioCtx.sampleRate, samples: copy }, [copy.buffer]);
+  };
+  vadSourceNode.connect(vadProcessorNode);
+  // On ne connecte PAS processorNode -> destination (on ne veut pas de bouclage audio local).
+  vadProcessorNode.connect(vadAudioCtx.createGain()); // sink muet, garde le graph actif dans certains navigateurs
+}
+function detachVadPipeline(){
+  try{ vadProcessorNode && vadProcessorNode.disconnect(); }catch(e){}
+  try{ vadSourceNode && vadSourceNode.disconnect(); }catch(e){}
+  try{ vadAudioCtx && vadAudioCtx.close(); }catch(e){}
+  vadProcessorNode = vadSourceNode = vadAudioCtx = null;
+}
+
+// Coupe-Flux Audio Local ("Zero-Bitrate Mute") : au lieu de juste faire
+// track.enabled=false (qui laisse Chrome émettre des paquets RTP de silence
+// à faible débit), on retire réellement la piste du sender WebRTC. 0 kb/s
+// consommé réseau tant que personne ne parle.
+let micSender = null; // RTCRtpSender courant, assigné après addTrack
+let micTrackRef = null; // piste locale gardée en réserve pour la remettre
+let autoGateEnabled = true;
+async function setZeroBitrateMute(shouldMute){
+  if (!micSender) return;
+  try{
+    if (shouldMute){
+      await micSender.replaceTrack(null); // coupe le flux RTP à la source, 0 kb/s
+    } else if (micTrackRef){
+      await micSender.replaceTrack(micTrackRef); // restaure instantanément
+    }
+  }catch(e){ /* certains navigateurs refusent replaceTrack(null) mid-call sur anciens SDP: fallback */ if (micTrackRef) micTrackRef.enabled = !shouldMute; }
+}
 
 async function fetchIceServers(){
   try{
@@ -4701,8 +4887,20 @@ const ICONS = {
 
 async function getMic(){
   const inputId = getPreferredInputDeviceId();
-  localStream = await navigator.mediaDevices.getUserMedia({
-    audio: inputId ? { deviceId: { exact: inputId } } : true
+  const constraints = { ...MIC_CONSTRAINTS_HD };
+  if (inputId) constraints.deviceId = { exact: inputId };
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+  micTrackRef = localStream.getAudioTracks()[0] || null;
+
+  // VAD + zero-bitrate mute automatique : le worker décide, le thread UI ne
+  // fait jamais de calcul DSP -> 60/144 FPS garantis pendant un appel.
+  attachVadPipeline(localStream, {
+    onSpeakingChange: (speaking) => {
+      if (!autoGateEnabled || callMuted) return; // le mute manuel reste prioritaire
+      setZeroBitrateMute(!speaking);
+      const btn = document.querySelector('.call-btn.mute');
+      if (btn) btn.classList.toggle('speaking', speaking);
+    }
   });
   return localStream;
 }
@@ -4720,6 +4918,11 @@ function buildPeerConnection(targetSocketId, targetNullId){
   return pc;
 }
 
+// Applique le SDP munging Opus HD juste avant l'envoi (offer et answer).
+function applyOpusHdToDescription(desc){
+  return { type: desc.type, sdp: forceOpusHD(desc.sdp) };
+}
+
 async function startCall(friend){
   if (activeCallPeer) return;
   activeCallPeer = friend;
@@ -4732,11 +4935,12 @@ async function startCall(friend){
   }
 
   rtcConn = buildPeerConnection(friend.socketId, friend.nullId);
-  localStream.getTracks().forEach(track => rtcConn.addTrack(track, localStream));
+  localStream.getTracks().forEach(track => { const s = rtcConn.addTrack(track, localStream); if (track.kind === 'audio') micSender = s; });
 
   const offer = await rtcConn.createOffer();
-  await rtcConn.setLocalDescription(offer);
-  socket.emit('call:offer', { targetNullId: friend.nullId, targetSocketId: friend.socketId, sdp: offer });
+  const hdOffer = applyOpusHdToDescription(offer);
+  await rtcConn.setLocalDescription(hdOffer);
+  socket.emit('call:offer', { targetNullId: friend.nullId, targetSocketId: friend.socketId, sdp: hdOffer });
 
   openCallOverlay({
     name: friend.username, statusText: 'Appel en cours…', avatarDataUrl: friend.avatarDataUrl, ringing: true, variant: 'outgoing',
@@ -4777,11 +4981,12 @@ async function acceptCall(from, sdp){
     return;
   }
   rtcConn = buildPeerConnection(from.socketId, from.nullId);
-  localStream.getTracks().forEach(track => rtcConn.addTrack(track, localStream));
+  localStream.getTracks().forEach(track => { const s = rtcConn.addTrack(track, localStream); if (track.kind === 'audio') micSender = s; });
   await rtcConn.setRemoteDescription(new RTCSessionDescription(sdp));
   const answer = await rtcConn.createAnswer();
-  await rtcConn.setLocalDescription(answer);
-  socket.emit('call:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, sdp: answer });
+  const hdAnswer = applyOpusHdToDescription(answer);
+  await rtcConn.setLocalDescription(hdAnswer);
+  socket.emit('call:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, sdp: hdAnswer });
 
   openCallOverlay({
     name: from.username, statusText: 'En appel', avatarDataUrl: from.avatarDataUrl, ringing: false, variant: 'connected',
@@ -4814,6 +5019,7 @@ function toggleMute(){
   if (!localStream) return;
   callMuted = !callMuted;
   localStream.getAudioTracks().forEach(t => t.enabled = !callMuted);
+  setZeroBitrateMute(callMuted); // mute manuel = coupe le flux réseau immédiatement, pas juste le micro local
   const btn = document.querySelector('.call-btn.mute');
   if (btn) btn.classList.toggle('active-mute', callMuted);
 }
@@ -4826,6 +5032,8 @@ function hangupCall(){
 function cleanupCall(){
   if (rtcConn){ rtcConn.close(); rtcConn = null; }
   if (localStream){ localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  detachVadPipeline();
+  micSender = null; micTrackRef = null;
   activeCallPeer = null;
   pendingIncomingSdp = null;
   callMuted = false;
@@ -5195,6 +5403,19 @@ async function startApp(){
     const errEl = document.getElementById('serverError');
     if (errEl) errEl.textContent = data.message || 'Une erreur est survenue.';
     showToast({ title: 'Info', body: data.message || 'Une erreur est survenue.' });
+  });
+
+  // Synchronise l'état "minuteur éphémère" par salon (source de vérité :
+  // serveur, voir server:channel_set_ephemeral). Le serveur renvoie déjà la
+  // liste complète des salons avec ephemeralTtlMs à chaque changement.
+  socket.on('server:channels', (data) => {
+    (data.channels || []).forEach(ch => channelEphemeralTtlMs.set(ch.id, ch.ephemeralTtlMs ?? null));
+  });
+
+  // Purge RAM + DOM + localStorage dès qu'un message expire, chez tout le
+  // monde en même temps (le serveur diffuse l'event à tout le salon).
+  socket.on('message:expired', (data) => {
+    purgeExpiredMessage(data);
   });
 
   socket.on('server:member_status', (data) => {
