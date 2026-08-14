@@ -99,11 +99,36 @@ const SCHEMA_SQL = `
     position INTEGER NOT NULL DEFAULT 0
   );
 
+  CREATE TABLE IF NOT EXISTS server_identities (
+    group_id TEXT NOT NULL REFERENCES chat_groups(id) ON DELETE CASCADE,
+    null_id TEXT NOT NULL,
+    pseudo TEXT NOT NULL,
+    avatar_data_url TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, null_id)
+  );
+
   CREATE TABLE IF NOT EXISTS app_bans (
     null_id TEXT PRIMARY KEY,
     username TEXT,
     reason TEXT,
     banned_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS reports (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    reporter_null_id TEXT NOT NULL,
+    reporter_username TEXT,
+    target_null_id TEXT NOT NULL,
+    target_username TEXT,
+    description TEXT,
+    proof_data_url TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    ai_verdict TEXT,
+    resolved_by TEXT,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
   );
 `;
 
@@ -177,9 +202,22 @@ async function init() {
     if (!existingCols.has('bg_value')) {
       await client.execute(`ALTER TABLE users ADD COLUMN bg_value TEXT`);
     }
+    // Mode Low-Bandwidth / SFW : préférence par compte (0/1), avant purement
+    // en mémoire (Map lowBandwidthPrefs côté server.js) et donc perdue à
+    // chaque redémarrage.
+    if (!existingCols.has('low_bandwidth')) {
+      await client.execute(`ALTER TABLE users ADD COLUMN low_bandwidth INTEGER DEFAULT 0`);
+    }
     await client.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_null_id ON users(null_id)`);
     await client.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
     await client.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
+
+    // Salons éphémères : minuteur (en ms) de suppression forcée des messages
+    // d'un salon, nul par défaut (pas d'expiration).
+    const channelCols = await tableColumns('chat_channels');
+    if (!channelCols.has('ephemeral_ttl_ms')) {
+      await client.execute(`ALTER TABLE chat_channels ADD COLUMN ephemeral_ttl_ms INTEGER`);
+    }
 
     await backfillNullIds();
 
@@ -230,13 +268,15 @@ module.exports = {
     const res = await client.execute(
       `SELECT username, password_hash AS passwordHash, null_id AS nullId, email, phone, public_key AS publicKey, avatar_data_url AS avatarDataUrl,
               name_font AS nameFont, name_effect AS nameEffect, name_colors AS nameColors,
-              banner_type AS bannerType, banner_value AS bannerValue, bg_type AS bgType, bg_value AS bgValue
+              banner_type AS bannerType, banner_value AS bannerValue, bg_type AS bgType, bg_value AS bgValue,
+              low_bandwidth AS lowBandwidth
        FROM users`
     );
     return res.rows.map(u => ({
       ...u,
       publicKey: u.publicKey ? JSON.parse(u.publicKey) : null,
-      nameColors: u.nameColors ? JSON.parse(u.nameColors) : []
+      nameColors: u.nameColors ? JSON.parse(u.nameColors) : [],
+      lowBandwidth: !!u.lowBandwidth
     }));
   },
 
@@ -252,6 +292,10 @@ module.exports = {
       sql: `UPDATE users SET banner_type = ?, banner_value = ?, bg_type = ?, bg_value = ? WHERE null_id = ?`,
       args: [bannerType || 'none', bannerValue || null, bgType || 'none', bgValue || null, nullId]
     });
+  },
+
+  async setLowBandwidthPref(nullId, enabled) {
+    await client.execute({ sql: `UPDATE users SET low_bandwidth = ? WHERE null_id = ?`, args: [enabled ? 1 : 0, nullId] });
   },
 
   async addFriendPair(a, b) {
@@ -353,10 +397,10 @@ module.exports = {
     return res.rows;
   },
 
-  async createChannel({ id, groupId, name, type, position }) {
+  async createChannel({ id, groupId, name, type, position, ephemeralTtlMs }) {
     await client.execute({
-      sql: `INSERT INTO chat_channels (id, group_id, name, type, position) VALUES (?, ?, ?, ?, ?)`,
-      args: [id, groupId, name, type || 'text', position || 0]
+      sql: `INSERT INTO chat_channels (id, group_id, name, type, position, ephemeral_ttl_ms) VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [id, groupId, name, type || 'text', position || 0, ephemeralTtlMs ?? null]
     });
   },
   async deleteChannel(id) {
@@ -365,8 +409,25 @@ module.exports = {
   async renameChannel(id, name) {
     await client.execute({ sql: `UPDATE chat_channels SET name = ? WHERE id = ?`, args: [name, id] });
   },
+  async setChannelEphemeral(id, ephemeralTtlMs) {
+    await client.execute({ sql: `UPDATE chat_channels SET ephemeral_ttl_ms = ? WHERE id = ?`, args: [ephemeralTtlMs ?? null, id] });
+  },
   async loadAllChannels() {
-    const res = await client.execute(`SELECT id, group_id AS groupId, name, type, position FROM chat_channels ORDER BY position ASC`);
+    const res = await client.execute(`SELECT id, group_id AS groupId, name, type, position, ephemeral_ttl_ms AS ephemeralTtlMs FROM chat_channels ORDER BY position ASC`);
+    return res.rows;
+  },
+
+  async setServerIdentity(groupId, nullId, pseudo, avatarDataUrl) {
+    await client.execute({
+      sql: `INSERT OR REPLACE INTO server_identities (group_id, null_id, pseudo, avatar_data_url, updated_at) VALUES (?, ?, ?, ?, ?)`,
+      args: [groupId, nullId, pseudo, avatarDataUrl || null, Date.now()]
+    });
+  },
+  async clearServerIdentity(groupId, nullId) {
+    await client.execute({ sql: `DELETE FROM server_identities WHERE group_id = ? AND null_id = ?`, args: [groupId, nullId] });
+  },
+  async loadAllServerIdentities() {
+    const res = await client.execute(`SELECT group_id AS groupId, null_id AS nullId, pseudo, avatar_data_url AS avatarDataUrl FROM server_identities`);
     return res.rows;
   },
 
@@ -381,6 +442,33 @@ module.exports = {
   },
   async loadAllAppBans() {
     const res = await client.execute(`SELECT null_id AS nullId, username, reason, banned_at AS bannedAt FROM app_bans`);
+    return res.rows;
+  },
+
+  // -----------------------------
+  // Signalements (utilisateur / dox)
+  // -----------------------------
+  async addReport(r) {
+    await client.execute({
+      sql: `INSERT INTO reports (id, type, reporter_null_id, reporter_username, target_null_id, target_username, description, proof_data_url, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      args: [r.id, r.type, r.reporterNullId, r.reporterUsername || null, r.targetNullId, r.targetUsername || null, r.description || null, r.proofDataUrl || null, r.createdAt]
+    });
+  },
+  async resolveReport(id, { status, aiVerdict, resolvedBy }) {
+    await client.execute({
+      sql: `UPDATE reports SET status = ?, ai_verdict = ?, resolved_by = ?, resolved_at = ? WHERE id = ?`,
+      args: [status, aiVerdict || null, resolvedBy || null, Date.now(), id]
+    });
+  },
+  async loadAllReports() {
+    const res = await client.execute(
+      `SELECT id, type, reporter_null_id AS reporterNullId, reporter_username AS reporterUsername,
+              target_null_id AS targetNullId, target_username AS targetUsername, description,
+              proof_data_url AS proofDataUrl, status, ai_verdict AS aiVerdict, resolved_by AS resolvedBy,
+              created_at AS createdAt, resolved_at AS resolvedAt
+       FROM reports ORDER BY created_at DESC`
+    );
     return res.rows;
   }
 };

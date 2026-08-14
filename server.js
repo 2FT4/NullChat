@@ -389,6 +389,21 @@ const LIMITS = {
   channelNameMax: 40,
   channelMax: 25,
   channelTypes: new Set(['text', 'voice']),
+  // Vocaux P2P / partage d'écran / soundboard : le serveur ne relaie jamais
+  // le média lui-même (tout passe en WebRTC direct entre clients), juste la
+  // signalisation (offer/answer/ICE) et de courts extraits soundboard
+  // chiffrés côté client comme les messages.
+  voiceChannelMaxPeers: 25,
+  soundboardCiphertextMaxBytes: 500 * 1024,
+  soundboardFilenameMax: 100,
+  // Anonymat par serveur : pseudo affiché aux autres membres d'un serveur
+  // donné, indépendant du pseudo global du compte.
+  serverPseudoMin: 2,
+  serverPseudoMax: 32,
+  // Salons éphémères : minuteur (en ms) avant suppression forcée d'un
+  // message dans un salon. null/absent = pas d'expiration.
+  ephemeralTtlMinMs: 10 * 1000,           // 10 secondes
+  ephemeralTtlMaxMs: 7 * 24 * 60 * 60 * 1000, // 7 jours
   groupNameMin: 2,
   groupNameMax: 40,
   groupMinMembers: 2,
@@ -410,6 +425,13 @@ const LIMITS = {
   hexColorRegex: /^#[0-9a-fA-F]{6}$/,
   profilePresets: new Set(['crimson', 'sunset', 'ocean', 'purple', 'forest', 'candy', 'midnight', 'gold']),
   bannerMaxDataUrlLength: 400 * 1024,
+  // Signalements (personne / dox) : description + une pièce de preuve
+  // (capture d'écran essentiellement). Volontairement plus généreux qu'un
+  // avatar/bannière mais toujours borné pour éviter d'exploser la base.
+  reportTypes: new Set(['user', 'dox']),
+  reportDescriptionMax: 2000,
+  reportProofMaxDataUrlLength: 6 * 1024 * 1024,
+  reportsMaxPerTarget: 500,
 };
 
 const app = express();
@@ -488,8 +510,35 @@ const blocked = new Map();
 // redémarrage (Render efface le process/la mémoire à chaque redéploiement
 // ou "spin down" — voir aussi la persistance du fichier SQLite lui-même,
 // qui nécessite un Persistent Disk côté Render).
-const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId>, admins: Set<nullId>, bannedNullIds: Set<nullId>, channels: [{id,name,type,position}] }
+const chatServers = new Map();       // serverId -> { id, name, inviteCode, ownerNullId, members: Set<nullId>, admins: Set<nullId>, bannedNullIds: Set<nullId>, channels: [{id,name,type,position,ephemeralTtlMs}] }
 const inviteCodeToServerId = new Map(); // inviteCode -> serverId
+
+// Anonymat par serveur : "${serverId}:${nullId}" -> { pseudo, avatarDataUrl }.
+// Un membre peut avoir un pseudo/avatar différent par serveur ; le NULLID
+// global du compte reste connu du serveur (nécessaire pour l'auth, les
+// rôles/la modération et l'échange de clés E2E) mais n'est jamais affiché
+// aux AUTRES membres à la place de cette identité de serveur — voir
+// getServerMembersInfo / server:set_identity plus bas.
+const serverIdentities = new Map();
+
+// Salons éphémères : channelId -> Set<Timeout> des minuteurs de suppression
+// programmée en cours pour ce salon (nettoyés si le salon/serveur est
+// supprimé avant leur échéance).
+const channelEphemeralTimers = new Map();
+
+// Vocaux P2P (mesh WebRTC) : channelId (type 'voice') -> Set<nullId> des
+// membres actuellement "dans" le vocal. Le serveur ne fait QUE relayer la
+// présence + la signalisation SDP/ICE ; aucun flux audio/vidéo/écran ne
+// transite par lui (voir voiceRoom / server:voice_* plus bas).
+const voiceChannelPeers = new Map();
+// Un compte ne peut être "dans" qu'un seul salon vocal à la fois :
+// nullId -> { serverId, channelId }.
+const nullIdVoiceChannel = new Map();
+// Préférence "Low-Bandwidth / SFW" : nullId -> boolean. Purement déclaratif
+// — c'est le CLIENT de chaque pair qui applique le floutage par défaut des
+// médias reçus tant que cette préférence est active pour son expéditeur ;
+// le serveur se contente de la diffuser aux autres participants du vocal.
+const lowBandwidthPrefs = new Map();
 
 // Groupes (chat à plusieurs, 2 à 30 membres, sans code d'invitation — les
 // membres sont ajoutés directement par le créateur parmi ses amis). Même
@@ -528,6 +577,13 @@ function appRoleOf(candidateNullId) {
   return null;
 }
 
+// Signalements (utilisateur / dox), visibles uniquement par owner+co-owners.
+// Persistés via db.js (table reports) pour survivre à un redémarrage.
+// id -> { id, type, reporterNullId, reporterUsername, targetNullId,
+//         targetUsername, description, proofDataUrl, status, aiVerdict,
+//         resolvedBy, createdAt, resolvedAt }
+const appReports = new Map();
+
 
 // ==========================================
 // HYDRATATION DEPUIS LA BASE SQLITE (au démarrage)
@@ -558,6 +614,7 @@ async function loadStateFromDb() {
     });
     nullIdToUser.set(u.nullId, u.username);
     if (!friends.has(u.nullId)) friends.set(u.nullId, new Set());
+    if (u.lowBandwidth) lowBandwidthPrefs.set(u.nullId, true);
   }
   const allFriends = await db.loadAllFriends();
   for (const f of allFriends) {
@@ -600,25 +657,34 @@ async function loadStateFromDb() {
   }
   for (const c of await db.loadAllChannels()) {
     const srv = chatServers.get(c.groupId);
-    if (srv) srv.channels.push({ id: c.id, name: c.name, type: c.type, position: c.position });
+    if (srv) srv.channels.push({ id: c.id, name: c.name, type: c.type, position: c.position, ephemeralTtlMs: c.ephemeralTtlMs ?? null });
   }
   // Tout serveur historique sans salon (ancien format) reçoit un salon par
   // défaut pour rester utilisable.
   for (const srv of chatServers.values()) {
     if (srv.channels.length === 0) {
       const chId = crypto.randomUUID();
-      srv.channels.push({ id: chId, name: 'Général', type: 'text', position: 0 });
+      srv.channels.push({ id: chId, name: 'Général', type: 'text', position: 0, ephemeralTtlMs: null });
       await db.createChannel({ id: chId, groupId: srv.id, name: 'Général', type: 'text', position: 0 });
     } else {
       srv.channels.sort((a, b) => a.position - b.position);
     }
   }
 
+  if (typeof db.loadAllServerIdentities === 'function') {
+    for (const si of await db.loadAllServerIdentities()) {
+      serverIdentities.set(serverIdentityKey(si.groupId, si.nullId), { pseudo: si.pseudo, avatarDataUrl: si.avatarDataUrl || null });
+    }
+  }
+
   for (const b of await db.loadAllAppBans()) {
     appBannedUsers.set(b.nullId, { nullId: b.nullId, username: b.username, reason: b.reason, bannedAt: b.bannedAt });
   }
+  for (const r of await db.loadAllReports()) {
+    appReports.set(r.id, r);
+  }
 
-  log(`Base chargée : ${users.size} compte(s), ${allFriends.length} lien(s) d'amitié, ${pendingRequests.size} demande(s) en attente, ${chatServers.size} serveur(s), ${chatGroups.size} groupe(s), ${appBannedUsers.size} bannissement(s) global(aux).`);
+  log(`Base chargée : ${users.size} compte(s), ${allFriends.length} lien(s) d'amitié, ${pendingRequests.size} demande(s) en attente, ${chatServers.size} serveur(s), ${chatGroups.size} groupe(s), ${appBannedUsers.size} bannissement(s) global(aux), ${appReports.size} signalement(s).`);
 }
 // NB : le chargement effectif est déclenché plus bas, dans le bootstrap
 // asynchrone juste avant server.listen() — il faut que db.init() (création
@@ -776,6 +842,19 @@ function isValidAvatarDataUrl(dataUrl) {
   );
 }
 
+// Pseudo de serveur : mêmes garde-fous anti-injection que les autres champs
+// affichés tels quels côté client (isSafeReactionEmoji), avec une longueur
+// dédiée (serverPseudoMin/Max) plutôt que celle du pseudo global.
+function isValidServerPseudo(pseudo) {
+  if (typeof pseudo !== 'string') return false;
+  const trimmed = pseudo.trim();
+  return (
+    trimmed.length >= LIMITS.serverPseudoMin &&
+    trimmed.length <= LIMITS.serverPseudoMax &&
+    !/[<>&"'`]/.test(trimmed)
+  );
+}
+
 function isValidHexColor(v) {
   return typeof v === 'string' && LIMITS.hexColorRegex.test(v);
 }
@@ -803,9 +882,58 @@ function isValidBannerDataUrl(dataUrl) {
   );
 }
 
+function isValidReportProofDataUrl(dataUrl) {
+  if (dataUrl === undefined || dataUrl === null) return true; // preuve optionnelle
+  return (
+    typeof dataUrl === 'string' &&
+    dataUrl.length <= LIMITS.reportProofMaxDataUrlLength &&
+    /^data:(image\/(png|jpe?g|webp|gif)|application\/pdf);base64,[A-Za-z0-9+/]+=*$/.test(dataUrl)
+  );
+}
+
 function getUserByNullId(targetNullId) {
   const uname = nullIdToUser.get(targetNullId);
   return uname ? users.get(uname.toLowerCase()) : null;
+}
+
+// Bannissement global de l'app, factorisé pour être appelé aussi bien depuis
+// le socket handler (décision humaine) que depuis le verdict automatique de
+// NullAI sur un signalement de dox confirmé (byNullId vaut alors 'NullAI').
+function banUserFromAppServer(targetNullId, reason, byNullId) {
+  const targetUsername = nullIdToUser.get(targetNullId) || null;
+  appBannedUsers.set(targetNullId, {
+    nullId: targetNullId,
+    username: targetUsername,
+    reason: reason || null,
+    bannedAt: Date.now()
+  });
+  persist(db.addAppBan(targetNullId, targetUsername, reason || null));
+
+  // Déconnecte TOUTES les sockets actives de ce nullId (pas seulement la
+  // dernière connue via userSockets, au cas où plusieurs onglets/sessions
+  // seraient ouverts) et révoque tous ses tokens actifs.
+  for (const [sockId, info] of connectedSockets.entries()) {
+    if (info.nullId !== targetNullId) continue;
+    const targetSocket = io.sockets.sockets.get(sockId);
+    if (!targetSocket) continue;
+    targetSocket.emit('app:user_banned', { reason: reason || null });
+    targetSocket.disconnect(true);
+  }
+  if (targetUsername) {
+    const tokens = usernameToTokens.get(targetUsername.toLowerCase());
+    if (tokens) for (const t of [...tokens]) revokeToken(t);
+  }
+  log('Compte banni de l’app par', byNullId, ':', targetNullId, reason ? `(${reason})` : '');
+}
+
+// Diffuse la mise à jour d'un signalement traité à tous les owners/co-owners
+// connectés (pour que leurs panneaux se synchronisent sans recharger).
+function broadcastReportUpdate(report) {
+  for (const [sockId, info] of connectedSockets.entries()) {
+    if (!isAppOwnerOrCoOwner(info.nullId)) continue;
+    const modSocket = io.sockets.sockets.get(sockId);
+    if (modSocket) modSocket.emit('report:updated', { report });
+  }
 }
 
 function isValidMeta(str, max) {
@@ -848,6 +976,9 @@ const serverActionRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 15 }
 // pas seulement par IP, pour qu'un utilisateur ne puisse pas épuiser le
 // quota/budget à lui seul.
 const nullaiRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 200 });
+// Signalements : évite le spam (un utilisateur qui balance 50 signalements
+// à la suite) sans gêner un usage légitime.
+const reportRateLimit = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 8 });
 
 function clientIp(req) {
   return req.ip || req.socket.remoteAddress || 'unknown';
@@ -1261,15 +1392,42 @@ Personnalité (à incarner dans le TON, pas à décrire ni à expliquer) :
 - Une intelligence vive et un charisme calculateur : tu parles avec aisance, tu structures ta pensée clairement, tu donnes l'impression d'avoir toujours une longueur d'avance — mais jamais pour manipuler ou rabaisser la personne en face de toi. Ton assurance sert à aider, pas à dominer.
 - Tu es concis par défaut, direct, sans blabla inutile ni formules robotiques ("En tant qu'IA...", "Je suis désolé mais..."). Pas d'emojis excessifs.
 
-Ce que tu restes, sous la personnalité : utile, honnête, jamais nuisible. La personnalité est un style, pas une excuse pour donner de mauvaises réponses, mentir sur des faits, ou aider à faire du mal à quelqu'un.`;
+Ce que tu restes, sous la personnalité : utile, honnête, jamais nuisible. La personnalité est un style, pas une excuse pour donner de mauvaises réponses, mentir sur des faits, ou aider à faire du mal à quelqu'un.
 
-async function callGemini(history, message) {
+Connaissance de l'app (pour pouvoir aider les gens qui te posent des questions dessus) :
+- NullChat : chat façon Discord mais chiffré de bout en bout (ECDH + AES-GCM) — amis, groupes et serveurs, identifiant unique NULLID.
+- Chaque compte a un rôle : membre normal, admin/propriétaire d'un serveur donné, ou — au niveau de toute l'app — Owner / Co-Owner. Un badge "certifié" (coche) s'affiche à côté du pseudo d'un vrai Owner/Co-Owner : il est calculé côté serveur à partir du NULLID réel du compte, donc personne ne peut l'obtenir juste en se renommant "Owner" ou "Admin" — c'est justement fait pour empêcher l'usurpation d'identité.
+- N'importe qui peut signaler un utilisateur (bouton "Signaler", avec une preuve à l'appui) ou signaler un cas de dox/doxxing (bouton dédié "Signaler un dox", preuve également requise). Les signalements arrivent dans le panneau de modération, visible seulement par les Owner/Co-Owner.
+- Pour les signalements de dox en particulier, un Owner/Co-Owner peut demander une analyse à NullAI (toi) sur la preuve fournie : si le dox est confirmé, le compte visé est banni automatiquement de toute l'app.
+- Si quelqu'un te demande de l'aide sur comment signaler un problème, explique-lui simplement où trouver les boutons (dans le profil de la personne concernée) et que fournir une preuve claire aide la modération à traiter la demande rapidement. Tu n'as pas accès toi-même à la liste des signalements ni au bouton de bannissement — ce sont des actions humaines (Owner/Co-Owner), sauf pour l'analyse ponctuelle d'une preuve de dox qu'on te soumet explicitement.`;
+
+// Instruction système dédiée à l'analyse de signalements de dox : rôle de
+// juge strict, sortie JSON uniquement, aucune personnalité NullAI ici — on
+// ne veut pas d'enrobage, juste un verdict exploitable par le serveur.
+const DOX_JUDGE_SYSTEM_PROMPT = `Tu es un outil interne de modération pour NullChat. On te soumet un signalement pour "dox" (divulgation non consentie d'informations personnelles identifiantes : adresse, numéro de téléphone, nom réel, lieu de travail/école, photos privées, etc. permettant de retrouver ou harceler quelqu'un dans la vraie vie) accompagné d'une description écrite par la personne qui signale, et éventuellement d'une preuve (image).
+
+Ta tâche : évaluer, à partir SEULEMENT de ce qui t'est fourni, si la preuve démontre de façon raisonnablement claire qu'un dox a bien eu lieu.
+
+Réponds UNIQUEMENT avec un objet JSON strictement de cette forme, sans texte avant/après, sans balises markdown :
+{"isDox": true|false, "confidence": 0-100, "reasoning": "une ou deux phrases en français expliquant le verdict"}
+
+Sois prudent : en cas de doute réel ou de preuve insuffisante/ambiguë, réponds isDox: false avec une confidence basse plutôt que de risquer un bannissement injustifié.`;
+
+async function callGemini(history, message, { systemPrompt, imageDataUrl } = {}) {
+  const userParts = [{ text: message }];
+  if (imageDataUrl) {
+    const match = /^data:(image\/[a-zA-Z+]+);base64,(.+)$/.exec(imageDataUrl);
+    if (match) {
+      userParts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+    }
+  }
+
   const contents = [
     ...(history || []).map(turn => ({
       role: turn.role,
       parts: [{ text: turn.text }]
     })),
-    { role: 'user', parts: [{ text: message }] }
+    { role: 'user', parts: userParts }
   ];
 
   const controller = new AbortController();
@@ -1286,7 +1444,7 @@ async function callGemini(history, message) {
         },
         body: JSON.stringify({
           contents,
-          systemInstruction: { parts: [{ text: NULLAI_SYSTEM_PROMPT }] },
+          systemInstruction: { parts: [{ text: systemPrompt || NULLAI_SYSTEM_PROMPT }] },
           generationConfig: { maxOutputTokens: 1024 }
         }),
         signal: controller.signal
@@ -1310,6 +1468,29 @@ async function callGemini(history, message) {
     throw new Error(`Réponse vide de Gemini (${blockReason || 'raison inconnue'}).`);
   }
   return reply.trim();
+}
+
+// Demande à Gemini de juger un signalement de dox. Retourne toujours un
+// objet exploitable (jamais d'exception vers l'appelant) — en cas de souci
+// on retombe sur un verdict "non confirmé" pour ne jamais bannir par défaut.
+async function judgeDoxReport(report) {
+  const message = `Description fournie par la personne qui signale :\n${report.description || '(aucune description)'}\n\nCompte visé : ${report.targetUsername || report.targetNullId}`;
+  try {
+    const raw = await callGemini([], message, {
+      systemPrompt: DOX_JUDGE_SYSTEM_PROMPT,
+      imageDataUrl: report.proofDataUrl || null
+    });
+    const cleaned = raw.replace(/^```json\s*|```\s*$/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+    return {
+      isDox: parsed.isDox === true,
+      confidence: Number.isFinite(parsed.confidence) ? Math.max(0, Math.min(100, parsed.confidence)) : 0,
+      reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning.slice(0, 500) : ''
+    };
+  } catch (err) {
+    logError('Erreur analyse dox NullAI :', err);
+    return { isDox: false, confidence: 0, reasoning: "Analyse indisponible (erreur technique) — verdict non confirmé par prudence." };
+  }
 }
 
 app.post('/api/nullai/chat', requireAuth, async (req, res) => {
@@ -1686,6 +1867,38 @@ function joinedServerCount(nullId) {
   return count;
 }
 
+function serverIdentityKey(serverId, nullId) {
+  return `${serverId}:${nullId}`;
+}
+
+function getServerIdentity(serverId, nullId) {
+  return serverIdentities.get(serverIdentityKey(serverId, nullId)) || null;
+}
+
+// Supprime l'identité de serveur d'un membre en local ET en base (départ,
+// kick, ban) — évite qu'un pseudo/avatar de serveur "ressuscite" si la
+// personne revient plus tard.
+function forgetServerIdentity(serverId, targetNullId) {
+  const key = serverIdentityKey(serverId, targetNullId);
+  if (serverIdentities.delete(key) && typeof db.clearServerIdentity === 'function') {
+    persist(db.clearServerIdentity(serverId, targetNullId));
+  }
+}
+
+// Identité effective d'un membre DANS un serveur donné : son pseudo/avatar
+// de serveur s'il en a défini un, sinon un repli sur son identité globale.
+function effectiveServerIdentity(serverId, nullId) {
+  const identity = getServerIdentity(serverId, nullId);
+  const memberUser = getUserByNullId(nullId);
+  return {
+    serverPseudo: identity?.pseudo || nullIdToUser.get(nullId) || null,
+    serverAvatarDataUrl: identity && identity.avatarDataUrl !== undefined && identity.avatarDataUrl !== null
+      ? identity.avatarDataUrl
+      : (memberUser?.avatarDataUrl || null),
+    hasCustomIdentity: !!identity
+  };
+}
+
 function getServerMembersInfo(serverId) {
   const srv = chatServers.get(serverId);
   if (!srv) return [];
@@ -1695,12 +1908,20 @@ function getServerMembersInfo(serverId) {
     if (!memberUsername) continue;
     const isOnline = userSockets.has(memberNullId);
     const memberUser = getUserByNullId(memberNullId);
+    const { serverPseudo, serverAvatarDataUrl, hasCustomIdentity } = effectiveServerIdentity(serverId, memberNullId);
     list.push({
       nullId: memberNullId,
       username: memberUsername,
       online: isOnline,
       socketId: isOnline ? userSockets.get(memberNullId) : null,
-      avatarDataUrl: memberUser?.avatarDataUrl || null
+      avatarDataUrl: memberUser?.avatarDataUrl || null,
+      // Champs d'identité de serveur : c'est CEUX-LÀ que le client doit
+      // afficher aux autres membres pour respecter l'anonymat par serveur
+      // (username/avatarDataUrl ci-dessus restent l'identité globale, encore
+      // exposée pour compat avec les anciens clients / la modération).
+      serverPseudo,
+      serverAvatarDataUrl,
+      hasCustomIdentity
     });
   }
   return list;
@@ -1780,6 +2001,112 @@ function persist(promise) {
   Promise.resolve(promise).catch(err => logError('Erreur de persistance DB :', err));
 }
 
+// Salons éphémères : programme la suppression définitive d'un message côté
+// clients (RAM + IndexedDB) après le minuteur configuré sur le salon. Le
+// serveur ne stockant jamais le clair (ni même le chiffré, une fois relayé),
+// il n'a rien à effacer lui-même : il se contente de notifier tous les
+// membres du salon pour qu'ils purgent leur copie locale déchiffrée.
+function scheduleEphemeralExpiry(serverId, channelId, messageId, ttlMs) {
+  const timer = setTimeout(() => {
+    const set = channelEphemeralTimers.get(channelId);
+    if (set) {
+      set.delete(timer);
+      if (set.size === 0) channelEphemeralTimers.delete(channelId);
+    }
+    io.to(serverRoom(serverId)).emit('message:expired', { scope: 'server', serverId, channelId, messageId });
+  }, ttlMs);
+  timer.unref?.();
+  if (!channelEphemeralTimers.has(channelId)) channelEphemeralTimers.set(channelId, new Set());
+  channelEphemeralTimers.get(channelId).add(timer);
+}
+
+// Annule tous les minuteurs en attente d'un salon (salon ou serveur
+// supprimé avant l'échéance) pour éviter fuite mémoire / notification vers
+// une room qui n'existe plus.
+function clearChannelEphemeralTimers(channelId) {
+  const set = channelEphemeralTimers.get(channelId);
+  if (!set) return;
+  for (const t of set) clearTimeout(t);
+  channelEphemeralTimers.delete(channelId);
+}
+
+// ==========================================
+// VOCAUX P2P — helpers de présence (mesh WebRTC)
+// ==========================================
+function voiceRoom(channelId) {
+  return `voice:${channelId}`;
+}
+
+function getVoiceChannelPeersInfo(serverId, channelId) {
+  const set = voiceChannelPeers.get(channelId);
+  if (!set) return [];
+  const list = [];
+  for (const memberNullId of set) {
+    const isOnline = userSockets.has(memberNullId);
+    const { serverPseudo, serverAvatarDataUrl } = effectiveServerIdentity(serverId, memberNullId);
+    list.push({
+      nullId: memberNullId,
+      socketId: isOnline ? userSockets.get(memberNullId) : null,
+      serverPseudo,
+      serverAvatarDataUrl,
+      lowBandwidth: !!lowBandwidthPrefs.get(memberNullId)
+    });
+  }
+  return list;
+}
+
+// Fait sortir un compte du vocal où il se trouve (s'il y en a un) et
+// prévient les autres participants. Utilisé par server:voice_leave, la
+// déconnexion socket, et le kick/ban/suppression de salon/serveur.
+function leaveVoiceChannel(targetNullId, reason = null, onlyIfServerId = null) {
+  const loc = nullIdVoiceChannel.get(targetNullId);
+  if (!loc) return;
+  if (onlyIfServerId && loc.serverId !== onlyIfServerId) return;
+  nullIdVoiceChannel.delete(targetNullId);
+  const set = voiceChannelPeers.get(loc.channelId);
+  if (set) {
+    set.delete(targetNullId);
+    if (set.size === 0) voiceChannelPeers.delete(loc.channelId);
+  }
+  io.to(voiceRoom(loc.channelId)).emit('server:voice_peer_left', {
+    serverId: loc.serverId, channelId: loc.channelId, nullId: targetNullId, reason
+  });
+  const targetSocketId = userSockets.get(targetNullId);
+  if (targetSocketId) {
+    io.sockets.sockets.get(targetSocketId)?.leave(voiceRoom(loc.channelId));
+  }
+}
+
+// ==========================================
+// RÉCAPITULATIF SÉCURITÉ / VIE PRIVÉE DE NULLCHAT
+// ==========================================
+// - Chiffrement de bout en bout (E2E) : le serveur ne voit et ne stocke
+//   jamais le texte en clair d'un message (dm:message/encrypted_message,
+//   server:message, group:message ne transportent que ciphertext+iv) ; seuls
+//   les appareils dans la conversation possèdent les clés de déchiffrement
+//   échangées via share_public_key / server:key_exchange.
+// - Salons éphémères : un salon de serveur peut avoir un minuteur
+//   programmable (server:channel_set_ephemeral) qui déclenche, une fois
+//   écoulé, un événement message:expired forçant tous les clients membres à
+//   supprimer définitivement le message (RAM + IndexedDB) — voir
+//   scheduleEphemeralExpiry ci-dessus.
+// - Anonymat par serveur : server:set_identity permet un pseudo/avatar
+//   propre à un serveur donné, distinct du pseudo global, sans jamais
+//   exposer aux AUTRES membres l'identité de compte (NULLID) associée.
+// - Vocaux P2P (WebRTC) : server:voice_join/voice_signal ne relaient que la
+//   présence et la signalisation SDP/ICE d'un salon vocal ; le flux
+//   audio/vidéo circule en direct entre clients (mesh), jamais via le
+//   serveur.
+// - Partage d'écran direct : réutilise la même connexion P2P (nouvelle piste
+//   vidéo négociée via server:voice_signal) ; server:voice_screen_share ne
+//   sert qu'à signaler aux pairs qu'un partage démarre/s'arrête.
+// - Soundboard P2P : server:voice_soundboard relaie de courts extraits
+//   sonores déjà chiffrés côté client (comme server:message), réservés aux
+//   participants du même vocal.
+// - Mode Low-Bandwidth / SFW : server:set_lowbandwidth diffuse une simple
+//   préférence par compte aux pairs du vocal ; c'est le client de chacun qui
+//   floute par défaut les médias reçus d'un expéditeur ayant activé ce mode,
+//   tant que le destinataire n'a pas cliqué pour déchiffrer/afficher.
 // ==========================================
 // GESTION SOCKET.IO
 // ==========================================
@@ -2234,8 +2561,8 @@ io.on('connection', (socket) => {
       admins: new Set(),       // ne contient jamais le owner (déjà géré via ownerNullId)
       bannedNullIds: new Set(),
       channels: [
-        { id: generalChannelId, name: 'Général', type: 'text', position: 0 },
-        { id: voiceChannelId, name: 'Vocal', type: 'voice', position: 1 }
+        { id: generalChannelId, name: 'Général', type: 'text', position: 0, ephemeralTtlMs: null },
+        { id: voiceChannelId, name: 'Vocal', type: 'voice', position: 1, ephemeralTtlMs: null }
       ]
     };
     chatServers.set(id, srv);
@@ -2293,12 +2620,15 @@ io.on('connection', (socket) => {
 
     srv.members.delete(nullId);
     srv.admins.delete(nullId);
+    forgetServerIdentity(srv.id, nullId);
+    leaveVoiceChannel(nullId, 'left_server', srv.id);
     persist(db.removeGroupMember(srv.id, nullId));
     socket.leave(serverRoom(srv.id));
 
     if (srv.members.size === 0) {
       chatServers.delete(srv.id);
       inviteCodeToServerId.delete(srv.inviteCode);
+      for (const c of srv.channels) clearChannelEphemeralTimers(c.id);
       persist(db.deleteGroup(srv.id));
     } else {
       if (srv.ownerNullId === nullId) {
@@ -2361,6 +2691,11 @@ io.on('connection', (socket) => {
     }
 
     const messageId = isNonEmptyString(data.messageId, 100) ? data.messageId : crypto.randomUUID();
+    // Anonymat par serveur : l'auteur affiché aux autres membres est le
+    // pseudo propre à CE serveur si l'expéditeur en a défini un, jamais son
+    // pseudo global — voir server:set_identity.
+    const senderIdentity = effectiveServerIdentity(srv.id, nullId);
+    let delivered = false;
     data.targets.slice(0, LIMITS.serverMaxMembers).forEach(t => {
       if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
       const target = connectedSockets.get(t.targetId);
@@ -2374,15 +2709,25 @@ io.on('connection', (socket) => {
         messageId,
         senderSocketId: socket.id,
         senderNullId: nullId,
-        author: username,
+        author: senderIdentity.serverPseudo || username,
+        authorAvatarDataUrl: senderIdentity.serverAvatarDataUrl,
         ciphertext: t.ciphertext,
         iv: t.iv,
         kind,
         mime: data.mime || null,
         filename: data.filename || null,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        expiresInMs: channel.ephemeralTtlMs || null
       });
+      delivered = true;
     });
+
+    // Salon éphémère : dès que le message a été relayé à au moins un membre,
+    // on programme sa suppression forcée (RAM + IndexedDB côté clients)
+    // après le minuteur configuré sur le salon.
+    if (delivered && channel.ephemeralTtlMs) {
+      scheduleEphemeralExpiry(srv.id, channel.id, messageId, channel.ephemeralTtlMs);
+    }
   }));
 
   // ==========================================
@@ -2409,7 +2754,7 @@ io.on('connection', (socket) => {
 
     const channelId = crypto.randomUUID();
     const position = srv.channels.length;
-    srv.channels.push({ id: channelId, name, type, position });
+    srv.channels.push({ id: channelId, name, type, position, ephemeralTtlMs: null });
     persist(db.createChannel({ id: channelId, groupId: srv.id, name, type, position }));
 
     io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
@@ -2453,8 +2798,257 @@ io.on('connection', (socket) => {
       return socket.emit('server:error', { message: 'Impossible de supprimer le dernier salon textuel.' });
     }
     srv.channels = srv.channels.filter(c => c.id !== channel.id);
+    clearChannelEphemeralTimers(channel.id);
+    // Si c'était un salon vocal, on en éjecte proprement tout le monde
+    // (sinon les clients resteraient signalés "dans" un vocal inexistant).
+    if (channel.type === 'voice') {
+      const peers = voiceChannelPeers.get(channel.id);
+      if (peers) for (const peerNullId of [...peers]) leaveVoiceChannel(peerNullId, 'channel_deleted');
+    }
     persist(db.deleteChannel(channel.id));
     io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
+  }));
+
+  // Salons éphémères : configure (ou désactive avec ephemeralTtlMs: null) le
+  // minuteur de suppression forcée des messages d'un salon texte donné.
+  // Réservé aux modérateurs du serveur, comme la gestion des salons.
+  socket.on('server:channel_set_ephemeral', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv) return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    if (!canModerateServer(srv, nullId)) {
+      return socket.emit('server:error', { message: 'Action non autorisée.' });
+    }
+    const channel = findChannel(srv, data.channelId);
+    if (!channel || channel.type !== 'text') {
+      return socket.emit('server:error', { message: 'Salon introuvable ou non textuel.' });
+    }
+
+    let ttlMs = null;
+    if (data.ephemeralTtlMs !== null && data.ephemeralTtlMs !== undefined) {
+      const n = Number(data.ephemeralTtlMs);
+      if (!Number.isFinite(n) || n < LIMITS.ephemeralTtlMinMs || n > LIMITS.ephemeralTtlMaxMs) {
+        return socket.emit('server:error', {
+          message: `Minuteur invalide (entre ${LIMITS.ephemeralTtlMinMs / 1000}s et ${Math.round(LIMITS.ephemeralTtlMaxMs / (24 * 60 * 60 * 1000))}j), ou null pour désactiver.`
+        });
+      }
+      ttlMs = Math.round(n);
+    }
+
+    channel.ephemeralTtlMs = ttlMs;
+    if (typeof db.setChannelEphemeral === 'function') {
+      persist(db.setChannelEphemeral(channel.id, ttlMs));
+    }
+    io.to(serverRoom(srv.id)).emit('server:channels', { serverId: srv.id, channels: [...srv.channels].sort((a, b) => a.position - b.position) });
+  }));
+
+  // ==========================================
+  // VOCAUX DE SERVEUR — SIGNALISATION WEBRTC P2P (MESH)
+  // ==========================================
+  // Le serveur ne relaie QUE de la signalisation (présence + SDP/ICE) et de
+  // courts extraits soundboard déjà chiffrés côté client : aucun flux
+  // audio/vidéo/écran ne transite jamais par lui. La négociation mesh est
+  // "chaque nouveau pair envoie une offer à chaque pair déjà présent" :
+  // c'est le rôle du client, server:voice_peers lui fournit la liste
+  // complète à son arrivée pour ça.
+  socket.on('server:voice_join', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv || !isMemberOfServer(nullId, srv.id)) {
+      return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    }
+    const channel = findChannel(srv, data.channelId);
+    if (!channel || channel.type !== 'voice') {
+      return socket.emit('server:error', { message: 'Salon vocal introuvable.' });
+    }
+
+    // Un compte ne peut être que dans un seul vocal à la fois : on le sort
+    // proprement de l'ancien avant de le faire rejoindre le nouveau (y
+    // compris si c'est le même salon depuis un autre onglet).
+    leaveVoiceChannel(nullId, 'switched');
+
+    let set = voiceChannelPeers.get(channel.id);
+    if (!set) {
+      set = new Set();
+      voiceChannelPeers.set(channel.id, set);
+    }
+    if (set.size >= LIMITS.voiceChannelMaxPeers) {
+      return socket.emit('server:error', { message: 'Ce salon vocal a atteint son nombre maximal de participants.' });
+    }
+
+    const existingPeers = getVoiceChannelPeersInfo(srv.id, channel.id);
+    set.add(nullId);
+    nullIdVoiceChannel.set(nullId, { serverId: srv.id, channelId: channel.id });
+    socket.join(voiceRoom(channel.id));
+
+    socket.emit('server:voice_peers', { serverId: srv.id, channelId: channel.id, peers: existingPeers });
+
+    const { serverPseudo, serverAvatarDataUrl } = effectiveServerIdentity(srv.id, nullId);
+    socket.to(voiceRoom(channel.id)).emit('server:voice_peer_joined', {
+      serverId: srv.id,
+      channelId: channel.id,
+      peer: { nullId, socketId: socket.id, serverPseudo, serverAvatarDataUrl, lowBandwidth: !!lowBandwidthPrefs.get(nullId) }
+    });
+  }));
+
+  socket.on('server:voice_leave', safeHandler(socket, () => {
+    if (!nullId) return;
+    leaveVoiceChannel(nullId, 'left');
+  }));
+
+  // Relais de signalisation WebRTC (offer/answer/ICE) entre deux pairs déjà
+  // présents dans le MÊME salon vocal. Fréquence potentiellement élevée
+  // (surtout les candidats ICE) -> limiteur permissif dédié.
+  socket.on('server:voice_signal', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    if (!socketEventRateLimit(socket.id)) return;
+    const { channelId, targetSocketId, signalType } = data;
+    if (!isNonEmptyString(channelId, 100) || !isNonEmptyString(targetSocketId, 100)) return;
+    if (!['offer', 'answer', 'ice'].includes(signalType)) return;
+
+    const myLoc = nullIdVoiceChannel.get(nullId);
+    if (!myLoc || myLoc.channelId !== channelId) return; // je ne suis pas (plus) dans ce vocal
+    const targetInfo = connectedSockets.get(targetSocketId);
+    const targetPeers = voiceChannelPeers.get(channelId);
+    if (!targetInfo?.nullId || !targetPeers?.has(targetInfo.nullId)) return; // la cible n'y est pas non plus
+
+    io.to(targetSocketId).emit('server:voice_signal', {
+      channelId,
+      signalType,
+      from: { nullId, socketId: socket.id },
+      sdp: data.sdp || null,
+      candidate: data.candidate || null
+    });
+  }));
+
+  // Partage d'écran direct : pas de média côté serveur, juste un signal de
+  // présence "je partage / j'arrête" pour que les pairs déclenchent leur
+  // propre renégociation WebRTC (nouvelle piste vidéo) côté client.
+  socket.on('server:voice_screen_share', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    if (!serverActionRateLimit(nullId)) return;
+    const action = data.action === 'start' ? 'start' : (data.action === 'stop' ? 'stop' : null);
+    if (!action) return;
+    const myLoc = nullIdVoiceChannel.get(nullId);
+    if (!myLoc) return;
+    io.to(voiceRoom(myLoc.channelId)).emit('server:voice_screen_share', {
+      serverId: myLoc.serverId, channelId: myLoc.channelId, nullId, action
+    });
+  }));
+
+  // Soundboard P2P : courts extraits sonores chiffrés côté client, relayés
+  // exactement comme server:message (une entrée ciphertext/iv par
+  // destinataire) mais réservés aux membres actuellement dans le même vocal,
+  // et plafonnés à une taille de "court extrait" (soundboardCiphertextMaxBytes).
+  socket.on('server:voice_soundboard', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    if (!messageRateLimit(socket.id)) {
+      return socket.emit('server:error', { message: 'Tu envoies des sons trop vite, ralentis un peu.' });
+    }
+    const myLoc = nullIdVoiceChannel.get(nullId);
+    if (!myLoc || myLoc.channelId !== data.channelId) return;
+    if (!Array.isArray(data.targets)) return;
+    if (!isValidMeta(data.mime, LIMITS.mimeMax) || !isValidMeta(data.filename, LIMITS.soundboardFilenameMax)) return;
+
+    const messageId = isNonEmptyString(data.messageId, 100) ? data.messageId : crypto.randomUUID();
+    const peers = voiceChannelPeers.get(myLoc.channelId);
+    data.targets.slice(0, LIMITS.voiceChannelMaxPeers).forEach(t => {
+      if (!t?.targetId || !connectedSockets.has(t.targetId)) return;
+      const target = connectedSockets.get(t.targetId);
+      if (!target?.nullId || !peers?.has(target.nullId)) return;
+      if (!isValidByteArray(t.ciphertext, LIMITS.soundboardCiphertextMaxBytes)) return;
+      if (!isValidByteArray(t.iv, LIMITS.ivBytes)) return;
+
+      io.to(t.targetId).emit('server:voice_soundboard', {
+        serverId: myLoc.serverId,
+        channelId: myLoc.channelId,
+        messageId,
+        senderSocketId: socket.id,
+        senderNullId: nullId,
+        ciphertext: t.ciphertext,
+        iv: t.iv,
+        mime: data.mime || null,
+        filename: data.filename || null,
+        timestamp: Date.now()
+      });
+    });
+  }));
+
+  // Mode Low-Bandwidth / SFW : préférence par compte, diffusée aux pairs du
+  // vocal en cours (s'il y en a un) pour qu'ils flouttent par défaut les
+  // médias qu'ils reçoivent de ce nullId tant qu'on ne clique pas dessus.
+  socket.on('server:set_lowbandwidth', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const enabled = !!data.enabled;
+    lowBandwidthPrefs.set(nullId, enabled);
+    if (typeof db.setLowBandwidthPref === 'function') {
+      persist(db.setLowBandwidthPref(nullId, enabled));
+    }
+    const myLoc = nullIdVoiceChannel.get(nullId);
+    if (myLoc) {
+      io.to(voiceRoom(myLoc.channelId)).emit('server:voice_peer_pref', {
+        serverId: myLoc.serverId, channelId: myLoc.channelId, nullId, lowBandwidth: enabled
+      });
+    }
+    socket.emit('server:lowbandwidth_updated', { enabled });
+  }));
+
+  // ==========================================
+  // ANONYMAT PAR SERVEUR (pseudo + avatar propres à un serveur)
+  // ==========================================
+  // Tout membre peut se donner un pseudo/avatar visible des AUTRES membres
+  // de ce serveur uniquement, sans que cela révèle ni change son pseudo
+  // global. Le NULLID reste connu du serveur en interne (auth, rôles,
+  // échange de clés E2E) : cette fonctionnalité change l'identité AFFICHÉE,
+  // pas la trace technique nécessaire au fonctionnement du serveur.
+  socket.on('server:set_identity', safeHandler(socket, (data = {}) => {
+    if (!nullId) return socket.emit('server:error', { message: 'Vous devez être connecté.' });
+    if (!serverActionRateLimit(nullId)) {
+      return socket.emit('server:error', { message: 'Trop d’actions serveur, réessaie dans une minute.' });
+    }
+    const srv = chatServers.get(data.serverId);
+    if (!srv || !isMemberOfServer(nullId, srv.id)) {
+      return socket.emit('server:error', { message: 'Serveur introuvable.' });
+    }
+    const pseudo = typeof data.pseudo === 'string' ? data.pseudo.trim() : '';
+    if (!isValidServerPseudo(pseudo)) {
+      return socket.emit('server:error', {
+        message: `Pseudo de serveur invalide (${LIMITS.serverPseudoMin} à ${LIMITS.serverPseudoMax} caractères).`
+      });
+    }
+    if (data.avatarDataUrl !== undefined && !isValidAvatarDataUrl(data.avatarDataUrl)) {
+      return socket.emit('server:error', { message: 'Avatar de serveur invalide.' });
+    }
+
+    const key = serverIdentityKey(srv.id, nullId);
+    const previous = serverIdentities.get(key) || {};
+    const identity = {
+      pseudo,
+      avatarDataUrl: data.avatarDataUrl !== undefined ? data.avatarDataUrl : (previous.avatarDataUrl ?? null)
+    };
+    serverIdentities.set(key, identity);
+    if (typeof db.setServerIdentity === 'function') {
+      persist(db.setServerIdentity(srv.id, nullId, identity.pseudo, identity.avatarDataUrl));
+    }
+
+    socket.emit('server:identity_updated', { serverId: srv.id, pseudo: identity.pseudo, avatarDataUrl: identity.avatarDataUrl });
+    broadcastServerMembers(srv.id);
+  }));
+
+  // Revient au pseudo/avatar global pour ce serveur.
+  socket.on('server:clear_identity', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    const srv = chatServers.get(data.serverId);
+    if (!srv || !isMemberOfServer(nullId, srv.id)) return;
+    forgetServerIdentity(srv.id, nullId);
+    socket.emit('server:identity_updated', { serverId: srv.id, pseudo: null, avatarDataUrl: null });
+    broadcastServerMembers(srv.id);
   }));
 
   // ==========================================
@@ -2526,6 +3120,8 @@ io.on('connection', (socket) => {
 
     srv.members.delete(targetNullId);
     srv.admins.delete(targetNullId);
+    forgetServerIdentity(srv.id, targetNullId);
+    leaveVoiceChannel(targetNullId, 'kicked', srv.id);
     persist(db.removeGroupMember(srv.id, targetNullId));
 
     const targetSocketId = userSockets.get(targetNullId);
@@ -2560,6 +3156,8 @@ io.on('connection', (socket) => {
     srv.members.delete(targetNullId);
     srv.admins.delete(targetNullId);
     srv.bannedNullIds.add(targetNullId);
+    forgetServerIdentity(srv.id, targetNullId);
+    leaveVoiceChannel(targetNullId, 'banned', srv.id);
     persist(db.removeGroupMember(srv.id, targetNullId));
     persist(db.addGroupBan(srv.id, targetNullId, typeof data.reason === 'string' ? data.reason.slice(0, 300) : null));
 
@@ -2868,48 +3466,25 @@ io.on('connection', (socket) => {
   // ⚠️ Revalidation indépendante obligatoire : le client n'affiche ces
   // boutons que si son NULLID figure dans une constante locale, ça ne PROUVE
   // rien — n'importe qui pourrait forger ces événements depuis la console.
-  // On ne fait donc jamais confiance qu'au nullId issu du socket authentifié
-  // et à OWNER_NULLIDS défini côté serveur (variable d'environnement).
+  // On ne fait donc jamais confiance qu'au nullId issu du socket authentifié,
+  // à OWNER_NULLIDS (env) et à appCoOwners (nommés en mémoire par un owner) —
+  // les co-owners ont exactement les mêmes droits de modération globale
+  // qu'un owner (voir commentaire sur appCoOwners plus haut).
   socket.on('app:ban_user', safeHandler(socket, (data = {}) => {
-    if (!isAppOwner(nullId)) {
+    if (!isAppOwnerOrCoOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     const targetNullId = data.nullId;
     if (!isValidNullId(targetNullId)) return;
-    if (isAppOwner(targetNullId)) {
-      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner de l’app.' });
+    if (isAppOwnerOrCoOwner(targetNullId)) {
+      return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner/co-owner de l’app.' });
     }
-
-    const targetUsername = nullIdToUser.get(targetNullId) || null;
     const banReason = typeof data.reason === 'string' ? data.reason.slice(0, 300) : null;
-    appBannedUsers.set(targetNullId, {
-      nullId: targetNullId,
-      username: targetUsername,
-      reason: banReason,
-      bannedAt: Date.now()
-    });
-    persist(db.addAppBan(targetNullId, targetUsername, banReason));
-
-    // Déconnecte TOUTES les sockets actives de ce nullId (pas seulement la
-    // dernière connue via userSockets, au cas où plusieurs onglets/sessions
-    // seraient ouverts) et révoque tous ses tokens actifs.
-    for (const [sockId, info] of connectedSockets.entries()) {
-      if (info.nullId !== targetNullId) continue;
-      const targetSocket = io.sockets.sockets.get(sockId);
-      if (!targetSocket) continue;
-      targetSocket.emit('app:user_banned', { reason: data.reason || null });
-      targetSocket.disconnect(true);
-    }
-    if (targetUsername) {
-      const tokens = usernameToTokens.get(targetUsername.toLowerCase());
-      if (tokens) for (const t of [...tokens]) revokeToken(t);
-    }
-
-    log('Compte banni de l’app par', nullId, ':', targetNullId);
+    banUserFromAppServer(targetNullId, banReason, nullId);
   }));
 
   socket.on('app:unban_user', safeHandler(socket, (data = {}) => {
-    if (!isAppOwner(nullId)) {
+    if (!isAppOwnerOrCoOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     const targetNullId = data.nullId;
@@ -2920,16 +3495,144 @@ io.on('connection', (socket) => {
   }));
 
   socket.on('app:list_banned', safeHandler(socket, () => {
-    if (!isAppOwner(nullId)) {
+    if (!isAppOwnerOrCoOwner(nullId)) {
       return socket.emit('friend:error', { message: 'Action non autorisée.' });
     }
     socket.emit('app:banned_users', { users: [...appBannedUsers.values()] });
+  }));
+
+  // ==========================================
+  // SIGNALEMENTS (personne / dox) — soumission ouverte à tout compte
+  // authentifié, consultation/traitement réservés à owner+co-owners.
+  // ==========================================
+  socket.on('report:submit', safeHandler(socket, (data = {}) => {
+    if (!nullId) return;
+    if (!reportRateLimit(nullId)) {
+      return socket.emit('friend:error', { message: 'Trop de signalements envoyés, réessaie dans quelques minutes.' });
+    }
+    const type = data.type;
+    const targetNullId = data.targetNullId;
+    if (!LIMITS.reportTypes.has(type)) return;
+    if (!isValidNullId(targetNullId) || targetNullId === nullId) {
+      return socket.emit('friend:error', { message: 'Cible du signalement invalide.' });
+    }
+    if (!isNonEmptyString(data.description, LIMITS.reportDescriptionMax)) {
+      return socket.emit('friend:error', { message: `Merci de décrire le problème (max ${LIMITS.reportDescriptionMax} caractères).` });
+    }
+    if (!isValidReportProofDataUrl(data.proofDataUrl)) {
+      return socket.emit('friend:error', { message: 'Preuve invalide ou trop volumineuse (6 Mo max, image ou PDF).' });
+    }
+    if (appReports.size >= LIMITS.reportsMaxPerTarget * 50) return; // garde-fou global grossier
+
+    const report = {
+      id: crypto.randomUUID(),
+      type,
+      reporterNullId: nullId,
+      reporterUsername: nullIdToUser.get(nullId) || null,
+      targetNullId,
+      targetUsername: nullIdToUser.get(targetNullId) || null,
+      description: data.description.slice(0, LIMITS.reportDescriptionMax),
+      proofDataUrl: data.proofDataUrl || null,
+      status: 'pending',
+      aiVerdict: null,
+      resolvedBy: null,
+      createdAt: Date.now(),
+      resolvedAt: null
+    };
+    appReports.set(report.id, report);
+    persist(db.addReport(report));
+    log(`Signalement (${type}) reçu de ${nullId} contre ${targetNullId}`);
+
+    // Notifie en direct tous les owners/co-owners connectés.
+    for (const [sockId, info] of connectedSockets.entries()) {
+      if (!isAppOwnerOrCoOwner(info.nullId)) continue;
+      const modSocket = io.sockets.sockets.get(sockId);
+      if (modSocket) modSocket.emit('report:new', { report });
+    }
+    socket.emit('report:submitted', { id: report.id });
+  }));
+
+  socket.on('report:list', safeHandler(socket, () => {
+    if (!isAppOwnerOrCoOwner(nullId)) {
+      return socket.emit('friend:error', { message: 'Action non autorisée.' });
+    }
+    socket.emit('report:list_result', { reports: [...appReports.values()].sort((a, b) => b.createdAt - a.createdAt) });
+  }));
+
+  // action: 'dismiss' (classer sans suite) | 'ban' (bannir directement,
+  // décision humaine) | 'ai_analyze' (uniquement pour type='dox' : demande
+  // à NullAI/Gemini de juger la preuve, et bannit automatiquement si le
+  // dox est confirmé avec une confiance suffisante).
+  socket.on('report:resolve', safeHandler(socket, async (data = {}) => {
+    if (!isAppOwnerOrCoOwner(nullId)) {
+      return socket.emit('friend:error', { message: 'Action non autorisée.' });
+    }
+    const report = appReports.get(data.id);
+    // 'ai_reviewed' = déjà passé par NullAI sans confirmation suffisante :
+    // reste actionnable (dismiss/ban manuel) mais plus par ai_analyze à nouveau.
+    if (!report || (report.status !== 'pending' && report.status !== 'ai_reviewed')) return;
+    const action = data.action;
+    if (action === 'ai_analyze' && report.status !== 'pending') return;
+
+    if (action === 'dismiss') {
+      report.status = 'dismissed';
+      report.resolvedBy = nullId;
+      report.resolvedAt = Date.now();
+      persist(db.resolveReport(report.id, { status: report.status, resolvedBy: nullId }));
+      broadcastReportUpdate(report);
+      return;
+    }
+
+    if (action === 'ban') {
+      if (isAppOwnerOrCoOwner(report.targetNullId)) {
+        return socket.emit('friend:error', { message: 'Impossible de bannir un autre owner/co-owner de l’app.' });
+      }
+      banUserFromAppServer(report.targetNullId, `Signalement (${report.type}) confirmé manuellement.`, nullId);
+      report.status = 'banned';
+      report.resolvedBy = nullId;
+      report.resolvedAt = Date.now();
+      persist(db.resolveReport(report.id, { status: report.status, resolvedBy: nullId }));
+      broadcastReportUpdate(report);
+      return;
+    }
+
+    if (action === 'ai_analyze') {
+      if (report.type !== 'dox') {
+        return socket.emit('friend:error', { message: "L'analyse NullAI n'est disponible que pour les signalements de dox." });
+      }
+      if (!nullaiConfigured) {
+        return socket.emit('friend:error', { message: "NullAI n'est pas configuré sur ce serveur." });
+      }
+      socket.emit('report:analyzing', { id: report.id });
+      const verdict = await judgeDoxReport(report);
+      const verdictText = JSON.stringify(verdict);
+      report.aiVerdict = verdictText;
+
+      // Seuil volontairement prudent : on ne bannit automatiquement que si
+      // NullAI est raisonnablement confiant. Sinon, la décision reste
+      // manuelle (bouton "Bannir" toujours disponible pour l'owner).
+      if (verdict.isDox && verdict.confidence >= 70) {
+        if (!isAppOwnerOrCoOwner(report.targetNullId)) {
+          banUserFromAppServer(report.targetNullId, `Dox confirmé par NullAI (confiance ${verdict.confidence}%) : ${verdict.reasoning}`, 'NullAI');
+          report.status = 'banned';
+        } else {
+          report.status = 'ai_reviewed'; // ne peut pas bannir un owner/co-owner même via l'IA
+        }
+      } else {
+        report.status = 'ai_reviewed';
+      }
+      report.resolvedBy = report.status === 'banned' ? 'NullAI' : null;
+      report.resolvedAt = report.status === 'banned' ? Date.now() : null;
+      persist(db.resolveReport(report.id, { status: report.status, aiVerdict: verdictText, resolvedBy: report.resolvedBy }));
+      broadcastReportUpdate(report);
+    }
   }));
 
   socket.on('disconnect', () => {
     connectedSockets.delete(socket.id);
     if (nullId && userSockets.get(nullId) === socket.id) {
       userSockets.delete(nullId);
+      leaveVoiceChannel(nullId, 'disconnected');
       notifyFriendsStatus(nullId, false);
       notifyServersMemberStatus(nullId, false);
       notifyGroupsMemberStatus(nullId, false);
