@@ -471,6 +471,8 @@ input:disabled{ opacity:.5; }
 .channel-chip:hover{ background: var(--bg-raised); color: var(--text-primary); }
 .channel-chip.active{ background: var(--accent-ring); color: var(--text-primary); border-color: rgba(255,45,71,0.25); }
 .channel-chip.voice{ opacity:.85; }
+.channel-chip-badge{ background: rgba(255,255,255,.16); color:inherit; font-size:10.5px;
+  font-weight:700; padding:1px 6px; border-radius:999px; line-height:1.4; }
 .channel-add-chip{
   display:flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%;
   background: var(--bg-panel-2); color: var(--text-muted); cursor:pointer; flex-shrink:0; font-size:15px; font-weight:700;
@@ -2065,6 +2067,10 @@ let rtcConn = null;
 let localStream = null;
 let activeCallPeer = null;
 let callMuted = false;
+let myMediaKeyPair = null;   // clé ECDH éphémère du call/vocal en cours (1:1)
+let mediaSharedKey = null;   // clé AES-GCM dérivée pour ce call (1:1)
+let isCallOfferer = false;
+let pendingIncomingMediaPub = null;
 
 function colorForName(name){
   let hash = 0;
@@ -3078,6 +3084,71 @@ function playNotifSound(){
   } catch(e){  }
 }
 
+// ==========================================
+// Sonnerie d'appel entrant + sons courts pour les notifs (générés en Web
+// Audio, aucun fichier audio à charger -> zéro poids réseau, zéro latence).
+// ==========================================
+let ringtoneInterval = null;
+function playRingtoneCycle(){
+  try{
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = audioCtx.currentTime;
+    // Deux notes alternées façon sonnerie classique (grave/aiguë, deux "beeps" rapprochés).
+    [0, 0.32].forEach((offset, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = i === 0 ? 880 : 660;
+      gain.gain.setValueAtTime(0.0001, now + offset);
+      gain.gain.exponentialRampToValueAtTime(0.16, now + offset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.26);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.28);
+    });
+  } catch(e){ }
+}
+function playRingtone(){
+  if (!notifsEnabled || ringtoneInterval) return;
+  playRingtoneCycle();
+  ringtoneInterval = setInterval(playRingtoneCycle, 1800); // cycle façon "drrring… drrring…"
+}
+function stopRingtone(){
+  if (ringtoneInterval){ clearInterval(ringtoneInterval); ringtoneInterval = null; }
+}
+
+// Sons courts et distincts par type d'événement, tous synthétisés (pas
+// d'asset externe). Réutilisent playNotifSound() pour le cas générique déjà
+// en place (messages/demandes d'ami) et ajoutent des variantes ciblées.
+function playToneSequence(freqs, { duration = 0.16, gap = 0.05, type = 'sine', peak = 0.14 } = {}){
+  if (!notifsEnabled) return;
+  try{
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = audioCtx.currentTime;
+    freqs.forEach((freq, i) => {
+      const start = now + i * (duration + gap);
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(peak, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(start);
+      osc.stop(start + duration + 0.02);
+    });
+  } catch(e){ }
+}
+// Mention/@toi dans un message -> double bip montant, plus marquant qu'un message normal.
+function playMentionSound(){ playToneSequence([600, 920], { duration: 0.13, peak: 0.18 }); }
+// Quelqu'un rejoint le vocal avec toi -> petit "pop" montant discret.
+function playVoiceJoinSound(){ playToneSequence([520, 780], { duration: 0.08, gap: 0.02, peak: 0.09 }); }
+// Quelqu'un quitte le vocal -> "pop" descendant, symétrique au son de join.
+function playVoiceLeaveSound(){ playToneSequence([780, 480], { duration: 0.08, gap: 0.02, peak: 0.09 }); }
+// Erreur / action refusée -> tonalité grave courte.
+function playErrorSound(){ playToneSequence([220], { duration: 0.18, type: 'square', peak: 0.08 }); }
+
 function notifyIncoming(title, body){
   if (!notifsEnabled) return;
   playNotifSound();
@@ -3953,11 +4024,65 @@ function openServer(serverId){
   switchView('server');
   renderServerList();
   ensureServerKeysWithOnlineMembers(serverId);
+  renderServerChannelBar(serverId);
 }
 
 function closeServer(){
   currentServerId = null;
   switchView('servers');
+}
+
+// Barre de salons (chips) d'un serveur : un chip par salon, texte (#) ou
+// vocal (🔊). Un clic sur un salon texte le sélectionne comme salon actif
+// (currentChannelByServer) ; un clic sur un salon vocal rejoint/quitte le
+// vocal correspondant via voiceMesh. Le badge de participants sur un chip
+// vocal ne peut refléter que le salon vocal où l'on se trouve déjà : le
+// serveur ne diffuse pas de compteur par salon pour les vocaux qu'on n'a
+// pas rejoints.
+function renderServerChannelBar(serverId){
+  const bar = document.getElementById('serverChannelBar');
+  if (!bar) return;
+  const srv = myServers.get(serverId);
+  bar.innerHTML = '';
+  if (!srv) return;
+  const channels = (srv.channels || []).slice().sort((a, b) => (a.position || 0) - (b.position || 0));
+  if (!channels.length) return;
+  if (!currentChannelByServer.get(serverId)){
+    const firstText = channels.find(c => c.type !== 'voice') || channels[0];
+    if (firstText) currentChannelByServer.set(serverId, firstText.id);
+  }
+  const activeTextChannelId = currentChannelByServer.get(serverId);
+  const inVoiceHere = voiceMesh.active && voiceMesh.serverId === serverId;
+  channels.forEach(ch => {
+    const isVoice = ch.type === 'voice';
+    const isJoinedVoice = isVoice && inVoiceHere && voiceMesh.channelId === ch.id;
+    const chip = document.createElement('div');
+    chip.className = 'channel-chip' + (isVoice ? ' voice' : '') +
+      ((isVoice ? isJoinedVoice : ch.id === activeTextChannelId) ? ' active' : '');
+    chip.title = ch.name || (isVoice ? 'Salon vocal' : 'Salon texte');
+    const icon = document.createElement('span');
+    icon.textContent = isVoice ? '🔊' : '#';
+    chip.appendChild(icon);
+    const label = document.createElement('span');
+    label.textContent = ch.name || (isVoice ? 'vocal' : 'salon');
+    chip.appendChild(label);
+    if (isJoinedVoice){
+      const badge = document.createElement('span');
+      badge.className = 'channel-chip-badge';
+      badge.textContent = String(voiceMesh.peers.size + 1);
+      chip.appendChild(badge);
+    }
+    chip.onclick = () => {
+      if (isVoice){
+        if (isJoinedVoice) leaveServerVoiceChannel();
+        else joinServerVoiceChannel(serverId, ch.id);
+      } else {
+        currentChannelByServer.set(serverId, ch.id);
+        renderServerChannelBar(serverId);
+      }
+    };
+    bar.appendChild(chip);
+  });
 }
 
 function serverStorageKey(serverId){
@@ -4741,7 +4866,67 @@ function purgeExpiredMessage({ scope, serverId, channelId, messageId }){
   }
 }
 
-const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+// ==========================================
+// Chiffrement E2E des appels (frames audio/vidéo) — Insertable Streams
+// ==========================================
+// WebRTC chiffre déjà tout le transport (DTLS-SRTP), obligatoire et natif.
+// Cette couche ajoute un chiffrement AES-GCM des trames elles-mêmes, avec
+// une clé ECDH éphémère propre à CHAQUE appel/connexion (jamais réutilisée,
+// jamais stockée), calculée intégralement dans call-crypto-worker.js —
+// aucun impact sur le thread de rendu. Ça protège aussi contre un futur SFU
+// ou un relais TURN qui verrait autrement le média en clair.
+// Support navigateur : Chromium uniquement pour l'instant (Insertable
+// Streams). Sur les autres navigateurs, l'appel reste protégé par le
+// DTLS-SRTP standard, juste sans cette couche additionnelle.
+const CALL_CRYPTO_SUPPORTED = typeof RTCRtpSender !== 'undefined' && 'createEncodedStreams' in RTCRtpSender.prototype;
+let callCryptoWorker = null;
+function getCallCryptoWorker(){
+  if (!callCryptoWorker) callCryptoWorker = new Worker('/call-crypto-worker.js');
+  return callCryptoWorker;
+}
+async function generateEphemeralMediaKeyPair(){
+  return crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+}
+async function exportMediaPublicKey(keyPair){
+  const raw = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+  return Array.from(new Uint8Array(raw));
+}
+async function deriveMediaSharedKey(myPrivateKey, peerPublicKeyBytes){
+  const peerPublicKey = await crypto.subtle.importKey(
+    'raw', new Uint8Array(peerPublicKeyBytes).buffer, { name: 'ECDH', namedCurve: 'P-256' }, true, []
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'ECDH', public: peerPublicKey }, myPrivateKey,
+    { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+  );
+}
+const ROLE_SALT_OFFERER = new Uint8Array([0, 0, 0, 1]);
+const ROLE_SALT_ANSWERER = new Uint8Array([0, 0, 0, 2]);
+let mediaStreamCounter = 0;
+// Idempotent : peut être rappelée après ajout d'une nouvelle piste (ex.
+// partage d'écran) sans re-chiffrer une piste déjà câblée.
+function applyCallEncryption(pc, sharedKey, isOfferer){
+  if (!CALL_CRYPTO_SUPPORTED || !sharedKey) return;
+  const worker = getCallCryptoWorker();
+  const mySalt = isOfferer ? ROLE_SALT_OFFERER : ROLE_SALT_ANSWERER;
+  const peerSalt = isOfferer ? ROLE_SALT_ANSWERER : ROLE_SALT_OFFERER;
+  pc.getSenders().forEach(sender => {
+    if (!sender.track || sender.__nulchatEncSetup) return;
+    sender.__nulchatEncSetup = true;
+    const streamId = 'tx-' + (mediaStreamCounter++);
+    const { readable, writable } = sender.createEncodedStreams();
+    worker.postMessage({ type: 'setup', streamId, key: sharedKey, roleSalt: mySalt.buffer, direction: 'encrypt', readable, writable }, [readable, writable]);
+  });
+  pc.getReceivers().forEach(receiver => {
+    if (!receiver.track || receiver.__nulchatEncSetup) return;
+    receiver.__nulchatEncSetup = true;
+    const streamId = 'rx-' + (mediaStreamCounter++);
+    const { readable, writable } = receiver.createEncodedStreams();
+    worker.postMessage({ type: 'setup', streamId, key: sharedKey, peerRoleSalt: peerSalt.buffer, direction: 'decrypt', readable, writable }, [readable, writable]);
+  });
+}
+
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], encodedInsertableStreams: CALL_CRYPTO_SUPPORTED };
 
 // --- Audio HD + Zero-Bitrate Mute + VAD Worker (NulChat perf core) ---
 // Contraintes micro "HD" : echo cancellation / noise suppression natifs activés,
@@ -4934,13 +5119,17 @@ async function startCall(friend){
     return;
   }
 
+  isCallOfferer = true;
+  myMediaKeyPair = await generateEphemeralMediaKeyPair();
+
   rtcConn = buildPeerConnection(friend.socketId, friend.nullId);
   localStream.getTracks().forEach(track => { const s = rtcConn.addTrack(track, localStream); if (track.kind === 'audio') micSender = s; });
 
   const offer = await rtcConn.createOffer();
   const hdOffer = applyOpusHdToDescription(offer);
   await rtcConn.setLocalDescription(hdOffer);
-  socket.emit('call:offer', { targetNullId: friend.nullId, targetSocketId: friend.socketId, sdp: hdOffer });
+  const mediaPub = await exportMediaPublicKey(myMediaKeyPair);
+  socket.emit('call:offer', { targetNullId: friend.nullId, targetSocketId: friend.socketId, sdp: hdOffer, mediaPub });
 
   openCallOverlay({
     name: friend.username, statusText: 'Appel en cours…', avatarDataUrl: friend.avatarDataUrl, ringing: true, variant: 'outgoing',
@@ -4948,7 +5137,7 @@ async function startCall(friend){
   });
 }
 
-function handleIncomingCall({ from, sdp }){
+function handleIncomingCall({ from, sdp, mediaPub }){
   if (blockedIds.has(from.nullId)){
     socket.emit('call:end', { targetNullId: from.nullId, targetSocketId: from.socketId, reason: 'declined' });
     return;
@@ -4960,8 +5149,10 @@ function handleIncomingCall({ from, sdp }){
   }
   activeCallPeer = from;
   pendingIncomingSdp = sdp;
+  pendingIncomingMediaPub = mediaPub || null;
 
   notifyIncoming('Appel entrant', `${from.username} t'appelle`);
+  playRingtone();
 
   openCallOverlay({
     name: from.username, statusText: 'Appel entrant…', avatarDataUrl: from.avatarDataUrl, ringing: true, variant: 'incoming',
@@ -4974,19 +5165,30 @@ function handleIncomingCall({ from, sdp }){
 let pendingIncomingSdp = null;
 
 async function acceptCall(from, sdp){
+  stopRingtone();
   try{ await getMic(); }
   catch(err){
     showToast({ title:'Micro indisponible', body: "Autorise l'accès au micro pour répondre." });
     declineCall(from);
     return;
   }
+  isCallOfferer = false;
+  myMediaKeyPair = await generateEphemeralMediaKeyPair();
+
   rtcConn = buildPeerConnection(from.socketId, from.nullId);
   localStream.getTracks().forEach(track => { const s = rtcConn.addTrack(track, localStream); if (track.kind === 'audio') micSender = s; });
   await rtcConn.setRemoteDescription(new RTCSessionDescription(sdp));
+
+  if (pendingIncomingMediaPub){
+    mediaSharedKey = await deriveMediaSharedKey(myMediaKeyPair.privateKey, pendingIncomingMediaPub);
+    applyCallEncryption(rtcConn, mediaSharedKey, false);
+  }
+
   const answer = await rtcConn.createAnswer();
   const hdAnswer = applyOpusHdToDescription(answer);
   await rtcConn.setLocalDescription(hdAnswer);
-  socket.emit('call:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, sdp: hdAnswer });
+  const mediaPub = await exportMediaPublicKey(myMediaKeyPair);
+  socket.emit('call:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, sdp: hdAnswer, mediaPub });
 
   openCallOverlay({
     name: from.username, statusText: 'En appel', avatarDataUrl: from.avatarDataUrl, ringing: false, variant: 'connected',
@@ -4997,12 +5199,18 @@ async function acceptCall(from, sdp){
   });
 }
 function declineCall(from){
+  stopRingtone();
   socket.emit('call:end', { targetNullId: from.nullId, targetSocketId: from.socketId, reason: 'declined' });
   cleanupCall();
 }
-async function handleCallAnswer({ sdp }){
+async function handleCallAnswer({ sdp, mediaPub }){
   if (!rtcConn) return;
+  stopRingtone();
   await rtcConn.setRemoteDescription(new RTCSessionDescription(sdp));
+  if (mediaPub && myMediaKeyPair){
+    mediaSharedKey = await deriveMediaSharedKey(myMediaKeyPair.privateKey, mediaPub);
+    applyCallEncryption(rtcConn, mediaSharedKey, true);
+  }
   openCallOverlay({
     name: activeCallPeer.username, statusText: 'En appel', avatarDataUrl: activeCallPeer.avatarDataUrl, ringing:false, variant: 'connected',
     actions: [
@@ -5024,20 +5232,411 @@ function toggleMute(){
   if (btn) btn.classList.toggle('active-mute', callMuted);
 }
 function hangupCall(){
+  stopRingtone();
   if (activeCallPeer){
     socket.emit('call:end', { targetNullId: activeCallPeer.nullId, targetSocketId: activeCallPeer.socketId });
   }
   cleanupCall();
 }
 function cleanupCall(){
+  stopRingtone();
   if (rtcConn){ rtcConn.close(); rtcConn = null; }
   if (localStream){ localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   detachVadPipeline();
   micSender = null; micTrackRef = null;
   activeCallPeer = null;
   pendingIncomingSdp = null;
+  pendingIncomingMediaPub = null;
+  myMediaKeyPair = null;
+  mediaSharedKey = null;
+  isCallOfferer = false;
   callMuted = false;
   closeCallOverlay();
+}
+
+// ==========================================
+// Salon vocal multi-pairs (mesh) + Partage d'écran 60 FPS P2P
+// ==========================================
+// Le serveur (server:voice_join/voice_signal/voice_screen_share, voir
+// server.js) ne relaie QUE de la signalisation : un nouvel arrivant reçoit
+// la liste des pairs déjà présents (server:voice_peers) et leur envoie une
+// offer à chacun ; les pairs déjà là répondent avec une answer. Le partage
+// d'écran ajoute simplement une piste vidéo supplémentaire sur les mêmes
+// RTCPeerConnection (renégociation), sans jamais transiter par le serveur.
+const voiceMesh = {
+  active: false,
+  serverId: null,
+  channelId: null,
+  localStream: null,
+  screenStream: null,
+  manualMuted: false,
+  peers: new Map(), // nullId -> { pc, socketId, micSender, screenSender, audioEl, myMediaKeyPair, mediaSharedKey, isOfferer }
+  peerMeta: new Map() // nullId -> { serverPseudo, serverAvatarDataUrl }
+};
+function registerVoicePeerMeta(peer){
+  if (peer?.nullId) voiceMesh.peerMeta.set(peer.nullId, peer);
+}
+
+async function joinServerVoiceChannel(serverId, channelId){
+  if (voiceMesh.active) await leaveServerVoiceChannel();
+  voiceMesh.serverId = serverId;
+  voiceMesh.channelId = channelId;
+  try{
+    voiceMesh.localStream = await navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS_HD });
+  } catch(err){
+    showToast({ title: 'Micro indisponible', body: "Autorise l'accès au micro pour rejoindre le vocal." });
+    voiceMesh.serverId = null; voiceMesh.channelId = null;
+    return;
+  }
+  attachVadPipeline(voiceMesh.localStream, { onSpeakingChange: onMeshSpeakingChange });
+  voiceMesh.active = true;
+  renderVoiceBar();
+  renderServerChannelBar(serverId);
+  socket.emit('server:voice_join', { serverId, channelId });
+}
+
+async function leaveServerVoiceChannel(){
+  if (!voiceMesh.active) return;
+  const leftServerId = voiceMesh.serverId;
+  socket.emit('server:voice_leave');
+  for (const entry of voiceMesh.peers.values()){
+    entry.pc.close();
+    if (entry.audioEl) entry.audioEl.remove();
+  }
+  voiceMesh.peers.clear();
+  voiceMesh.peerMeta.clear();
+  if (voiceMesh.screenStream){ voiceMesh.screenStream.getTracks().forEach(t => t.stop()); voiceMesh.screenStream = null; }
+  if (voiceMesh.localStream){ voiceMesh.localStream.getTracks().forEach(t => t.stop()); voiceMesh.localStream = null; }
+  detachVadPipeline();
+  voiceMesh.active = false;
+  voiceMesh.manualMuted = false;
+  voiceMesh.serverId = null;
+  voiceMesh.channelId = null;
+  clearVoiceTiles();
+  renderVoiceBar();
+  if (leftServerId) renderServerChannelBar(leftServerId);
+}
+
+function onMeshSpeakingChange(speaking){
+  if (voiceMesh.manualMuted) return; // le mute manuel reste toujours prioritaire sur le VAD
+  for (const entry of voiceMesh.peers.values()) setPeerZeroBitrateMute(entry, !speaking);
+  const bar = document.getElementById('voiceMeshBar');
+  if (bar) bar.classList.toggle('vm-speaking', speaking);
+  const selfAvatar = document.getElementById('vmSelfAvatar');
+  if (selfAvatar) selfAvatar.classList.toggle('vm-tile-speaking', speaking);
+}
+
+async function setPeerZeroBitrateMute(entry, shouldMute){
+  if (!entry.micSender) return;
+  try{
+    if (shouldMute) await entry.micSender.replaceTrack(null);
+    else if (voiceMesh.localStream) await entry.micSender.replaceTrack(voiceMesh.localStream.getAudioTracks()[0]);
+  }catch(e){
+    const track = voiceMesh.localStream?.getAudioTracks()[0];
+    if (track) track.enabled = !shouldMute; // fallback navigateurs anciens
+  }
+}
+
+function toggleVoiceMeshManualMute(){
+  if (!voiceMesh.active) return;
+  voiceMesh.manualMuted = !voiceMesh.manualMuted;
+  for (const entry of voiceMesh.peers.values()) setPeerZeroBitrateMute(entry, voiceMesh.manualMuted);
+  renderVoiceBar();
+}
+
+function createMeshPeerConnection(nullId, socketId){
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  const entry = { pc, socketId, micSender: null, screenSender: null, audioEl: null, myMediaKeyPair: null, mediaSharedKey: null, isOfferer: false };
+  voiceMesh.peers.set(nullId, entry);
+
+  if (voiceMesh.localStream){
+    voiceMesh.localStream.getAudioTracks().forEach(track => {
+      entry.micSender = pc.addTrack(track, voiceMesh.localStream);
+    });
+  }
+  if (voiceMesh.screenStream){
+    voiceMesh.screenStream.getVideoTracks().forEach(track => {
+      entry.screenSender = pc.addTrack(track, voiceMesh.screenStream);
+      applyScreenShareBitrate(entry.screenSender);
+    });
+  }
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate){
+      socket.emit('server:voice_signal', { channelId: voiceMesh.channelId, targetSocketId: socketId, signalType: 'ice', candidate: e.candidate });
+    }
+  };
+  pc.ontrack = (e) => {
+    if (e.track.kind === 'audio'){
+      let audioEl = entry.audioEl;
+      if (!audioEl){
+        audioEl = document.createElement('audio');
+        audioEl.autoplay = true;
+        audioEl.dataset.nullId = nullId;
+        document.body.appendChild(audioEl);
+        entry.audioEl = audioEl;
+      }
+      audioEl.srcObject = e.streams[0];
+    } else if (e.track.kind === 'video'){
+      attachRemoteScreenTile(nullId, e.streams[0]);
+    }
+  };
+  return entry;
+}
+
+async function offerToPeer(entry){
+  if (!entry.myMediaKeyPair){
+    entry.isOfferer = true;
+    entry.myMediaKeyPair = await generateEphemeralMediaKeyPair();
+  }
+  const offer = await entry.pc.createOffer();
+  const hdOffer = applyOpusHdToDescription(offer);
+  await entry.pc.setLocalDescription(hdOffer);
+  const mediaPub = await exportMediaPublicKey(entry.myMediaKeyPair);
+  socket.emit('server:voice_signal', { channelId: voiceMesh.channelId, targetSocketId: entry.socketId, signalType: 'offer', sdp: hdOffer, mediaPub });
+}
+
+socket.on('server:voice_peers', async ({ channelId, peers }) => {
+  if (!voiceMesh.active || channelId !== voiceMesh.channelId) return;
+  for (const p of (peers || [])){
+    registerVoicePeerMeta(p);
+    const entry = createMeshPeerConnection(p.nullId, p.socketId);
+    await offerToPeer(entry); // je suis le nouvel arrivant : j'offre à chaque pair déjà présent
+  }
+  renderVoiceBar();
+});
+
+socket.on('server:voice_peer_joined', (data) => { playVoiceJoinSound(); renderVoiceBar(); registerVoicePeerMeta(data?.peer); });
+
+socket.on('server:voice_signal', async ({ channelId, signalType, from, sdp, candidate, mediaPub }) => {
+  if (!voiceMesh.active || channelId !== voiceMesh.channelId) return;
+  let entry = voiceMesh.peers.get(from.nullId);
+  if (!entry) entry = createMeshPeerConnection(from.nullId, from.socketId);
+
+  if (signalType === 'offer'){
+    entry.isOfferer = false;
+    if (!entry.myMediaKeyPair) entry.myMediaKeyPair = await generateEphemeralMediaKeyPair();
+    await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    if (mediaPub){
+      entry.mediaSharedKey = await deriveMediaSharedKey(entry.myMediaKeyPair.privateKey, mediaPub);
+      applyCallEncryption(entry.pc, entry.mediaSharedKey, false);
+    }
+    const answer = await entry.pc.createAnswer();
+    const hdAnswer = applyOpusHdToDescription(answer);
+    await entry.pc.setLocalDescription(hdAnswer);
+    const myMediaPub = await exportMediaPublicKey(entry.myMediaKeyPair);
+    socket.emit('server:voice_signal', { channelId, targetSocketId: from.socketId, signalType: 'answer', sdp: hdAnswer, mediaPub: myMediaPub });
+  } else if (signalType === 'answer'){
+    await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    if (mediaPub && entry.myMediaKeyPair){
+      entry.mediaSharedKey = await deriveMediaSharedKey(entry.myMediaKeyPair.privateKey, mediaPub);
+      applyCallEncryption(entry.pc, entry.mediaSharedKey, true);
+    }
+  } else if (signalType === 'ice' && candidate){
+    try{ await entry.pc.addIceCandidate(new RTCIceCandidate(candidate)); }catch(e){}
+  }
+});
+
+socket.on('server:voice_peer_left', ({ channelId, nullId }) => {
+  if (channelId !== voiceMesh.channelId) return;
+  const entry = voiceMesh.peers.get(nullId);
+  if (entry){ entry.pc.close(); if (entry.audioEl) entry.audioEl.remove(); voiceMesh.peers.delete(nullId); }
+  voiceMesh.peerMeta.delete(nullId);
+  removeRemoteScreenTile(nullId);
+  renderVoiceBar();
+});
+
+// ---- Partage d'écran haute fréquence (60 FPS) avec bitrate adaptatif ----
+async function startVoiceScreenShare(){
+  if (!voiceMesh.active || voiceMesh.screenStream) return;
+  try{
+    voiceMesh.screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 60, max: 60 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
+  } catch(err){ return; } // utilisateur a annulé la sélection de fenêtre/écran
+
+  const track = voiceMesh.screenStream.getVideoTracks()[0];
+  track.onended = () => stopVoiceScreenShare();
+
+  for (const entry of voiceMesh.peers.values()){
+    entry.screenSender = entry.pc.addTrack(track, voiceMesh.screenStream);
+    applyScreenShareBitrate(entry.screenSender);
+    await offerToPeer(entry); // renégociation : nouvelle piste vidéo pour ce pair
+  }
+  socket.emit('server:voice_screen_share', { action: 'start' });
+  renderVoiceBar();
+}
+
+async function stopVoiceScreenShare(){
+  if (!voiceMesh.screenStream) return;
+  for (const entry of voiceMesh.peers.values()){
+    if (entry.screenSender){
+      entry.pc.removeTrack(entry.screenSender);
+      entry.screenSender = null;
+      await offerToPeer(entry);
+    }
+  }
+  voiceMesh.screenStream.getTracks().forEach(t => t.stop());
+  voiceMesh.screenStream = null;
+  socket.emit('server:voice_screen_share', { action: 'stop' });
+  renderVoiceBar();
+}
+
+// Ajustement dynamique du débit : plafond haut par défaut (adapté au
+// 1080p60), préférence "maintenir le framerate" plutôt que la résolution
+// (zéro saccade), puis surveillance légère (toutes les 4s, pas sur le thread
+// de rendu) des pertes de paquets pour réduire le plafond si le réseau du
+// pair en face ne suit pas.
+function applyScreenShareBitrate(sender){
+  const params = sender.getParameters();
+  if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+  params.encodings[0].maxBitrate = 6_000_000;
+  params.encodings[0].maxFramerate = 60;
+  params.degradationPreference = 'maintain-framerate';
+  sender.setParameters(params).catch(() => {});
+
+  const monitor = setInterval(async () => {
+    if (!voiceMesh.peers.size || sender.track === null){ clearInterval(monitor); return; }
+    try{
+      const stats = await sender.getStats();
+      stats.forEach(r => {
+        if (r.type === 'outbound-rtp' && r.kind === 'video' && r.packetsLost > 0){
+          const p = sender.getParameters();
+          if (!p.encodings?.length) return;
+          const current = p.encodings[0].maxBitrate || 6_000_000;
+          p.encodings[0].maxBitrate = Math.max(1_500_000, Math.floor(current * 0.85));
+          sender.setParameters(p).catch(() => {});
+        }
+      });
+    }catch(e){ clearInterval(monitor); }
+  }, 4000);
+}
+
+// ---- UI minimale : barre flottante + tuiles d'écrans partagés ----
+// Volontairement générique (indépendante de tes classes CSS existantes) pour
+// ne rien casser dans ton design actuel ; à styliser/repositionner comme tu veux.
+function ensureVoiceMeshStyles(){
+  if (document.getElementById('voiceMeshStyles')) return;
+  const style = document.createElement('style');
+  style.id = 'voiceMeshStyles';
+  style.textContent = `
+    #voiceMeshBar{ position:fixed; left:16px; bottom:16px; z-index:9000; display:flex; flex-direction:column; gap:10px;
+      background: rgba(20,16,18,.92); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:10px 12px;
+      backdrop-filter: blur(6px); transition: box-shadow .15s; max-width:280px; }
+    #voiceMeshBar.vm-speaking{ box-shadow: 0 0 0 2px #6ee7a8; }
+    .vm-controls-row{ display:flex; gap:8px; align-items:center; }
+    #voiceMeshBar button{ background:#231c1f; color:#eee; border:1px solid rgba(255,255,255,.1); border-radius:8px;
+      padding:6px 10px; font-size:12.5px; cursor:pointer; }
+    #voiceMeshBar button.vm-active{ background:#6ee7a8; color:#0b0b0d; }
+    .vm-tiles{ display:flex; gap:10px; flex-wrap:wrap; }
+    .vm-tile{ display:flex; flex-direction:column; align-items:center; gap:4px; width:52px; }
+    .vm-tile-avatar{ width:42px; height:42px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+      font-weight:700; font-size:14px; color:white; position:relative; box-shadow: 0 0 0 2px transparent; transition: box-shadow .15s; }
+    .vm-tile-avatar.vm-tile-speaking{ box-shadow: 0 0 0 2px #6ee7a8; }
+    .vm-tile-muted-badge{ position:absolute; right:-2px; bottom:-2px; width:16px; height:16px; border-radius:50%;
+      background:#ff2d47; display:flex; align-items:center; justify-content:center; font-size:9px; }
+    .vm-tile-name{ font-size:10.5px; color:#cbb3b6; max-width:52px; overflow:hidden; text-overflow:ellipsis;
+      white-space:nowrap; text-align:center; }
+    #voiceScreenTiles{ position:fixed; right:16px; bottom:16px; z-index:9000; display:flex; gap:10px; flex-wrap:wrap; max-width:60vw; }
+    #voiceScreenTiles video{ width:280px; border-radius:10px; border:1px solid rgba(255,255,255,.1); background:#000; }
+  `;
+  document.head.appendChild(style);
+}
+
+// Construit une "tuile" participant (avatar rond + nom) pour le panneau
+// vocal flottant. `elId` permet de retrouver l'avatar plus tard (ex: pour
+// l'anneau "en train de parler" de sa propre tuile, mise à jour sans tout
+// re-render depuis onMeshSpeakingChange).
+function buildVoiceTile({ name, avatarDataUrl, elId, muted, speaking }){
+  const tile = document.createElement('div');
+  tile.className = 'vm-tile';
+  const avatar = document.createElement('div');
+  avatar.className = 'vm-tile-avatar' + (speaking ? ' vm-tile-speaking' : '');
+  if (elId) avatar.id = elId;
+  renderAvatarInto(avatar, { username: name, avatarDataUrl });
+  if (muted){
+    const badge = document.createElement('span');
+    badge.className = 'vm-tile-muted-badge';
+    badge.textContent = '🔇';
+    avatar.appendChild(badge);
+  }
+  const nameEl = document.createElement('div');
+  nameEl.className = 'vm-tile-name';
+  nameEl.textContent = name;
+  nameEl.title = name;
+  tile.append(avatar, nameEl);
+  return tile;
+}
+
+function renderVoiceBar(){
+  ensureVoiceMeshStyles();
+  let bar = document.getElementById('voiceMeshBar');
+  if (!voiceMesh.active){ if (bar) bar.remove(); return; }
+  if (!bar){
+    bar = document.createElement('div');
+    bar.id = 'voiceMeshBar';
+    document.body.appendChild(bar);
+  }
+  const sharing = !!voiceMesh.screenStream;
+  bar.innerHTML = '';
+
+  const tiles = document.createElement('div');
+  tiles.className = 'vm-tiles';
+  tiles.appendChild(buildVoiceTile({
+    name: currentUser || 'Moi', avatarDataUrl: myAvatarDataUrl,
+    elId: 'vmSelfAvatar', muted: voiceMesh.manualMuted, speaking: false
+  }));
+  for (const nullId of voiceMesh.peers.keys()){
+    const meta = voiceMesh.peerMeta.get(nullId);
+    tiles.appendChild(buildVoiceTile({
+      name: meta?.serverPseudo || nullId, avatarDataUrl: meta?.serverAvatarDataUrl || null,
+      elId: null, muted: false, speaking: false
+    }));
+  }
+  bar.appendChild(tiles);
+
+  const controls = document.createElement('div');
+  controls.className = 'vm-controls-row';
+  const label = document.createElement('span');
+  label.style.cssText = 'color:#a3888a;font-size:12px;';
+  label.textContent = `Vocal · ${voiceMesh.peers.size + 1} participant${voiceMesh.peers.size ? 's' : ''}`;
+  const muteBtn = document.createElement('button');
+  muteBtn.textContent = voiceMesh.manualMuted ? 'Muet' : 'Micro actif';
+  muteBtn.className = voiceMesh.manualMuted ? 'vm-active' : '';
+  muteBtn.onclick = toggleVoiceMeshManualMute;
+  const shareBtn = document.createElement('button');
+  shareBtn.textContent = sharing ? "Arrêter l'écran" : "Partager l'écran";
+  shareBtn.className = sharing ? 'vm-active' : '';
+  shareBtn.onclick = sharing ? stopVoiceScreenShare : startVoiceScreenShare;
+  const leaveBtn = document.createElement('button');
+  leaveBtn.textContent = 'Quitter';
+  leaveBtn.onclick = leaveServerVoiceChannel;
+  controls.append(label, muteBtn, shareBtn, leaveBtn);
+  bar.appendChild(controls);
+
+  if (voiceMesh.serverId) renderServerChannelBar(voiceMesh.serverId);
+}
+
+function attachRemoteScreenTile(nullId, stream){
+  ensureVoiceMeshStyles();
+  let tiles = document.getElementById('voiceScreenTiles');
+  if (!tiles){ tiles = document.createElement('div'); tiles.id = 'voiceScreenTiles'; document.body.appendChild(tiles); }
+  let video = tiles.querySelector(`video[data-null-id="${CSS.escape(nullId)}"]`);
+  if (!video){
+    video = document.createElement('video');
+    video.autoplay = true; video.playsInline = true;
+    video.dataset.nullId = nullId;
+    tiles.appendChild(video);
+  }
+  video.srcObject = stream;
+}
+function removeRemoteScreenTile(nullId){
+  document.querySelector(`#voiceScreenTiles video[data-null-id="${CSS.escape(nullId)}"]`)?.remove();
+}
+function clearVoiceTiles(){
+  document.getElementById('voiceScreenTiles')?.remove();
+  document.getElementById('voiceMeshBar')?.remove();
 }
 
 function addSystemMessage(text){
@@ -5410,6 +6009,9 @@ async function startApp(){
   // liste complète des salons avec ephemeralTtlMs à chaque changement.
   socket.on('server:channels', (data) => {
     (data.channels || []).forEach(ch => channelEphemeralTtlMs.set(ch.id, ch.ephemeralTtlMs ?? null));
+    const srv = myServers.get(data.serverId);
+    if (srv) srv.channels = [...(data.channels || [])].sort((a, b) => a.position - b.position);
+    if (currentServerId === data.serverId) renderServerChannelBar(data.serverId);
   });
 
   // Purge RAM + DOM + localStorage dès qu'un message expire, chez tout le
