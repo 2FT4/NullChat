@@ -1231,6 +1231,10 @@ input:disabled{ opacity:.5; }
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           </button>
           <input type="file" id="dmFileInput" accept="image/*,video/*" style="display:none" onchange="handleDmFileSelected(event)">
+          <button class="icon-btn fx-btn" id="dmFileP2pBtn" title="Envoyer un fichier en P2P direct (aucune limite de taille, ne passe jamais par le serveur)" onclick="document.getElementById('dmFileP2pInput').click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+          </button>
+          <input type="file" id="dmFileP2pInput" style="display:none" onchange="handleDmP2pFileSelected(event)">
           <button class="icon-btn fx-btn" id="dmMicBtn" title="Message vocal" onclick="toggleVoiceRecording()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
           </button>
@@ -5255,6 +5259,336 @@ function cleanupCall(){
 }
 
 // ==========================================
+// FILETRANSFER : partage de fichiers P2P en streaming disque
+// ==========================================
+// Objectif : envoyer un fichier de PC à PC via WebRTC (RTCDataChannel),
+// sans jamais le faire transiter par le serveur (contrairement aux pièces
+// jointes classiques ci-dessus, qui passent en base64 dans les messages
+// chiffrés), et sans charger tout le fichier en RAM ni à l'envoi ni à la
+// réception :
+//  - Envoi : lu chunk par chunk avec File.slice() (jamais tout le fichier
+//    en mémoire), avec gestion du contre-pression (bufferedAmount) pour ne
+//    pas saturer le canal.
+//  - Réception : écrit chunk par chunk directement sur le disque via l'API
+//    File System Access (showSaveFilePicker + createWritable), donc une
+//    taille de fichier n'est jamais limitée par la RAM du navigateur. Si
+//    cette API n'est pas disponible (Firefox, Safari à ce jour), on retombe
+//    sur une accumulation en mémoire façon téléchargement classique — donc
+//    fonctionnel partout, mais avec la même limite RAM que le reste de
+//    l'appli sur ces navigateurs.
+// Un seul transfert actif à la fois, comme les appels 1:1 (activeCallPeer).
+// Le contenu du fichier ne passe jamais par le serveur ; seule la
+// signalisation WebRTC (SDP/ICE, aucun octet du fichier) transite par lui.
+const FILE_CHUNK_SIZE = 64 * 1024; // 64 Ko par chunk
+const FILE_BUFFER_HIGH_WATERMARK = 4 * 1024 * 1024; // pause l'envoi au-delà de 4 Mo en attente d'ACK réseau
+const FILE_BUFFER_LOW_WATERMARK = 1 * 1024 * 1024;  // reprend l'envoi sous ce seuil
+
+const fileTransfer = {
+  active: false,
+  role: null, // 'sender' | 'receiver'
+  pc: null,
+  dc: null,
+  peerNullId: null,
+  peerSocketId: null,
+  transferId: null,
+  filename: null,
+  size: 0,
+  mimeType: null,
+  sentBytes: 0,
+  receivedBytes: 0,
+  file: null,        // File source, côté envoyeur
+  writable: null,     // FileSystemWritableFileStream, côté receveur (streaming disque)
+  memoryChunks: null, // repli mémoire si l'API File System Access est indisponible
+  cancelled: false
+};
+
+function formatBytes(bytes){
+  if (!bytes) return '0 o';
+  const units = ['o', 'Ko', 'Mo', 'Go', 'To'];
+  let i = 0, val = bytes;
+  while (val >= 1024 && i < units.length - 1){ val /= 1024; i++; }
+  return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function ensureFileTransferStyles(){
+  if (document.getElementById('fileTransferStyles')) return;
+  const style = document.createElement('style');
+  style.id = 'fileTransferStyles';
+  style.textContent = `
+    #fileTransferBar{ position:fixed; right:16px; top:76px; z-index:9000; width:250px;
+      background: rgba(20,16,18,.92); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:12px 14px;
+      backdrop-filter: blur(6px); color:#eee; font-size:12.5px; }
+    #fileTransferBar .ft-name{ font-weight:700; margin-bottom:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #fileTransferBar .ft-progress-track{ background:#231c1f; border-radius:6px; height:6px; overflow:hidden; margin:6px 0; }
+    #fileTransferBar .ft-progress-fill{ background:#6ee7a8; height:100%; transition: width .15s; }
+    #fileTransferBar .ft-meta{ color:#a3888a; font-size:11px; display:flex; justify-content:space-between; }
+    #fileTransferBar button{ margin-top:8px; width:100%; background:#231c1f; color:#eee; border:1px solid rgba(255,255,255,.1);
+      border-radius:8px; padding:6px 10px; font-size:12px; cursor:pointer; }
+    #fileTransferBar button:hover{ background:#2f262a; }
+  `;
+  document.head.appendChild(style);
+}
+
+function renderFileTransferBar(){
+  ensureFileTransferStyles();
+  let bar = document.getElementById('fileTransferBar');
+  if (!fileTransfer.active){ if (bar) bar.remove(); return; }
+  if (!bar){
+    bar = document.createElement('div');
+    bar.id = 'fileTransferBar';
+    document.body.appendChild(bar);
+  }
+  const done = fileTransfer.role === 'sender' ? fileTransfer.sentBytes : fileTransfer.receivedBytes;
+  const pct = fileTransfer.size ? Math.min(100, Math.round((done / fileTransfer.size) * 100)) : 0;
+  const streaming = fileTransfer.role === 'receiver' && !!fileTransfer.writable;
+  bar.innerHTML = `
+    <div class="ft-name" title="${escapeHtml(fileTransfer.filename || '')}">${escapeHtml(fileTransfer.filename || '')}</div>
+    <div class="ft-progress-track"><div class="ft-progress-fill" style="width:${pct}%"></div></div>
+    <div class="ft-meta"><span>${formatBytes(done)} / ${formatBytes(fileTransfer.size)}</span><span>${pct}%</span></div>
+    <div class="ft-meta"><span>${fileTransfer.role === 'sender' ? 'Envoi P2P' : 'Réception P2P'}${streaming ? ' · direct disque' : ''}</span></div>
+  `;
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Annuler';
+  cancelBtn.onclick = cancelFileTransfer;
+  bar.appendChild(cancelBtn);
+}
+
+async function handleDmP2pFileSelected(event){
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file || !currentDmPeer) return;
+  if (!currentDmPeer.online){
+    showToast({ title: 'Ami hors ligne', body: 'Le transfert P2P direct nécessite que le destinataire soit en ligne en même temps que toi.' });
+    return;
+  }
+  if (fileTransfer.active){
+    showToast({ title: 'Transfert en cours', body: "Termine ou annule le transfert en cours avant d'en démarrer un autre." });
+    return;
+  }
+  await startFileTransferSend(currentDmPeer, file);
+}
+
+async function startFileTransferSend(peer, file){
+  const transferId = crypto.randomUUID();
+  fileTransfer.active = true;
+  fileTransfer.role = 'sender';
+  fileTransfer.transferId = transferId;
+  fileTransfer.peerNullId = peer.nullId;
+  fileTransfer.peerSocketId = peer.socketId;
+  fileTransfer.filename = file.name;
+  fileTransfer.size = file.size;
+  fileTransfer.mimeType = file.type || 'application/octet-stream';
+  fileTransfer.sentBytes = 0;
+  fileTransfer.cancelled = false;
+  fileTransfer.file = file;
+
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  fileTransfer.pc = pc;
+  pc.onicecandidate = (e) => {
+    if (e.candidate) socket.emit('filetransfer:ice', { targetNullId: peer.nullId, targetSocketId: peer.socketId, transferId, candidate: e.candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    if ((pc.connectionState === 'failed' || pc.connectionState === 'closed') && fileTransfer.active && fileTransfer.transferId === transferId){
+      failFileTransfer('Connexion perdue avec le pair.');
+    }
+  };
+
+  const dc = pc.createDataChannel('file');
+  fileTransfer.dc = dc;
+  dc.binaryType = 'arraybuffer';
+  dc.bufferedAmountLowThreshold = FILE_BUFFER_LOW_WATERMARK;
+  dc.onopen = () => sendFileChunks(transferId);
+  dc.onerror = () => failFileTransfer("Erreur du canal de données pendant l'envoi.");
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  renderFileTransferBar();
+  socket.emit('filetransfer:offer', {
+    targetNullId: peer.nullId, targetSocketId: peer.socketId,
+    transferId, filename: file.name, size: file.size, mimeType: fileTransfer.mimeType,
+    sdp: offer
+  });
+}
+
+async function sendFileChunks(transferId){
+  if (fileTransfer.transferId !== transferId) return;
+  const { dc, file } = fileTransfer;
+  const total = file.size;
+  let offset = 0;
+  try{
+    while (offset < total){
+      if (fileTransfer.cancelled || fileTransfer.transferId !== transferId) return;
+      if (dc.bufferedAmount > FILE_BUFFER_HIGH_WATERMARK){
+        await new Promise(resolve => { dc.onbufferedamountlow = () => resolve(); });
+        continue;
+      }
+      const slice = file.slice(offset, offset + FILE_CHUNK_SIZE);
+      const buf = await slice.arrayBuffer();
+      dc.send(buf);
+      offset += buf.byteLength;
+      fileTransfer.sentBytes = offset;
+      renderFileTransferBar();
+    }
+    if (fileTransfer.cancelled || fileTransfer.transferId !== transferId) return;
+    dc.send('__FT_EOF__');
+    showToast({ title: 'Transfert terminé', body: `${file.name} envoyé.` });
+    endFileTransfer();
+  }catch(err){
+    failFileTransfer("Erreur pendant l'envoi du fichier.");
+  }
+}
+
+async function handleIncomingFileTransferOffer(data){
+  const { from, transferId, filename, size, mimeType, sdp } = data;
+  if (blockedIds.has(from.nullId)){
+    socket.emit('filetransfer:decline', { targetNullId: from.nullId, targetSocketId: from.socketId, transferId, reason: 'blocked' });
+    return;
+  }
+  if (fileTransfer.active){
+    socket.emit('filetransfer:decline', { targetNullId: from.nullId, targetSocketId: from.socketId, transferId, reason: 'busy' });
+    return;
+  }
+  showToast({
+    title: 'Fichier entrant',
+    body: `${from.username} veut t'envoyer « ${filename} » (${formatBytes(size)})`,
+    actions: [
+      { type: 'decline', label: 'Refuser', onClick: () => {
+        socket.emit('filetransfer:decline', { targetNullId: from.nullId, targetSocketId: from.socketId, transferId });
+      } },
+      { type: 'accept', label: 'Accepter', onClick: () => acceptFileTransfer({ from, transferId, filename, size, mimeType, sdp }) }
+    ]
+  });
+}
+
+async function acceptFileTransfer({ from, transferId, filename, size, mimeType, sdp }){
+  // showSaveFilePicker() doit être appelé pendant le geste utilisateur (ce
+  // clic) pour être autorisé par le navigateur : on le fait avant tout await
+  // de signalisation réseau.
+  let writable = null, memoryChunks = null;
+  try{
+    if ('showSaveFilePicker' in window){
+      const handle = await window.showSaveFilePicker({ suggestedName: filename });
+      writable = await handle.createWritable();
+    } else {
+      memoryChunks = [];
+    }
+  }catch(err){
+    // Boîte de dialogue annulée par l'utilisateur : pas une vraie erreur.
+    socket.emit('filetransfer:decline', { targetNullId: from.nullId, targetSocketId: from.socketId, transferId, reason: 'cancelled' });
+    return;
+  }
+
+  fileTransfer.active = true;
+  fileTransfer.role = 'receiver';
+  fileTransfer.transferId = transferId;
+  fileTransfer.peerNullId = from.nullId;
+  fileTransfer.peerSocketId = from.socketId;
+  fileTransfer.filename = filename;
+  fileTransfer.size = size;
+  fileTransfer.mimeType = mimeType;
+  fileTransfer.receivedBytes = 0;
+  fileTransfer.cancelled = false;
+  fileTransfer.writable = writable;
+  fileTransfer.memoryChunks = memoryChunks;
+
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  fileTransfer.pc = pc;
+  pc.onicecandidate = (e) => {
+    if (e.candidate) socket.emit('filetransfer:ice', { targetNullId: from.nullId, targetSocketId: from.socketId, transferId, candidate: e.candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    if ((pc.connectionState === 'failed' || pc.connectionState === 'closed') && fileTransfer.active && fileTransfer.transferId === transferId){
+      failFileTransfer('Connexion perdue avec le pair.');
+    }
+  };
+  pc.ondatachannel = (e) => {
+    const dc = e.channel;
+    fileTransfer.dc = dc;
+    dc.binaryType = 'arraybuffer';
+    dc.onmessage = (ev) => handleIncomingFileChunk(ev.data, transferId);
+    dc.onerror = () => failFileTransfer('Erreur du canal de données pendant la réception.');
+  };
+
+  await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  socket.emit('filetransfer:answer', { targetNullId: from.nullId, targetSocketId: from.socketId, transferId, sdp: answer });
+
+  renderFileTransferBar();
+}
+
+async function handleIncomingFileChunk(data, transferId){
+  if (!fileTransfer.active || fileTransfer.role !== 'receiver' || fileTransfer.transferId !== transferId) return;
+  if (typeof data === 'string'){
+    if (data === '__FT_EOF__') await finishReceivingFile();
+    return;
+  }
+  const chunk = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+  try{
+    if (fileTransfer.writable) await fileTransfer.writable.write(chunk);
+    else fileTransfer.memoryChunks.push(chunk);
+  }catch(err){
+    failFileTransfer("Erreur d'écriture du fichier reçu.");
+    return;
+  }
+  fileTransfer.receivedBytes += chunk.byteLength;
+  renderFileTransferBar();
+}
+
+async function finishReceivingFile(){
+  const { filename, mimeType } = fileTransfer;
+  try{
+    if (fileTransfer.writable){
+      await fileTransfer.writable.close();
+    } else if (fileTransfer.memoryChunks){
+      const blob = new Blob(fileTransfer.memoryChunks, { type: mimeType || 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }
+    showToast({ title: 'Fichier reçu', body: filename || '' });
+  }catch(err){
+    showToast({ title: 'Erreur', body: "Le fichier n'a pas pu être finalisé sur le disque." });
+  }
+  endFileTransfer();
+}
+
+function endFileTransfer(){
+  if (fileTransfer.dc){ try{ fileTransfer.dc.close(); }catch(e){} }
+  if (fileTransfer.pc){ try{ fileTransfer.pc.close(); }catch(e){} }
+  fileTransfer.active = false;
+  fileTransfer.role = null;
+  fileTransfer.pc = null;
+  fileTransfer.dc = null;
+  fileTransfer.file = null;
+  fileTransfer.writable = null;
+  fileTransfer.memoryChunks = null;
+  fileTransfer.transferId = null;
+  renderFileTransferBar();
+}
+
+function failFileTransfer(reason){
+  if (!fileTransfer.active) return;
+  showToast({ title: 'Transfert échoué', body: reason || '' });
+  if (fileTransfer.writable){ try{ fileTransfer.writable.abort(); }catch(e){} }
+  endFileTransfer();
+}
+
+function cancelFileTransfer(){
+  if (!fileTransfer.active) return;
+  fileTransfer.cancelled = true;
+  if (fileTransfer.peerSocketId && fileTransfer.transferId){
+    socket.emit('filetransfer:cancel', { targetNullId: fileTransfer.peerNullId, targetSocketId: fileTransfer.peerSocketId, transferId: fileTransfer.transferId });
+  }
+  if (fileTransfer.writable){ try{ fileTransfer.writable.abort(); }catch(e){} }
+  endFileTransfer();
+  showToast({ title: 'Transfert annulé', body: '' });
+}
+
+// ==========================================
 // Salon vocal multi-pairs (mesh) + Partage d'écran 60 FPS P2P
 // ==========================================
 // Le serveur (server:voice_join/voice_signal/voice_screen_share, voir
@@ -5396,55 +5730,10 @@ async function offerToPeer(entry){
   socket.emit('server:voice_signal', { channelId: voiceMesh.channelId, targetSocketId: entry.socketId, signalType: 'offer', sdp: hdOffer, mediaPub });
 }
 
-socket.on('server:voice_peers', async ({ channelId, peers }) => {
-  if (!voiceMesh.active || channelId !== voiceMesh.channelId) return;
-  for (const p of (peers || [])){
-    registerVoicePeerMeta(p);
-    const entry = createMeshPeerConnection(p.nullId, p.socketId);
-    await offerToPeer(entry); // je suis le nouvel arrivant : j'offre à chaque pair déjà présent
-  }
-  renderVoiceBar();
-});
-
-socket.on('server:voice_peer_joined', (data) => { playVoiceJoinSound(); renderVoiceBar(); registerVoicePeerMeta(data?.peer); });
-
-socket.on('server:voice_signal', async ({ channelId, signalType, from, sdp, candidate, mediaPub }) => {
-  if (!voiceMesh.active || channelId !== voiceMesh.channelId) return;
-  let entry = voiceMesh.peers.get(from.nullId);
-  if (!entry) entry = createMeshPeerConnection(from.nullId, from.socketId);
-
-  if (signalType === 'offer'){
-    entry.isOfferer = false;
-    if (!entry.myMediaKeyPair) entry.myMediaKeyPair = await generateEphemeralMediaKeyPair();
-    await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    if (mediaPub){
-      entry.mediaSharedKey = await deriveMediaSharedKey(entry.myMediaKeyPair.privateKey, mediaPub);
-      applyCallEncryption(entry.pc, entry.mediaSharedKey, false);
-    }
-    const answer = await entry.pc.createAnswer();
-    const hdAnswer = applyOpusHdToDescription(answer);
-    await entry.pc.setLocalDescription(hdAnswer);
-    const myMediaPub = await exportMediaPublicKey(entry.myMediaKeyPair);
-    socket.emit('server:voice_signal', { channelId, targetSocketId: from.socketId, signalType: 'answer', sdp: hdAnswer, mediaPub: myMediaPub });
-  } else if (signalType === 'answer'){
-    await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    if (mediaPub && entry.myMediaKeyPair){
-      entry.mediaSharedKey = await deriveMediaSharedKey(entry.myMediaKeyPair.privateKey, mediaPub);
-      applyCallEncryption(entry.pc, entry.mediaSharedKey, true);
-    }
-  } else if (signalType === 'ice' && candidate){
-    try{ await entry.pc.addIceCandidate(new RTCIceCandidate(candidate)); }catch(e){}
-  }
-});
-
-socket.on('server:voice_peer_left', ({ channelId, nullId }) => {
-  if (channelId !== voiceMesh.channelId) return;
-  const entry = voiceMesh.peers.get(nullId);
-  if (entry){ entry.pc.close(); if (entry.audioEl) entry.audioEl.remove(); voiceMesh.peers.delete(nullId); }
-  voiceMesh.peerMeta.delete(nullId);
-  removeRemoteScreenTile(nullId);
-  renderVoiceBar();
-});
+// (Les handlers socket.on('server:voice_*', ...) sont enregistrés dans
+// startApp(), avec les autres écouteurs socket — voir plus bas. Ils ne
+// peuvent pas s'enregistrer ici : `socket` vaut encore `null` à ce stade
+// du chargement du script.)
 
 // ---- Partage d'écran haute fréquence (60 FPS) avec bitrate adaptatif ----
 async function startVoiceScreenShare(){
@@ -6209,6 +6498,78 @@ async function startApp(){
   socket.on('call:ice', handleCallIce);
   socket.on('call:ended', () => { showToast({ title:'Appel terminé', body:'' }); cleanupCall(); });
   socket.on('call:declined', () => { showToast({ title:'Appel refusé', body:'' }); cleanupCall(); });
+
+  // Salon vocal serveur (mesh) — déplacés ici depuis le niveau racine du
+  // script (voir le commentaire au-dessus de startVoiceScreenShare) car ils
+  // ont besoin que `socket` existe déjà.
+  socket.on('server:voice_peers', async ({ channelId, peers }) => {
+    if (!voiceMesh.active || channelId !== voiceMesh.channelId) return;
+    for (const p of (peers || [])){
+      registerVoicePeerMeta(p);
+      const entry = createMeshPeerConnection(p.nullId, p.socketId);
+      await offerToPeer(entry); // je suis le nouvel arrivant : j'offre à chaque pair déjà présent
+    }
+    renderVoiceBar();
+  });
+  socket.on('server:voice_peer_joined', (data) => { playVoiceJoinSound(); renderVoiceBar(); registerVoicePeerMeta(data?.peer); });
+  socket.on('server:voice_signal', async ({ channelId, signalType, from, sdp, candidate, mediaPub }) => {
+    if (!voiceMesh.active || channelId !== voiceMesh.channelId) return;
+    let entry = voiceMesh.peers.get(from.nullId);
+    if (!entry) entry = createMeshPeerConnection(from.nullId, from.socketId);
+    if (signalType === 'offer'){
+      entry.isOfferer = false;
+      if (!entry.myMediaKeyPair) entry.myMediaKeyPair = await generateEphemeralMediaKeyPair();
+      await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      if (mediaPub){
+        entry.mediaSharedKey = await deriveMediaSharedKey(entry.myMediaKeyPair.privateKey, mediaPub);
+        applyCallEncryption(entry.pc, entry.mediaSharedKey, false);
+      }
+      const answer = await entry.pc.createAnswer();
+      const hdAnswer = applyOpusHdToDescription(answer);
+      await entry.pc.setLocalDescription(hdAnswer);
+      const myMediaPub = await exportMediaPublicKey(entry.myMediaKeyPair);
+      socket.emit('server:voice_signal', { channelId, targetSocketId: from.socketId, signalType: 'answer', sdp: hdAnswer, mediaPub: myMediaPub });
+    } else if (signalType === 'answer'){
+      await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      if (mediaPub && entry.myMediaKeyPair){
+        entry.mediaSharedKey = await deriveMediaSharedKey(entry.myMediaKeyPair.privateKey, mediaPub);
+        applyCallEncryption(entry.pc, entry.mediaSharedKey, true);
+      }
+    } else if (signalType === 'ice' && candidate){
+      try{ await entry.pc.addIceCandidate(new RTCIceCandidate(candidate)); }catch(e){}
+    }
+  });
+  socket.on('server:voice_peer_left', ({ channelId, nullId }) => {
+    if (channelId !== voiceMesh.channelId) return;
+    const entry = voiceMesh.peers.get(nullId);
+    if (entry){ entry.pc.close(); if (entry.audioEl) entry.audioEl.remove(); voiceMesh.peers.delete(nullId); }
+    voiceMesh.peerMeta.delete(nullId);
+    removeRemoteScreenTile(nullId);
+    renderVoiceBar();
+  });
+
+  // Transfert de fichiers P2P en streaming disque (voir plus haut,
+  // section FILETRANSFER).
+  socket.on('filetransfer:offer', handleIncomingFileTransferOffer);
+  socket.on('filetransfer:answer', async ({ sdp }) => {
+    if (!fileTransfer.pc || fileTransfer.role !== 'sender') return;
+    await fileTransfer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+  });
+  socket.on('filetransfer:ice', async ({ candidate }) => {
+    if (!fileTransfer.pc || !candidate) return;
+    try{ await fileTransfer.pc.addIceCandidate(new RTCIceCandidate(candidate)); }catch(e){}
+  });
+  socket.on('filetransfer:decline', ({ transferId, reason }) => {
+    if (!fileTransfer.active || fileTransfer.transferId !== transferId) return;
+    showToast({ title: 'Transfert refusé', body: reason === 'busy' ? 'Le destinataire a déjà un transfert en cours.' : "L'autre personne a refusé le fichier." });
+    endFileTransfer();
+  });
+  socket.on('filetransfer:cancel', ({ transferId }) => {
+    if (!fileTransfer.active || fileTransfer.transferId !== transferId) return;
+    showToast({ title: "Transfert annulé par l'autre personne", body: '' });
+    if (fileTransfer.writable){ try{ fileTransfer.writable.abort(); }catch(e){} }
+    endFileTransfer();
+  });
 }
 
 async function sendSecretMessage(){

@@ -2534,6 +2534,57 @@ io.on('connection', (socket) => {
   }));
 
   // ==========================================
+  // TRANSFERT DE FICHIERS P2P (WebRTC DataChannel, streaming disque)
+  // ==========================================
+  // Le serveur ne relaie ICI que la signalisation WebRTC (SDP/ICE) entre
+  // deux amis, exactement comme pour call:*. Aucun octet du fichier ne
+  // transite jamais par lui.
+  socket.on('filetransfer:offer', safeHandler(socket, (data = {}) => {
+    if (!resolveFriendTarget(data.targetSocketId)) return;
+    io.to(data.targetSocketId).emit('filetransfer:offer', {
+      from: { nullId, username, socketId: socket.id },
+      transferId: data.transferId,
+      filename: data.filename,
+      size: data.size,
+      mimeType: data.mimeType,
+      sdp: data.sdp
+    });
+  }));
+
+  socket.on('filetransfer:answer', safeHandler(socket, (data = {}) => {
+    if (!resolveFriendTarget(data.targetSocketId)) return;
+    io.to(data.targetSocketId).emit('filetransfer:answer', {
+      from: { nullId, socketId: socket.id },
+      transferId: data.transferId,
+      sdp: data.sdp
+    });
+  }));
+
+  socket.on('filetransfer:ice', safeHandler(socket, (data = {}) => {
+    if (!resolveFriendTarget(data.targetSocketId)) return;
+    io.to(data.targetSocketId).emit('filetransfer:ice', {
+      from: { nullId, socketId: socket.id },
+      transferId: data.transferId,
+      candidate: data.candidate
+    });
+  }));
+
+  socket.on('filetransfer:decline', safeHandler(socket, (data = {}) => {
+    if (!data.targetSocketId || !connectedSockets.has(data.targetSocketId)) return;
+    io.to(data.targetSocketId).emit('filetransfer:decline', {
+      transferId: data.transferId,
+      reason: data.reason || null
+    });
+  }));
+
+  socket.on('filetransfer:cancel', safeHandler(socket, (data = {}) => {
+    if (!data.targetSocketId || !connectedSockets.has(data.targetSocketId)) return;
+    io.to(data.targetSocketId).emit('filetransfer:cancel', {
+      transferId: data.transferId
+    });
+  }));
+
+  // ==========================================
   // SERVEURS (groupes chiffrés créés par les utilisateurs)
   // ==========================================
   socket.on('server:create', safeHandler(socket, (data = {}) => {
