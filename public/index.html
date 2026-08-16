@@ -4956,7 +4956,16 @@ function purgeExpiredMessage({ scope, serverId, channelId, messageId }){
 // Support navigateur : Chromium uniquement pour l'instant (Insertable
 // Streams). Sur les autres navigateurs, l'appel reste protégé par le
 // DTLS-SRTP standard, juste sans cette couche additionnelle.
-const CALL_CRYPTO_SUPPORTED = typeof RTCRtpSender !== 'undefined' && 'createEncodedStreams' in RTCRtpSender.prototype;
+// TEMPORAIREMENT DÉSACTIVÉ : la couche de chiffrement additionnel des trames
+// (call-crypto-worker.js) semble avoir un bug qui bloque silencieusement
+// l'audio (aucune erreur, juste plus aucune trame qui passe) — confirmé par
+// un appel "connecté" (ICE OK, même wifi) mais totalement muet des deux
+// côtés. Le transport reste chiffré nativement par WebRTC (DTLS-SRTP), donc
+// désactiver cette couche additionnelle ne rend pas les appels "en clair".
+// Pour réactiver : remettre la ligne originale ci-dessous une fois
+// call-crypto-worker.js corrigé/vérifié.
+// const CALL_CRYPTO_SUPPORTED = typeof RTCRtpSender !== 'undefined' && 'createEncodedStreams' in RTCRtpSender.prototype;
+const CALL_CRYPTO_SUPPORTED = false;
 let callCryptoWorker = null;
 function getCallCryptoWorker(){
   if (!callCryptoWorker) callCryptoWorker = new Worker('/call-crypto-worker.js');
