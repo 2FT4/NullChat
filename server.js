@@ -58,6 +58,13 @@ if (process.env.TURN_URL) {
     username: process.env.TURN_USERNAME || undefined,
     credential: process.env.TURN_CREDENTIAL || undefined
   });
+} else {
+  // Sans TURN, les appels (DM et vocaux de serveur) ne fonctionneront QUE si
+  // les deux personnes arrivent à établir une connexion P2P directe via STUN
+  // seul — ce qui échoue souvent en pratique (4G/5G, NAT symétrique, wifi
+  // d'entreprise/école/campus...). C'est la cause la plus fréquente d'un
+  // appel qui se "connecte" côté UI mais où personne n'entend rien.
+  console.warn('⚠️ TURN_URL non défini : les appels échoueront pour toute paire d\'utilisateurs qui ne peut pas établir de connexion P2P directe (STUN seul). Configure TURN_URL/TURN_USERNAME/TURN_CREDENTIAL (ex. Metered, Twilio, ou un coturn auto-hébergé) pour fiabiliser les appels.');
 }
 
 // ==========================================

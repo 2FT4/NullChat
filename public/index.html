@@ -324,9 +324,21 @@ input:disabled{ opacity:.5; }
 .friend-row:hover{ background: var(--bg-raised); }
 .friend-row .avatar{ width:36px; height:36px; font-size:13px; }
 .friend-meta{ flex:1; min-width:0; }
-.friend-name{ font-size: 13.5px; font-weight:600; color: var(--text-primary); display:flex; align-items:center; gap:6px; }
+.friend-name{ font-size: 13.5px; font-weight:600; color: var(--text-primary); display:flex; align-items:center; gap:6px; flex-wrap:wrap; row-gap:3px; }
 .friend-sub{ font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
-.friend-actions{ display:flex; gap:6px; }
+.friend-actions{ display:flex; gap:6px; flex-shrink:0; }
+.friend-menu{
+  position:fixed; z-index:9600; background: var(--bg-panel); border:1px solid var(--border-soft);
+  border-radius: var(--radius-md); box-shadow: 0 12px 32px rgba(0,0,0,.45); padding:6px; min-width:190px;
+  display:flex; flex-direction:column; gap:2px;
+}
+.friend-menu button{
+  display:flex; align-items:center; gap:8px; text-align:left; background:none; border:none;
+  color: var(--text-primary); font-size:13px; padding:8px 10px; border-radius:7px; cursor:pointer;
+}
+.friend-menu button:hover{ background: var(--bg-raised); }
+.friend-menu button.danger{ color: var(--danger); }
+.friend-menu button.danger:hover{ background: rgba(239,90,111,.14); }
 /* Badge "certifié" Owner/Co-Owner : calculé côté serveur (jamais depuis un
    pseudo), pour qu'un compte normal ne puisse jamais l'obtenir en se
    renommant "Owner" ou "Admin" — sert donc de protection anti-usurpation. */
@@ -644,7 +656,33 @@ input:disabled{ opacity:.5; }
   background: var(--bg-panel); border:1px solid var(--border-soft); border-radius: var(--radius-lg);
   padding: 36px 32px; width:320px; text-align:center; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
   animation: call-card-in .38s cubic-bezier(.34,1.56,.64,1);
+  position:relative;
 }
+.call-minimize-btn{
+  position:absolute; top:10px; right:10px; width:28px; height:28px; border-radius:8px;
+  border:none; background: var(--bg-raised); color: var(--text-muted); cursor:pointer;
+  font-size:16px; line-height:1; display:flex; align-items:center; justify-content:center;
+}
+.call-minimize-btn:hover{ background: var(--accent-1); color:#fff; }
+
+/* Barre flottante affichée quand l'appel est réduit : on n'est plus obligé
+   de rester sur l'écran d'appel plein écran pour continuer à parler, on peut
+   naviguer ailleurs dans l'app pendant que l'appel continue en arrière-plan. */
+.mini-call-bar{
+  display:none; position:fixed; left:16px; bottom:16px; z-index:9500;
+  align-items:center; gap:10px; padding:8px 10px; border-radius: var(--radius-lg);
+  background: var(--bg-panel); border:1px solid var(--border-soft); box-shadow: 0 12px 32px rgba(0,0,0,.45);
+  cursor:pointer; max-width: min(320px, 90vw);
+}
+.mini-call-bar.open{ display:flex; }
+.mini-call-avatar{
+  width:34px; height:34px; border-radius:50%; flex-shrink:0; display:flex; align-items:center; justify-content:center;
+  background: var(--accent-grad); color:#10111a; font-weight:700; font-size:13px; overflow:hidden;
+}
+.mini-call-avatar img{ width:100%; height:100%; object-fit:cover; }
+.mini-call-info{ min-width:0; flex:1; }
+.mini-call-name{ font-size:12.5px; font-weight:700; color: var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.mini-call-status{ font-size:11px; color: var(--online); }
 .call-overlay.closing .call-card{ animation: call-card-out .2s ease forwards; }
 @keyframes call-card-in{ from{ opacity:0; transform: scale(.82) translateY(14px); } to{ opacity:1; transform: scale(1) translateY(0); } }
 @keyframes call-card-out{ from{ opacity:1; transform: scale(1); } to{ opacity:0; transform: scale(.92); } }
@@ -1672,11 +1710,26 @@ input:disabled{ opacity:.5; }
 
 <div class="call-overlay" id="callOverlay">
   <div class="call-card">
+    <button class="call-minimize-btn" id="callMinimizeBtn" title="Réduire (continuer l'appel en arrière-plan)" onclick="minimizeCallOverlay()">▾</button>
     <div class="call-avatar" id="callAvatar">?</div>
     <div class="call-name" id="callName">—</div>
     <div class="call-status" id="callStatusText">...</div>
     <div class="call-actions" id="callActions"></div>
   </div>
+</div>
+
+<div class="mini-call-bar" id="miniCallBar" onclick="restoreCallOverlay()">
+  <div class="mini-call-avatar" id="miniCallAvatar">?</div>
+  <div class="mini-call-info">
+    <div class="mini-call-name" id="miniCallName">—</div>
+    <div class="mini-call-status" id="miniCallStatus">En appel</div>
+  </div>
+  <button class="icon-btn fx-btn" id="miniCallMuteBtn" title="Muet" onclick="event.stopPropagation(); toggleMute(); syncMiniCallBar();">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
+  </button>
+  <button class="icon-btn fx-btn danger" title="Raccrocher" onclick="event.stopPropagation(); hangupCall();">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 1L1 23M1 1l22 22"/></svg>
+  </button>
 </div>
 
 <audio id="remoteAudio" autoplay></audio>
@@ -3294,28 +3347,49 @@ function renderFriendList(){
         <button class="icon-btn fx-btn" title="Appeler" data-action="call" ${f.online ? '' : 'disabled style="opacity:.35;cursor:not-allowed;"'}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
         </button>
-        <button class="icon-btn fx-btn" title="Signaler" data-action="report">🚩</button>
-        <button class="icon-btn fx-btn danger" title="Signaler un dox" data-action="reportdox">🔒</button>
-        <button class="icon-btn fx-btn danger" title="Bloquer" data-action="block">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M4.9 4.9l14.2 14.2"/></svg>
-        </button>
-        <button class="icon-btn fx-btn danger" title="Retirer" data-action="remove">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-        </button>
-        ${isAppOwner() ? `<button class="icon-btn fx-btn danger" title="Bannir de l'app" data-action="appban" style="background:var(--danger); color:#fff;">⛔</button>` : ''}
+        <button class="icon-btn fx-btn" title="Plus d'options" data-action="more">⋮</button>
       </div>
     `;
     row.addEventListener('click', () => openDm(f));
     const callBtn = row.querySelector('[data-action="call"]');
     if (f.online) callBtn.onclick = (e) => { e.stopPropagation(); startCall(f); };
-    row.querySelector('[data-action="remove"]').onclick = (e) => { e.stopPropagation(); removeFriend(f.nullId); };
-    row.querySelector('[data-action="block"]').onclick = (e) => { e.stopPropagation(); blockFriend(f.nullId); };
-    row.querySelector('[data-action="report"]').onclick = (e) => { e.stopPropagation(); openReportModal('user', f.nullId, f.username); };
-    row.querySelector('[data-action="reportdox"]').onclick = (e) => { e.stopPropagation(); openReportModal('dox', f.nullId, f.username); };
-    const appBanBtn = row.querySelector('[data-action="appban"]');
-    if (appBanBtn) appBanBtn.onclick = (e) => { e.stopPropagation(); banUserFromApp(f.nullId, f.username); };
+    row.querySelector('[data-action="more"]').onclick = (e) => { e.stopPropagation(); openFriendMenu(e.currentTarget, f); };
     scroll.appendChild(row);
   }
+}
+
+// Regroupe les actions secondaires (signaler, bloquer, retirer, bannir) dans
+// un petit menu au clic sur "⋮" au lieu de tout empiler en icônes dans la
+// ligne — trop d'icônes/badges côte à côte dans les 300px du panneau amis
+// rendait la ligne illisible (texte et icônes qui se chevauchent).
+let openFriendMenuEl = null;
+function closeFriendMenu(){
+  if (openFriendMenuEl){ openFriendMenuEl.remove(); openFriendMenuEl = null; }
+  document.removeEventListener('click', closeFriendMenu, true);
+}
+function openFriendMenu(anchorBtn, f){
+  closeFriendMenu();
+  const menu = document.createElement('div');
+  menu.className = 'friend-menu';
+  menu.innerHTML = `
+    <button data-action="report">🚩 Signaler</button>
+    <button data-action="reportdox">🔒 Signaler un dox</button>
+    <button data-action="block" class="danger">🚫 Bloquer</button>
+    <button data-action="remove" class="danger">✕ Retirer</button>
+    ${isAppOwner() ? `<button data-action="appban" class="danger">⛔ Bannir de l'app</button>` : ''}
+  `;
+  document.body.appendChild(menu);
+  const rect = anchorBtn.getBoundingClientRect();
+  menu.style.top = Math.round(rect.bottom + 4) + 'px';
+  menu.style.left = Math.round(Math.min(rect.left, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+  menu.querySelector('[data-action="report"]').onclick = (e) => { e.stopPropagation(); closeFriendMenu(); openReportModal('user', f.nullId, f.username); };
+  menu.querySelector('[data-action="reportdox"]').onclick = (e) => { e.stopPropagation(); closeFriendMenu(); openReportModal('dox', f.nullId, f.username); };
+  menu.querySelector('[data-action="block"]').onclick = (e) => { e.stopPropagation(); closeFriendMenu(); blockFriend(f.nullId); };
+  menu.querySelector('[data-action="remove"]').onclick = (e) => { e.stopPropagation(); closeFriendMenu(); removeFriend(f.nullId); };
+  const appBanBtn = menu.querySelector('[data-action="appban"]');
+  if (appBanBtn) appBanBtn.onclick = (e) => { e.stopPropagation(); closeFriendMenu(); banUserFromApp(f.nullId, f.username); };
+  openFriendMenuEl = menu;
+  setTimeout(() => document.addEventListener('click', closeFriendMenu, true), 0);
 }
 
 async function ensureDmKey(friend){
@@ -4907,26 +4981,47 @@ async function deriveMediaSharedKey(myPrivateKey, peerPublicKeyBytes){
 const ROLE_SALT_OFFERER = new Uint8Array([0, 0, 0, 1]);
 const ROLE_SALT_ANSWERER = new Uint8Array([0, 0, 0, 2]);
 let mediaStreamCounter = 0;
+// Si le worker de chiffrement des appels plante ou ne charge pas (ex.
+// call-crypto-worker.js absent/404), on ne veut JAMAIS que ça coupe l'audio :
+// dès la moindre erreur, on désactive cette couche pour le reste de la
+// session et les appels retombent sur le DTLS-SRTP natif (déjà chiffré,
+// juste sans la couche additionnelle). Un appel qui échoue silencieusement
+// et laisse les gens sans son est pire qu'un appel sans cette couche en plus.
+let callCryptoBroken = false;
+function reportCallCryptoBroken(reason){
+  if (callCryptoBroken) return;
+  callCryptoBroken = true;
+  RTC_CONFIG.encodedInsertableStreams = false;
+  console.warn('⚠️ Chiffrement additionnel des appels désactivé (' + reason + ') — audio conservé via DTLS-SRTP standard.');
+}
 // Idempotent : peut être rappelée après ajout d'une nouvelle piste (ex.
 // partage d'écran) sans re-chiffrer une piste déjà câblée.
 function applyCallEncryption(pc, sharedKey, isOfferer){
-  if (!CALL_CRYPTO_SUPPORTED || !sharedKey) return;
-  const worker = getCallCryptoWorker();
+  if (!CALL_CRYPTO_SUPPORTED || !sharedKey || callCryptoBroken) return;
+  let worker;
+  try{
+    worker = getCallCryptoWorker();
+    worker.onerror = (e) => { reportCallCryptoBroken('worker onerror'); e.preventDefault && e.preventDefault(); };
+  } catch(e){ reportCallCryptoBroken('worker init'); return; }
   const mySalt = isOfferer ? ROLE_SALT_OFFERER : ROLE_SALT_ANSWERER;
   const peerSalt = isOfferer ? ROLE_SALT_ANSWERER : ROLE_SALT_OFFERER;
   pc.getSenders().forEach(sender => {
     if (!sender.track || sender.__nulchatEncSetup) return;
-    sender.__nulchatEncSetup = true;
-    const streamId = 'tx-' + (mediaStreamCounter++);
-    const { readable, writable } = sender.createEncodedStreams();
-    worker.postMessage({ type: 'setup', streamId, key: sharedKey, roleSalt: mySalt.buffer, direction: 'encrypt', readable, writable }, [readable, writable]);
+    try{
+      const streamId = 'tx-' + (mediaStreamCounter++);
+      const { readable, writable } = sender.createEncodedStreams();
+      sender.__nulchatEncSetup = true;
+      worker.postMessage({ type: 'setup', streamId, key: sharedKey, roleSalt: mySalt.buffer, direction: 'encrypt', readable, writable }, [readable, writable]);
+    } catch(e){ reportCallCryptoBroken('sender setup: ' + (e && e.message || e)); }
   });
   pc.getReceivers().forEach(receiver => {
     if (!receiver.track || receiver.__nulchatEncSetup) return;
-    receiver.__nulchatEncSetup = true;
-    const streamId = 'rx-' + (mediaStreamCounter++);
-    const { readable, writable } = receiver.createEncodedStreams();
-    worker.postMessage({ type: 'setup', streamId, key: sharedKey, peerRoleSalt: peerSalt.buffer, direction: 'decrypt', readable, writable }, [readable, writable]);
+    try{
+      const streamId = 'rx-' + (mediaStreamCounter++);
+      const { readable, writable } = receiver.createEncodedStreams();
+      receiver.__nulchatEncSetup = true;
+      worker.postMessage({ type: 'setup', streamId, key: sharedKey, peerRoleSalt: peerSalt.buffer, direction: 'decrypt', readable, writable }, [readable, writable]);
+    } catch(e){ reportCallCryptoBroken('receiver setup: ' + (e && e.message || e)); }
   });
 }
 
@@ -4963,7 +5058,15 @@ function forceOpusHD(sdp){
 // Worker dédié VAD (jamais sur le thread principal -> 0 impact FPS UI).
 let vadWorker = null;
 function getVadWorker(){
-  if (!vadWorker) vadWorker = new Worker('/audio-worker.js');
+  if (!vadWorker){
+    vadWorker = new Worker('/audio-worker.js');
+    vadWorker.onerror = (e) => {
+      console.warn('⚠️ audio-worker.js indisponible — micro forcé actif.');
+      autoGateEnabled = false;
+      if (!callMuted) setZeroBitrateMute(false);
+      e.preventDefault && e.preventDefault();
+    };
+  }
   return vadWorker;
 }
 
@@ -5028,6 +5131,12 @@ async function fetchIceServers(){
 
 function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions, variant }){
   const overlay = document.getElementById('callOverlay');
+  // Si l'appel a été réduit, on ne force pas le plein écran à chaque étape
+  // (ex. passage "sonne" -> "connecté") — on met juste à jour la mini-barre.
+  if (document.getElementById('miniCallBar').classList.contains('open')){
+    syncMiniCallBar();
+    return;
+  }
   overlay.classList.remove('closing');
   overlay.classList.add('open');
   { const st = nameStyleForAuthor(name, false); document.getElementById('callName').innerHTML = styledNameHTML(name, st.font, st.effect, st.colors); }
@@ -5055,6 +5164,7 @@ function openCallOverlay({ name, statusText, avatarDataUrl, ringing, actions, va
 }
 function closeCallOverlay(){
   const overlay = document.getElementById('callOverlay');
+  hideMiniCallBar();
   if (!overlay.classList.contains('open')) return;
   overlay.classList.add('closing');
   const avatar = document.getElementById('callAvatar');
@@ -5066,6 +5176,36 @@ function closeCallOverlay(){
     overlay.classList.remove('open');
     overlay.classList.remove('closing');
   }, 220);
+}
+
+// Réduire l'appel : on n'a plus besoin de rester sur l'écran d'appel plein
+// écran pour continuer à parler — l'appel (rtcConn/localStream) reste
+// intact, seule l'UI plein écran se ferme au profit d'une petite barre.
+function minimizeCallOverlay(){
+  if (!activeCallPeer) return;
+  const overlay = document.getElementById('callOverlay');
+  overlay.classList.remove('open', 'closing');
+  syncMiniCallBar();
+  document.getElementById('miniCallBar').classList.add('open');
+}
+function restoreCallOverlay(){
+  if (!activeCallPeer) return;
+  hideMiniCallBar();
+  const overlay = document.getElementById('callOverlay');
+  overlay.classList.remove('closing');
+  overlay.classList.add('open');
+}
+function hideMiniCallBar(){
+  const bar = document.getElementById('miniCallBar');
+  if (bar) bar.classList.remove('open');
+}
+function syncMiniCallBar(){
+  if (!activeCallPeer) return;
+  document.getElementById('miniCallName').textContent = activeCallPeer.username || '—';
+  document.getElementById('miniCallStatus').textContent = pendingIncomingSdp && !rtcConn ? 'Appel entrant…' : 'En appel';
+  renderAvatarInto(document.getElementById('miniCallAvatar'), activeCallPeer);
+  const muteBtn = document.getElementById('miniCallMuteBtn');
+  if (muteBtn) muteBtn.classList.toggle('active-mute', callMuted);
 }
 
 const ICONS = {
@@ -5083,14 +5223,25 @@ async function getMic(){
 
   // VAD + zero-bitrate mute automatique : le worker décide, le thread UI ne
   // fait jamais de calcul DSP -> 60/144 FPS garantis pendant un appel.
+  // Garde-fou : si le worker VAD (audio-worker.js) ne répond jamais (absent,
+  // erreur, algo cassé), on ne veut surtout pas rester coupé en silence tout
+  // l'appel — on désactive alors la coupure auto et on force le micro actif.
+  let vadSignalReceived = false;
   attachVadPipeline(localStream, {
     onSpeakingChange: (speaking) => {
+      vadSignalReceived = true;
       if (!autoGateEnabled || callMuted) return; // le mute manuel reste prioritaire
       setZeroBitrateMute(!speaking);
       const btn = document.querySelector('.call-btn.mute');
       if (btn) btn.classList.toggle('speaking', speaking);
     }
   });
+  setTimeout(() => {
+    if (vadSignalReceived || !autoGateEnabled) return;
+    console.warn('⚠️ Détection vocale (audio-worker.js) muette — micro forcé actif pour éviter un appel silencieux.');
+    autoGateEnabled = false;
+    if (!callMuted) setZeroBitrateMute(false);
+  }, 2000);
   return localStream;
 }
 
@@ -5103,6 +5254,32 @@ function buildPeerConnection(targetSocketId, targetNullId){
   };
   pc.ontrack = (e) => {
     document.getElementById('remoteAudio').srcObject = e.streams[0];
+  };
+  // Sans ce suivi, un échec de connexion P2P — très fréquent sans serveur
+  // TURN configuré dès que les deux personnes ne sont pas sur un réseau
+  // "simple" (4G/5G, wifi d'entreprise/école, NAT symétrique...) — restait
+  // totalement invisible : l'appel affichait "En appel" en continu alors
+  // qu'aucun paquet audio ne circulait dans un sens ou dans l'autre.
+  // RTC_CONFIG.iceServers ne contient qu'un serveur STUN par défaut ; un
+  // TURN_URL doit être configuré côté serveur (.env) pour les cas où le
+  // direct P2P échoue.
+  let iceFailTimer = null;
+  pc.oniceconnectionstatechange = () => {
+    const state = pc.iceConnectionState;
+    if (state === 'failed'){
+      showToast({ title: 'Appel : connexion audio impossible', body: "Connexion directe impossible entre vos deux réseaux. Ça nécessite un serveur TURN — contacte l'admin de ce serveur NullChat." });
+      const statusEl = document.getElementById('callStatusText');
+      if (statusEl && activeCallPeer) statusEl.textContent = 'Connexion impossible…';
+      clearTimeout(iceFailTimer);
+      iceFailTimer = setTimeout(() => { if (pc.iceConnectionState === 'failed') hangupCall(); }, 4000);
+    } else if (state === 'disconnected'){
+      clearTimeout(iceFailTimer);
+      iceFailTimer = setTimeout(() => {
+        if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') hangupCall();
+      }, 8000);
+    } else if (state === 'connected'){
+      clearTimeout(iceFailTimer);
+    }
   };
   return pc;
 }
@@ -5234,6 +5411,7 @@ function toggleMute(){
   setZeroBitrateMute(callMuted); // mute manuel = coupe le flux réseau immédiatement, pas juste le micro local
   const btn = document.querySelector('.call-btn.mute');
   if (btn) btn.classList.toggle('active-mute', callMuted);
+  syncMiniCallBar();
 }
 function hangupCall(){
   stopRingtone();
